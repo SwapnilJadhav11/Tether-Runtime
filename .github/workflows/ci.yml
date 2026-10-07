@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: static (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the CI/runtime platform; Windows is the development host.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python (from .python-version)
+        run: uv python install
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run poe lint
+
+      - name: Type check (strict)
+        run: uv run poe typecheck
+
+      - name: Architecture and import contracts (T-14)
+        run: uv run poe contracts
+
+      - name: Unit tests
+        run: uv run poe test-unit

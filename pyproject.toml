@@ -1,0 +1,164 @@
+[project]
+name = "tether-runtime"
+version = "0.0.0"
+description = "Tether: a self-hostable, model-agnostic governed tool-execution runtime."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+# Workloads register with Tether through this entry-point group and are discovered by name from
+# bootstrap configuration (ADR-0002). Entries are added when the first workload is implemented.
+[project.entry-points."tether.workloads"]
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.1",
+    "mypy>=1.13",
+    "poethepoet>=0.31",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+# Live model-provider tests (PRD T-11). Populated when the provider adapters are implemented.
+live = []
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tether"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+# --------------------------------------------------------------------------------------------
+# Ruff
+# --------------------------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "workloads", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "N",       # pep8-naming
+    "UP",      # pyupgrade
+    "B",       # bugbear
+    "C4",      # comprehensions
+    "SIM",     # simplify
+    "PTH",     # prefer pathlib
+    "PT",      # pytest style
+    "S",       # bandit (security)
+    "T20",     # no print
+    "RUF",     # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert is how pytest tests assert
+
+# --------------------------------------------------------------------------------------------
+# mypy: strict on every Python source root that ships or registers code
+# --------------------------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+files = ["src", "workloads"]
+
+# --------------------------------------------------------------------------------------------
+# pytest
+# --------------------------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "8.3"
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib", "--strict-markers", "--strict-config", "-ra"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: requires real model providers (manual dispatch only)",
+    "chaos: process-kill reliability tests",
+    "perf: performance and load tests",
+]
+
+# --------------------------------------------------------------------------------------------
+# import-linter: the workload boundary (ADR-0002, PRD T-14)
+# --------------------------------------------------------------------------------------------
+
+[tool.importlinter]
+root_packages = ["tether", "workloads"]
+
+[[tool.importlinter.contracts]]
+name = "Tether core must not import workloads (ADR-0002, T-14)"
+type = "forbidden"
+source_modules = ["tether"]
+forbidden_modules = ["workloads"]
+
+[[tool.importlinter.contracts]]
+name = "Workloads may import only tether.sdk from Tether (ADR-0002, T-14)"
+type = "forbidden"
+source_modules = ["workloads"]
+# Every top-level core module except tether.sdk. tests/architecture enforces that this list
+# stays complete as core modules are added.
+forbidden_modules = [
+    "tether.api",
+    "tether.approvals",
+    "tether.audit",
+    "tether.authz",
+    "tether.cli",
+    "tether.core",
+    "tether.identity",
+    "tether.ledger",
+    "tether.observability",
+    "tether.policy",
+    "tether.providers",
+    "tether.queue",
+    "tether.reconciliation",
+    "tether.registry",
+    "tether.runtime",
+    "tether.secrets",
+    "tether.settings",
+    "tether.storage",
+    "tether.testing",
+    "tether.worker",
+]
+
+# --------------------------------------------------------------------------------------------
+# Poe tasks (cross-platform: no shell syntax; run with `uv run poe <task>`)
+# --------------------------------------------------------------------------------------------
+
+[tool.poe.tasks.lint]
+help = "Ruff lint and format check"
+sequence = ["ruff check .", "ruff format --check ."]
+default_item_type = "cmd"
+
+[tool.poe.tasks.format]
+help = "Apply Ruff formatting and safe lint fixes"
+sequence = ["ruff format .", "ruff check --fix ."]
+default_item_type = "cmd"
+
+[tool.poe.tasks.typecheck]
+help = "Strict mypy over src/ and workloads/"
+cmd = "mypy"
+
+[tool.poe.tasks.contracts]
+help = "Import-linter contracts plus architecture tests (T-14, package layout)"
+sequence = ["lint-imports", "pytest tests/architecture"]
+default_item_type = "cmd"
+# import-linter prints non-ASCII; UTF-8 mode keeps it working on Windows (cp1252) consoles.
+env = { PYTHONUTF8 = "1" }
+
+[tool.poe.tasks.test-unit]
+help = "Unit tests"
+cmd = "pytest tests/unit"
+
+[tool.poe.tasks.ci]
+help = "Static checks run by CI: lint, typecheck, contracts, unit tests"
+sequence = ["lint", "typecheck", "contracts", "test-unit"]
