@@ -22,11 +22,17 @@ If two sources conflict, or code would have to contradict one of them, **stop an
 
 ## Current stage
 
-- **Last completed step: S1.2.** S1.1 delivered the scaffold, toolchain, CI and T-14 import contracts. S1.2 added the Compose stack, settings, the psycopg pool, `/healthz` and `/readyz`, the idle worker, and `tether migrate` (Alembic for the `tether` schema, empty baseline). Nothing beyond S1.2 is implemented; packages not touched by S1.1–S1.2 are still empty placeholders.
-- **Active step: S1.3** (LangGraph semantics contract tests and version pin). Work only on this step. Immediate goal:
-  - pin exact `langgraph` and `langgraph-checkpoint-postgres` versions (PD-22);
-  - implement the Postgres saver factory using the `langgraph` schema;
-  - validate sync durability, interrupt/resume, crash recovery, state inspection and schema isolation.
+- **Last completed step: S1.3.** Nothing beyond it is implemented; packages not touched by S1.1–S1.3 are still empty placeholders.
+  - S1.1 established the repository, toolchain, CI and T-14 import contracts.
+  - S1.2 established the runnable Compose/Postgres foundation: settings, the psycopg pool, `/healthz` and `/readyz`, the idle worker, and `tether migrate`.
+  - S1.3 established durable LangGraph checkpointing (exact pins, saver factory on the `langgraph` schema) and the contract suite for sync durability, interrupt/resume, crash recovery and state inspection.
+- **Active step: S1.4** (core primitives: canonical JSON, keyed hashes, idempotency keys, SecretsProvider, key ring). Work only on this step. Immediate goal:
+  - implement RFC 8785 canonical JSON;
+  - implement keyed HMAC call hashes;
+  - implement deterministic idempotency keys;
+  - implement `SecretsProvider`, `SecretValue`, env-backed secrets, and separate audit and binding key families;
+  - enforce float rejection and ±(2^53−1) integer limits for write envelopes;
+  - add the property and unit tests the S1.4 plan requires.
 - Other steps that the dependency graph would allow are **not** to be started. Don't offer them as alternatives. The active step changes only when the user says so; update this section when it does.
 
 ## How to work

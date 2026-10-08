@@ -13,6 +13,7 @@ dependencies = [
     "psycopg-pool>=3.2",
     "psycopg[binary]>=3.2",
     "pydantic-settings>=2.6",
+    "rfc8785==0.1.4",
     "typer>=0.15",
     "uvicorn>=0.32",
 ]
@@ -32,6 +33,7 @@ tether-worker-healthcheck = "tether.worker.main:healthcheck"
 [dependency-groups]
 dev = [
     "httpx>=0.28",
+    "hypothesis>=6.100",
     "import-linter>=2.1",
     "mypy>=1.13",
     "poethepoet>=0.31",
