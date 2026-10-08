@@ -7,6 +7,9 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.14",
     "fastapi>=0.115",
+    # Exact pins (PD-22): bump only with the S1.3 LangGraph contract suite green.
+    "langgraph==1.2.14",
+    "langgraph-checkpoint-postgres==3.1.2",
     "psycopg-pool>=3.2",
     "psycopg[binary]>=3.2",
     "pydantic-settings>=2.6",
@@ -183,6 +186,15 @@ help = "Integration tests against deploy/compose/docker-compose.test.yml (needs 
 sequence = [
     "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
     "pytest tests/integration",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
+[tool.poe.tasks.test-contract]
+help = "LangGraph semantics contract suite on the pinned versions (required on every LangGraph bump)"
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "pytest tests/contract/langgraph",
 ]
 default_item_type = "cmd"
 envfile = "deploy/compose/.env"

@@ -55,6 +55,52 @@ def test_migrate_exits_zero_and_is_idempotent(test_db: TestDatabase) -> None:
     assert _versions(test_db) == [BASELINE_REVISION]
 
 
+SAVER_TABLES = frozenset(
+    {"checkpoint_migrations", "checkpoints", "checkpoint_blobs", "checkpoint_writes"}
+)
+
+
+def _saver_table_schemas(test_db: TestDatabase) -> set[tuple[str, str]]:
+    with psycopg.connect(test_db.migrator_dsn) as conn:
+        rows = conn.execute(
+            "SELECT table_schema, table_name FROM information_schema.tables"
+            " WHERE table_name = ANY(%s)",
+            (sorted(SAVER_TABLES),),
+        ).fetchall()
+    return {(row[0], row[1]) for row in rows}
+
+
+def test_migrate_creates_saver_tables_only_in_langgraph_schema(test_db: TestDatabase) -> None:
+    result = _run_migrate(test_db)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _saver_table_schemas(test_db) == {("langgraph", name) for name in SAVER_TABLES}
+
+
+def test_saver_setup_is_idempotent(test_db: TestDatabase) -> None:
+    def applied() -> list[int]:
+        with psycopg.connect(test_db.migrator_dsn) as conn:
+            rows = conn.execute("SELECT v FROM langgraph.checkpoint_migrations ORDER BY v")
+            return [row[0] for row in rows.fetchall()]
+
+    assert _run_migrate(test_db).returncode == 0
+    before = applied()
+    assert _run_migrate(test_db).returncode == 0
+    assert applied() == before
+    assert before, "the saver recorded no migrations"
+
+
+@pytest.mark.parametrize("table", sorted(SAVER_TABLES - {"checkpoint_migrations"}))
+def test_app_role_can_read_and_write_saver_tables(test_db: TestDatabase, table: str) -> None:
+    assert _run_migrate(test_db).returncode == 0
+    with psycopg.connect(test_db.migrator_dsn) as conn:
+        row = conn.execute(
+            "SELECT has_table_privilege('tether_app', %s, 'SELECT, INSERT, UPDATE, DELETE')",
+            (f"langgraph.{table}",),
+        ).fetchone()
+    assert row is not None
+    assert row[0] is True
+
+
 def test_tether_and_langgraph_schemas_exist(test_db: TestDatabase) -> None:
     with psycopg.connect(test_db.app_dsn) as conn:
         rows = conn.execute(

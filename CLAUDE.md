@@ -22,8 +22,11 @@ If two sources conflict, or code would have to contradict one of them, **stop an
 
 ## Current stage
 
-- **Last completed step: S1.1.** This covers the scaffold, the uv/ruff/mypy/pytest/poe toolchain, CI, and the T-14 import contracts. Nothing beyond it is implemented. Every package under `src/tether/` is an empty placeholder.
-- **Active step: S1.2** (compose stack, settings, migration framework). Work only on this step.
+- **Last completed step: S1.2.** S1.1 delivered the scaffold, toolchain, CI and T-14 import contracts. S1.2 added the Compose stack, settings, the psycopg pool, `/healthz` and `/readyz`, the idle worker, and `tether migrate` (Alembic for the `tether` schema, empty baseline). Nothing beyond S1.2 is implemented; packages not touched by S1.1–S1.2 are still empty placeholders.
+- **Active step: S1.3** (LangGraph semantics contract tests and version pin). Work only on this step. Immediate goal:
+  - pin exact `langgraph` and `langgraph-checkpoint-postgres` versions (PD-22);
+  - implement the Postgres saver factory using the `langgraph` schema;
+  - validate sync durability, interrupt/resume, crash recovery, state inspection and schema isolation.
 - Other steps that the dependency graph would allow are **not** to be started. Don't offer them as alternatives. The active step changes only when the user says so; update this section when it does.
 
 ## How to work

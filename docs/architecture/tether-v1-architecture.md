@@ -3,6 +3,7 @@
 > **Input:** frozen V1 PRD — [`.claude/PRPs/prds/tether-runtime.prd.md`](../../.claude/PRPs/prds/tether-runtime.prd.md).
 > **Scope:** high-level architecture only. No implementation plans or code. Decisions marked **AD-xx** and the §24 candidates are recorded as ADRs in [`docs/adr/`](../adr/README.md).
 > **Status:** revised after architect review (`ecc:architect`) — 2026-10-06. Review disposition in §27.
+> **Amended 2026-10-08:** §9.3 step 3 resumes with an opaque sentinel instead of `Command(resume=None)` (S1.3 contract finding; ADR-0003 unchanged).
 
 ---
 
@@ -355,7 +356,8 @@ flowchart TD
 
 1. **Lease, then lock.** The worker leases an `advance_run` job, then takes a **session-level advisory lock** on the run using a dedicated connection held for the whole invocation (released in `finally`). If the lock is contended, the job is returned to `ready` with a short delay **without incrementing `attempts`** — never completed. The advisory lock is the per-run mutex; it is load-bearing, not belt-and-braces. Heartbeat or lock-connection failure aborts the invocation. After acquiring the lock the driver increments the run's driver generation and uses it as a fencing token: every run-driver write (TX2, TX3, TX5, TX11, TX12, and other node decision events) asserts it under the run-row lock and aborts on mismatch; a fenced invocation releases its job without completing it (ADR-0005).
 2. **Terminal check.** If the run is terminal, complete the job as a no-op.
-3. **Invocation choice.** No checkpoint → invoke with the initial input built from `runs`. Pending interrupt(s) → `Command(resume=None)`. Checkpoint with non-empty `next` and no interrupt (crash mid-step) → `invoke(None)`. Otherwise → reconcile status via a TX11 finalize.
+3. **Invocation choice.** No checkpoint → invoke with the initial input built from `runs`. Pending interrupt(s) → resume with `Command(resume=<sentinel>)`. Checkpoint with non-empty `next` and no interrupt (crash mid-step) → `invoke(None)`. Otherwise → reconcile status via a TX11 finalize.
+   - **Resume sentinel.** Tether resumes with an opaque, non-semantic constant, currently `"tether:wake"`. It carries no business or domain meaning: wait nodes ignore it and always re-read the authoritative row (ADR-0003, unchanged). `Command(resume=None)` is not used, because on the pinned LangGraph version `None` is not a valid resume. The S1.3 contract suite pins both facts (`tests/contract/langgraph/README.md`).
 4. **Check before interrupt.** Every wait node checks its authoritative condition **before** calling `interrupt()`, interrupts only if unsatisfied, and loops on spurious wakes. A duplicate or early wake is therefore a no-op.
 5. **Payloads.** `advance_run` jobs carry only `run_id`. Duplicate `advance_run` jobs are harmless and are **not** coalesced (F-01).
 

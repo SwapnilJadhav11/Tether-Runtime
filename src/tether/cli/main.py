@@ -7,6 +7,7 @@ from alembic import command
 from alembic.config import Config
 from pydantic import ValidationError
 
+from tether.runtime.checkpointer import setup_langgraph_schema
 from tether.settings import MigrationSettings
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Tether administration.")
@@ -29,13 +30,15 @@ def upgrade_to_head(dsn: str) -> None:
 
 @app.command()
 def migrate() -> None:
-    """Apply Tether schema migrations (PD-4). Idempotent."""
+    """Apply the `tether` schema migrations and the LangGraph saver setup (PD-4). Idempotent."""
     try:
         settings = MigrationSettings()
     except ValidationError:
         typer.echo("TETHER_MIGRATOR_DATABASE_URL must be set to the migrator role's URL.", err=True)
         raise typer.Exit(code=2) from None
-    upgrade_to_head(settings.migrator_database_url.get_secret_value())
+    dsn = settings.migrator_database_url.get_secret_value()
+    upgrade_to_head(dsn)
+    setup_langgraph_schema(dsn)
     typer.echo("migrations applied")
 
 

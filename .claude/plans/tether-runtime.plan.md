@@ -258,7 +258,7 @@ Size key: **S** ≈ 0.5 day, **M** ≈ 1 day, **L** ≈ 2 days. Model tier: **st
   - (c) a resume carrying no meaning works. Verify `Command(resume=None)`; if `None` is not a valid resume, adopt a constant sentinel value and record that in the README;
   - (d) a subprocess `os._exit` mid-node → `invoke(None)` on the same thread re-runs that node from the last checkpoint;
   - (e) state inspection distinguishes the four §9.3 step-3 branches (no checkpoint / pending interrupt / non-empty `next` without interrupt / finished);
-  - (f) saver tables exist only in `langgraph`, and Alembic autogenerate ignores them.
+  - (f) saver tables exist only in `langgraph` (covered by `tests/integration/test_compose_smoke.py`). *Moved to S1.5 (2026-10-08):* "Alembic autogenerate ignores them". Autogenerate cannot run until the migration environment has `target_metadata`, which first exists in S1.5; an empty-`MetaData` stand-in would not exercise the real `env.py` configuration.
 - **Validation / exit:** contract suite green on the pinned versions; invocation-choice mapping documented in the test README.
 - **Risk / slip:** **High impact.** If (a)–(e) fail, ADR-0003's premises fail: stop and raise a superseding ADR before S2.8 / never.
 - **Size / model:** M / strongest.
@@ -308,7 +308,8 @@ Size key: **S** ≈ 0.5 day, **M** ≈ 1 day, **L** ≈ 2 days. Model tier: **st
   - `tether_app` UPDATE/DELETE on `audit_events` → permission denied;
   - building a repository without a scope fails;
   - a cross-workspace lookup returns not-found;
-  - static test: no `now()` in SQL anywhere under `src/tether`.
+  - static test: no `now()` in SQL anywhere under `src/tether`;
+  - *moved from S1.3 (f), 2026-10-08:* Alembic autogenerate, with the real `target_metadata` and `env.py` configuration, proposes no changes for the LangGraph saver tables in the `langgraph` schema.
 - **Validation / exit:** migration runs from an empty DB; the template-DB clone fixture works; tests green.
 - **Risk / slip:** Schema churn, mitigated by additive migrations only / never.
 - **Size / model:** M / strongest.
