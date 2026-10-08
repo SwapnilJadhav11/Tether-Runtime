@@ -1,0 +1,25 @@
+# OpenTelemetry collector (architecture §19): receives OTLP from api and worker and forwards
+# traces to Jaeger. Instrumentation in the Tether processes arrives in S1.9.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger]

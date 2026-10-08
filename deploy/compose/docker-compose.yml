@@ -1,0 +1,132 @@
+# Tether V1 single-host stack (architecture §19, ADR-0001).
+#
+#   cp deploy/compose/.env.example deploy/compose/.env   # then set real values
+#   uv run poe smoke                                       # build, start, wait until healthy
+#
+# Only the api (8080) and the Jaeger UI (16686) are published; everything else stays on the
+# internal compose network.
+name: tether
+
+x-tether-image: &tether-image
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: tether-runtime:dev
+
+x-app-env: &app-env
+  TETHER_ENV: dev
+  TETHER_DATABASE_URL: postgresql://tether_app:${TETHER_APP_DB_PASSWORD:?set TETHER_APP_DB_PASSWORD in deploy/compose/.env}@postgres:5432/tether
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${TETHER_POSTGRES_PASSWORD:?set TETHER_POSTGRES_PASSWORD in deploy/compose/.env}
+      TETHER_MIGRATOR_DB_PASSWORD: ${TETHER_MIGRATOR_DB_PASSWORD:?set TETHER_MIGRATOR_DB_PASSWORD in deploy/compose/.env}
+      TETHER_APP_DB_PASSWORD: ${TETHER_APP_DB_PASSWORD:?set TETHER_APP_DB_PASSWORD in deploy/compose/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/10-tether-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tether"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *tether-image
+    command: ["tether", "migrate"]
+    environment:
+      TETHER_MIGRATOR_DATABASE_URL: postgresql://tether_migrator:${TETHER_MIGRATOR_DB_PASSWORD}@postgres:5432/tether
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *tether-image
+    command: ["tether-api"]
+    environment: *app-env
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    <<: *tether-image
+    command: ["tether-worker"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "tether-worker-healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  ollama:
+    image: ollama/ollama:0.5.7
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Pulls TETHER_OLLAMA_MODEL into the model volume. Only in the `live` profile (PD-26).
+  ollama-pull:
+    image: ollama/ollama:0.5.7
+    profiles: ["live"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      TETHER_OLLAMA_MODEL: ${TETHER_OLLAMA_MODEL:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'test -n "$$TETHER_OLLAMA_MODEL" || { echo "set TETHER_OLLAMA_MODEL in deploy/compose/.env"; exit 1; }; ollama pull "$$TETHER_OLLAMA_MODEL"'
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.116.1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/jaeger:2.1.0
+    ports:
+      - "16686:16686"
+
+  # Placeholder until the demo target service is built (S2.5). Internal only; not Tether.
+  demo-target:
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8000", "--directory", "/tmp"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres-data:
+  ollama-models:

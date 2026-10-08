@@ -1,0 +1,39 @@
+# Test dependencies for integration tests (PD-8): Postgres and the demo-target placeholder.
+# Started by `uv run poe test-integration`. The database lives in tmpfs, so every
+# `down` + `up` starts from a freshly initialised cluster.
+name: tether-test
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${TETHER_POSTGRES_PASSWORD:?set TETHER_POSTGRES_PASSWORD in deploy/compose/.env}
+      TETHER_MIGRATOR_DB_PASSWORD: ${TETHER_MIGRATOR_DB_PASSWORD:?set TETHER_MIGRATOR_DB_PASSWORD in deploy/compose/.env}
+      TETHER_APP_DB_PASSWORD: ${TETHER_APP_DB_PASSWORD:?set TETHER_APP_DB_PASSWORD in deploy/compose/.env}
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/10-tether-init.sh:ro
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tether"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Placeholder until the demo target service is built (S2.5).
+  demo-target:
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8000", "--directory", "/tmp"]
+    ports:
+      - "127.0.0.1:58000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 12
