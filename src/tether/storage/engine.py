@@ -1,9 +1,39 @@
-"""Database connectivity: the async psycopg connection pool (PD-2)."""
+"""Database connectivity (PD-2, PD-3).
+
+- ``create_pool``: the plain psycopg pool used for readiness checks.
+- ``create_database_engine``: the async SQLAlchemy engine (psycopg 3 driver) behind the Unit
+  of Work.
+"""
 
 from __future__ import annotations
 
 import psycopg
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
+from sqlalchemy import Engine, create_engine, pool
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+
+def create_migration_engine(dsn: str) -> Engine:
+    """Sync engine for Alembic (migrations and autogenerate).
+
+    The database roles default to ``search_path = tether``. Alembic treats the default schema
+    as unnamed, so with that setting it would see the ``tether`` tables as schema-less and
+    autogenerate would misreport them. Migration connections therefore use ``public`` as the
+    default schema; all migration DDL is schema-qualified.
+    """
+    url = make_url(dsn).set(drivername="postgresql+psycopg")
+    return create_engine(
+        url,
+        poolclass=pool.NullPool,
+        connect_args={"options": "-c search_path=public"},
+    )
+
+
+def create_database_engine(dsn: str) -> AsyncEngine:
+    """Async SQLAlchemy engine for a ``postgresql://`` DSN, using the psycopg 3 driver."""
+    url = make_url(dsn).set(drivername="postgresql+psycopg")
+    return create_async_engine(url, pool_pre_ping=True)
 
 
 def create_pool(

@@ -7,12 +7,11 @@ The database URL comes from ``config.attributes["database_url"]`` when invoked t
 from __future__ import annotations
 
 from alembic import context
-from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import make_url
 
 from tether.settings import MigrationSettings
-
-TETHER_SCHEMA = "tether"
+from tether.storage.engine import create_migration_engine
+from tether.storage.tables import MIGRATION_CONTEXT_OPTIONS, metadata
 
 
 def _database_url() -> str:
@@ -29,21 +28,21 @@ def _database_url() -> str:
 def run_migrations_offline() -> None:
     context.configure(
         url=_database_url(),
-        target_metadata=None,
-        version_table_schema=TETHER_SCHEMA,
+        target_metadata=metadata,
         literal_binds=True,
+        **MIGRATION_CONTEXT_OPTIONS,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online() -> None:
-    engine = create_engine(_database_url(), poolclass=pool.NullPool)
+    engine = create_migration_engine(_database_url())
     with engine.connect() as connection:
         context.configure(
             connection=connection,
-            target_metadata=None,
-            version_table_schema=TETHER_SCHEMA,
+            target_metadata=metadata,
+            **MIGRATION_CONTEXT_OPTIONS,
         )
         with context.begin_transaction():
             context.run_migrations()

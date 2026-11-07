@@ -37,3 +37,11 @@ class KeyUnavailableError(TetherError, LookupError):
 
 class SecretNotFoundError(TetherError, LookupError):
     """A named secret is not available from the SecretsProvider."""
+
+
+class ScopeViolationError(TetherError, ValueError):
+    """A workspace scope is invalid, or data would cross workspaces (ADR-0013, invariant 13)."""
+
+
+class UnitOfWorkError(TetherError, RuntimeError):
+    """A Unit of Work was used outside its active transaction."""

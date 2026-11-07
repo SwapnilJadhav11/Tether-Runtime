@@ -23,7 +23,7 @@ from tether.settings import Settings
 if TYPE_CHECKING:
     from conftest import TestDatabase
 
-BASELINE_REVISION = "0001"
+HEAD_REVISION = "0002"
 
 
 def _run_migrate(test_db: TestDatabase) -> subprocess.CompletedProcess[str]:
@@ -48,11 +48,11 @@ def _versions(test_db: TestDatabase) -> list[str]:
 def test_migrate_exits_zero_and_is_idempotent(test_db: TestDatabase) -> None:
     first = _run_migrate(test_db)
     assert first.returncode == 0, first.stdout + first.stderr
-    assert _versions(test_db) == [BASELINE_REVISION]
+    assert _versions(test_db) == [HEAD_REVISION]
 
     second = _run_migrate(test_db)
     assert second.returncode == 0, second.stdout + second.stderr
-    assert _versions(test_db) == [BASELINE_REVISION]
+    assert _versions(test_db) == [HEAD_REVISION]
 
 
 SAVER_TABLES = frozenset(

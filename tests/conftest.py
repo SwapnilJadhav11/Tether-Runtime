@@ -28,9 +28,21 @@ class TestDatabase:
     port: int
     migrator_password: str
     app_password: str
+    dbname: str = "tether"
+    # The test-only Postgres superuser, used solely to create template-database clones.
+    superuser_password: str | None = None
 
-    def _dsn(self, role: str, password: str) -> str:
-        return f"postgresql://{role}:{quote(password, safe='')}@{self.host}:{self.port}/tether"
+    def _dsn(self, role: str, password: str, dbname: str | None = None) -> str:
+        database = dbname or self.dbname
+        return f"postgresql://{role}:{quote(password, safe='')}@{self.host}:{self.port}/{database}"
+
+    def superuser_dsn(self, dbname: str = "postgres") -> str:
+        if not self.superuser_password:
+            pytest.fail(
+                "TETHER_POSTGRES_PASSWORD is required for template-database fixtures",
+                pytrace=False,
+            )
+        return self._dsn("postgres", self.superuser_password, dbname)
 
     @property
     def migrator_dsn(self) -> str:
@@ -56,4 +68,5 @@ def test_db() -> TestDatabase:
         port=int(os.environ.get("TETHER_TEST_PG_PORT", "55432")),
         migrator_password=os.environ["TETHER_MIGRATOR_DB_PASSWORD"],
         app_password=os.environ["TETHER_APP_DB_PASSWORD"],
+        superuser_password=os.environ.get("TETHER_POSTGRES_PASSWORD") or None,
     )

@@ -22,17 +22,17 @@ If two sources conflict, or code would have to contradict one of them, **stop an
 
 ## Current stage
 
-- **Last completed step: S1.3.** Nothing beyond it is implemented; packages not touched by S1.1–S1.3 are still empty placeholders.
+- **Last completed step: S1.5.** Nothing beyond it is implemented; packages not touched by S1.1–S1.5 are still empty placeholders.
   - S1.1 established the repository, toolchain, CI and T-14 import contracts.
   - S1.2 established the runnable Compose/Postgres foundation: settings, the psycopg pool, `/healthz` and `/readyz`, the idle worker, and `tether migrate`.
   - S1.3 established durable LangGraph checkpointing (exact pins, saver factory on the `langgraph` schema) and the contract suite for sync durability, interrupt/resume, crash recovery and state inspection.
-- **Active step: S1.4** (core primitives: canonical JSON, keyed hashes, idempotency keys, SecretsProvider, key ring). Work only on this step. Immediate goal:
-  - implement RFC 8785 canonical JSON;
-  - implement keyed HMAC call hashes;
-  - implement deterministic idempotency keys;
-  - implement `SecretsProvider`, `SecretValue`, env-backed secrets, and separate audit and binding key families;
-  - enforce float rejection and ±(2^53−1) integer limits for write envelopes;
-  - add the property and unit tests the S1.4 plan requires.
+  - S1.4 established the core primitives: RFC 8785 canonical JSON, keyed HMAC call hashes, deterministic idempotency keys, and secret and key handling (`SecretValue`, `SecretsProvider`, separate audit and binding key families).
+  - S1.5 established the authoritative data model (migration `0002`: 14 tables, terminal-status trigger, workspace-aware composite FKs, consistency CHECKs, least-privilege grants with no app DELETE and append-only audit/access events), the Unit of Work, `WorkspaceScope` and scoped repositories, and Alembic `target_metadata` that ignores the LangGraph schema.
+- **Active step: none.** The owner names the next step; until then, start nothing.
+- **Decisions and deferrals carried forward:**
+  - S1.5 trade-off: we chose database-enforced workspace and consistency protections plus a strict Unit of Work rather than relying only on application discipline, accepting some schema and transaction complexity for stronger failure safety.
+  - Deferred from the S1.5 database review: F5 immutable identity/binding columns; F7 remaining cross-workspace and polymorphic references (`jobs.ref_id`, `policy_version` columns, `access_events.target_run_id`); F9 template-fixture hardening (host guard, xdist, leftover-clone sweep); F10 extra indexes; F11 `ScopedRepository` API refinements (scoped update, composite keys).
+  - Deferred from S1.4: startup check that audit and binding keys never share material (configuration/startup step); traceback-locals scrubbing (S1.9).
 - Other steps that the dependency graph would allow are **not** to be started. Don't offer them as alternatives. The active step changes only when the user says so; update this section when it does.
 
 ## How to work
