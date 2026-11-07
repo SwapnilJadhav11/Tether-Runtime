@@ -2,7 +2,7 @@
 
 Each poll interval the worker checks database connectivity and, while the database is reachable,
 refreshes a heartbeat file that the container healthcheck reads and processes every due job.
-Walking-skeleton scope: only ``advance_run`` jobs are leased.
+MVP scope: ``advance_run`` and ``execute_tool`` jobs are leased; timers are not implemented.
 """
 
 from __future__ import annotations
@@ -13,15 +13,15 @@ import logging
 import signal
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
-
-from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tether.core.statuses import JobKind
 from tether.queue import postgres as queue
+from tether.runtime.driver import WorkerRuntime
 from tether.settings import Settings
-from tether.storage.engine import create_database_engine, create_pool, database_is_reachable
-from tether.worker.handlers import advance_run
+from tether.storage.engine import create_pool, database_is_reachable
+from tether.worker.handlers import advance_run, execute_tool
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +37,26 @@ def heartbeat_is_fresh(path: Path, *, max_age_seconds: float) -> bool:
     return time.time() - modified <= max_age_seconds
 
 
-async def process_next_job(engine: AsyncEngine, settings: Settings) -> bool:
-    """Lease and process one due job; ``False`` if there was none."""
+HANDLED_KINDS = (JobKind.ADVANCE_RUN, JobKind.EXECUTE_TOOL)
+
+
+async def process_next_job(runtime: WorkerRuntime, kinds: Sequence[str] | None = None) -> bool:
+    """Lease and process one due job of ``kinds`` (default: all handled); ``False`` if none."""
+    engine = runtime.engine
     job = await queue.lease_one(
-        engine, kinds=(JobKind.ADVANCE_RUN,), lease_seconds=settings.worker_lease_seconds
+        engine, kinds=kinds or HANDLED_KINDS, lease_seconds=runtime.settings.worker_lease_seconds
     )
     if job is None:
         return False
-    outcome = await advance_run.handle(engine, job)
+    if job.kind == JobKind.EXECUTE_TOOL:
+        await execute_tool.handle(runtime, job)
+        # TX7 is already committed; completing needs the current lease token (no rollback).
+        await queue.complete(engine, job)
+        return True
+    outcome = await advance_run.handle(runtime, job)
     if outcome is advance_run.Outcome.COMPLETED:
         await queue.complete(engine, job)
-    elif outcome is advance_run.Outcome.CONTENDED:
+    elif outcome in (advance_run.Outcome.CONTENDED, advance_run.Outcome.STALE):
         await queue.release(engine, job, delay_seconds=CONTENDED_RETRY_SECONDS, refund_attempt=True)
     else:
         # Fenced: leave the run to the newer driver; this job is retried and re-checks the run.
@@ -58,14 +67,14 @@ async def process_next_job(engine: AsyncEngine, settings: Settings) -> bool:
 async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
     dsn = settings.database_url.get_secret_value()
     pool = create_pool(dsn, name="tether-worker")
-    engine = create_database_engine(dsn)
+    runtime = await WorkerRuntime.open(settings)
     await pool.open(wait=False)
     try:
         while not stop.is_set():
             if await database_is_reachable(pool, timeout=settings.readiness_timeout_seconds):
                 settings.worker_heartbeat_file.touch()
                 try:
-                    while not stop.is_set() and await process_next_job(engine, settings):
+                    while not stop.is_set() and await process_next_job(runtime):
                         pass
                 except Exception:
                     # The job keeps its lease and is retried after it expires; keep serving.
@@ -73,7 +82,7 @@ async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=settings.worker_poll_interval_seconds)
     finally:
-        await engine.dispose()
+        await runtime.close()
         await pool.close()
 
 

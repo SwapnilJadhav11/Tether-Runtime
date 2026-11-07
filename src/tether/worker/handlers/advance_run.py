@@ -2,10 +2,8 @@
 
 Lease, then lock: after the job is leased, the driver takes a session-level advisory lock on the
 run, on a dedicated connection held for the whole invocation. With the lock held it takes the next
-fencing token (``driver_generation``) and moves ``queued``/``running`` to ``running``, then
-``running`` to ``succeeded`` only while that token is still current.
-
-Walking-skeleton scope: no graph, model calls, policy, approvals, tools or audit events yet.
+fencing token (``driver_generation``), marks the run ``running`` and drives the run graph
+(``tether.runtime.driver``). Every write the graph makes asserts that token.
 """
 
 from __future__ import annotations
@@ -18,9 +16,10 @@ from enum import StrEnum
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from tether.core.statuses import RunStatus
+from tether.policy.engine import PolicyStaleError
 from tether.queue.postgres import LeasedJob
-from tether.storage.repos.runs import RunsRepository
+from tether.runtime.driver import WorkerRuntime, drive
+from tether.storage.repos.runs import FencedError, RunsRepository
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
@@ -32,6 +31,7 @@ class Outcome(StrEnum):
     COMPLETED = "completed"  # the job's work is done (or there was nothing left to do)
     CONTENDED = "contended"  # another driver holds the run lock
     FENCED = "fenced"  # a newer driver took over during this invocation
+    STALE = "stale"  # this process's policy is not the active version: decide nothing (ADR-0009)
 
 
 def run_lock_name(run_id: uuid.UUID) -> str:
@@ -69,17 +69,8 @@ async def start(engine: AsyncEngine, scope: WorkspaceScope, run_id: uuid.UUID) -
         return await uow.repository(RunsRepository, scope).claim_driver_generation(run_id)
 
 
-async def finish(
-    engine: AsyncEngine, scope: WorkspaceScope, run_id: uuid.UUID, generation: int
-) -> bool:
-    """``running`` to ``succeeded``, refused if ``generation`` has been superseded."""
-    async with UnitOfWork(engine) as uow:
-        return await uow.repository(RunsRepository, scope).transition(
-            run_id, expected=RunStatus.RUNNING, new=RunStatus.SUCCEEDED, generation=generation
-        )
-
-
-async def handle(engine: AsyncEngine, job: LeasedJob) -> Outcome:
+async def handle(runtime: WorkerRuntime, job: LeasedJob) -> Outcome:
+    engine = runtime.engine
     scope = WorkspaceScope.for_job(
         job_workspace_id=job.workspace_id, run_workspace_id=job.run_workspace_id
     )
@@ -89,6 +80,10 @@ async def handle(engine: AsyncEngine, job: LeasedJob) -> Outcome:
         generation = await start(engine, scope, job.run_id)
         if generation is None:
             return Outcome.COMPLETED
-        if not await finish(engine, scope, job.run_id, generation):
+        try:
+            await drive(runtime, scope, job.run_id, generation)
+        except FencedError:
             return Outcome.FENCED
+        except PolicyStaleError:
+            return Outcome.STALE
         return Outcome.COMPLETED

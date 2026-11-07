@@ -1,4 +1,4 @@
-# The image needs only pyproject.toml, uv.lock, README.md and src/ (see Dockerfile).
+# The image needs pyproject.toml, uv.lock, README.md, src/, workloads/ and config/ (see Dockerfile).
 .git
 .github
 .claude
@@ -17,6 +17,4 @@ deploy
 docs
 tests
 tools
-workloads
 services
-config

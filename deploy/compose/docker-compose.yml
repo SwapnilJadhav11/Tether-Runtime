@@ -15,6 +15,14 @@ x-tether-image: &tether-image
 
 x-app-env: &app-env
   TETHER_ENV: dev
+  TETHER_BOOTSTRAP_FILE: /app/config/bootstrap/dev.yaml
+  TETHER_SCENARIOS_DIR: /app/scenarios
+  DEMO_TARGET_URL: http://demo-target:8000
+  # Separate audit and call-binding key families (ADR-0010); values come from .env only.
+  TETHER_AUDIT_ACTIVE_KEY_ID: ${TETHER_AUDIT_ACTIVE_KEY_ID:?set TETHER_AUDIT_ACTIVE_KEY_ID in deploy/compose/.env}
+  TETHER_AUDIT_KEY_DEV1: ${TETHER_AUDIT_KEY_DEV1:?set TETHER_AUDIT_KEY_DEV1 in deploy/compose/.env}
+  TETHER_BINDING_ACTIVE_KEY_ID: ${TETHER_BINDING_ACTIVE_KEY_ID:?set TETHER_BINDING_ACTIVE_KEY_ID in deploy/compose/.env}
+  TETHER_BINDING_KEY_DEV1: ${TETHER_BINDING_KEY_DEV1:?set TETHER_BINDING_KEY_DEV1 in deploy/compose/.env}
   TETHER_DATABASE_URL: postgresql://tether_app:${TETHER_APP_DB_PASSWORD:?set TETHER_APP_DB_PASSWORD in deploy/compose/.env}@postgres:5432/tether
 
 services:
@@ -35,7 +43,8 @@ services:
 
   migrate:
     <<: *tether-image
-    command: ["tether", "migrate"]
+    # Migrations, then the dev bootstrap (workspaces, agents, active policy version).
+    command: ["sh", "-c", "tether migrate && tether bootstrap apply /app/config/bootstrap/dev.yaml"]
     environment:
       TETHER_MIGRATOR_DATABASE_URL: postgresql://tether_migrator:${TETHER_MIGRATOR_DB_PASSWORD}@postgres:5432/tether
     depends_on:
@@ -113,16 +122,17 @@ services:
     ports:
       - "16686:16686"
 
-  # Placeholder until the demo target service is built (S2.5). Internal only; not Tether.
+  # Demo target service (MVP: in-memory state). Internal only; not Tether.
   demo-target:
-    image: python:3.12-slim
-    command: ["python", "-m", "http.server", "8000", "--directory", "/tmp"]
+    build:
+      context: ../../services/demo_target_service
+    image: tether-demo-target:dev
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
       interval: 5s
       timeout: 5s
       retries: 12

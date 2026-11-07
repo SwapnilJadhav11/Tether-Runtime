@@ -13,7 +13,10 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from tether.api.routers import tasks
+from tether.api.routers import approvals, tasks
+from tether.policy.config import BootstrapFile, load_bootstrap
+from tether.secrets.env_provider import EnvSecretsProvider
+from tether.secrets.keyring import KeyRing
 from tether.settings import Settings
 from tether.storage.engine import create_database_engine, create_pool, database_is_reachable
 
@@ -36,7 +39,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Tether", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.settings = resolved
+    app.state.keyring = KeyRing(EnvSecretsProvider())
+    app.state.bootstrap = (
+        load_bootstrap(resolved.bootstrap_file) if resolved.bootstrap_file else BootstrapFile()
+    )
     app.include_router(tasks.router)
+    app.include_router(approvals.router)
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:

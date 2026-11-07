@@ -35,6 +35,8 @@ class LeasedJob:
     run_workspace_id: str
     lease_token: uuid.UUID
     attempts: int
+    ref_id: uuid.UUID | None
+    payload: dict[str, Any]
 
 
 def _seconds_from_now(seconds: float) -> Any:
@@ -78,6 +80,8 @@ async def lease_one(
             _RUNS.c.workspace_id.label("run_workspace_id"),
             _JOBS.c.lease_token,
             _JOBS.c.attempts,
+            _JOBS.c.ref_id,
+            _JOBS.c.payload,
         )
     )
     async with engine.begin() as connection:

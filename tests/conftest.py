@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
+import secrets
 import sys
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -16,6 +18,17 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 REQUIRED_ENV = ("TETHER_MIGRATOR_DB_PASSWORD", "TETHER_APP_DB_PASSWORD")
+
+
+def _random_key() -> str:
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
+# Per-session random audit and call-binding keys (separate families, never shared material).
+os.environ.setdefault("TETHER_AUDIT_ACTIVE_KEY_ID", "TESTA1")
+os.environ.setdefault("TETHER_AUDIT_KEY_TESTA1", _random_key())
+os.environ.setdefault("TETHER_BINDING_ACTIVE_KEY_ID", "TESTB1")
+os.environ.setdefault("TETHER_BINDING_KEY_TESTB1", _random_key())
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,10 @@
+# Scripted model turns for the demo (PD-23): read health, restart (needs approval), report.
+name: restart_checkout
+turns:
+  - tool_calls:
+      - tool: get_service_health
+        arguments: {service: checkout}
+  - tool_calls:
+      - tool: restart_service
+        arguments: {service: checkout}
+  - final: "checkout was unhealthy; restarted it after approval."

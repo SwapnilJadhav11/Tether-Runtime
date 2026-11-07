@@ -1082,6 +1082,7 @@ dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
     { name = "pydantic-settings" },
+    { name = "pyyaml" },
     { name = "rfc8785" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "typer" },
@@ -1098,6 +1099,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "types-pyyaml" },
 ]
 
 [package.metadata]
@@ -1109,6 +1111,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "psycopg-pool", specifier = ">=3.2" },
     { name = "pydantic-settings", specifier = ">=2.6" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "rfc8785", specifier = "==0.1.4" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
     { name = "typer", specifier = ">=0.15" },
@@ -1125,6 +1128,7 @@ dev = [
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.8" },
+    { name = "types-pyyaml", specifier = ">=6.0" },
 ]
 live = []
 
@@ -1150,6 +1154,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/03/51/d33db42cc72ffd8c30777547b42d01f0cbf9d95a770457698d0174b3ed71/typer-0.27.3.tar.gz", hash = "sha256:d0396f770a560ab1b0a8504e13b5f254b728cedb05c61cf0359e944e50ce8901", size = 205303, upload-time = "2026-10-06T17:24:16.61Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/ea/2e31b67051e91a133189e9c000c222502ddc6969856416de0d095de4c0b0/typer-0.27.3-py3-none-any.whl", hash = "sha256:e50022f28b82a86313e54501317a1db64bf8f8d036ff8cfe5ca7e47675454aff", size = 123312, upload-time = "2026-10-06T17:24:15.054Z" },
+]
+
+[[package]]
+name = "types-pyyaml"
+version = "6.0.12.20261103"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d9/82/2ed4d215a2840b467a9a864f03b0d21904250e28f5e1f006ad36fba0311a/types_pyyaml-6.0.12.20261103.tar.gz", hash = "sha256:7a1b5f837881dd35d5448b5f18275164f89f206185e31e8eae6e0b42607bc001", size = 18911, upload-time = "2026-11-03T08:45:23.714Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/10/4353eb86278f6a59aeb9fe2be4d979c20b110b4009fa455a3ea6467cf5cb/types_pyyaml-6.0.12.20261103-py3-none-any.whl", hash = "sha256:444654c61f635dab82c092a511aa96a0ce31164810784b9a37314e3e56532ac8", size = 21299, upload-time = "2026-11-03T08:45:22.749Z" },
 ]
 
 [[package]]

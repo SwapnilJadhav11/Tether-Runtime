@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     # Stored on each run at submission as deadline_at = submission time + this (§11.4).
     run_max_duration_seconds: int = Field(default=3600, gt=0)
 
+    # Bootstrap file (workspaces, agents, policy) loaded by the worker; see `tether bootstrap`.
+    bootstrap_file: Path | None = None
+    # Scenario files for the scripted model provider (dev/test only, PD-23).
+    scenarios_dir: Path = Path("scenarios")
+    max_model_turns: int = Field(default=8, gt=0)
+    # How long an approval request stays decidable (expiry is checked at decision time).
+    approval_ttl_seconds: int = Field(default=3600, gt=0)
+
     worker_poll_interval_seconds: float = 1.0
     # How long a leased job stays invisible to other workers before it can be reclaimed.
     worker_lease_seconds: float = Field(default=60.0, gt=0)

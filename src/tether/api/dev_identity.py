@@ -1,8 +1,9 @@
 """TEMPORARY dev/test-only identity shortcut. S1.8 replaces this whole module.
 
 ADR-0013 requires the workspace, agent and requester to come from a validated tasks JWT plus an
-API key. Until S1.8 exists, the walking skeleton takes them from the request instead: a
-``dev_identity`` body object on submit and a ``dev_workspace_id`` query parameter on reads.
+API key, and the approver from an approvals token. Until S1.8 exists, the MVP takes them
+from the request instead: a ``dev_identity`` body object on submit and on approval decisions,
+and a ``dev_workspace_id`` query parameter on reads.
 
 Rules that keep the shortcut contained:
 - Every route that uses it is refused with ``404`` when ``TETHER_ENV`` is ``prod``.
@@ -42,6 +43,20 @@ class DevIdentity(BaseModel):
     requester: DevRequester
 
 
+@dataclass(frozen=True)
+class Approver:
+    """Who is deciding an approval: their workspace and a ``{sub, roles}`` snapshot."""
+
+    workspace_id: str
+    person: dict[str, Any]
+
+
+class DevApprover(BaseModel):
+    workspace_id: str = Field(min_length=1)
+    sub: str = Field(min_length=1)
+    roles: list[str] = Field(default_factory=list)
+
+
 def refuse_in_prod(request: Request) -> None:
     if request.app.state.settings.env == "prod":
         raise HTTPException(status.HTTP_404_NOT_FOUND)
@@ -52,6 +67,13 @@ def dev_submit_principal(dev_identity: Annotated[DevIdentity, Body()]) -> Princi
         workspace_id=dev_identity.workspace_id,
         agent_id=dev_identity.agent_id,
         requester=dev_identity.requester.model_dump(),
+    )
+
+
+def dev_approver(dev_identity: Annotated[DevApprover, Body()]) -> Approver:
+    return Approver(
+        workspace_id=dev_identity.workspace_id,
+        person={"sub": dev_identity.sub, "roles": list(dev_identity.roles)},
     )
 
 

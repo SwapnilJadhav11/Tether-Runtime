@@ -1,0 +1,14 @@
+# Dev bootstrap (ADR-0014): applied by the migrate service with `tether bootstrap apply`.
+# The api and worker load the same file; decisions are made only under its active version.
+workspaces:
+  - id: ops-demo
+    agents:
+      - id: incident-remediator
+        workload: incident_remediation
+    policy:
+      rules:
+        - tool: get_service_health
+          decision: allow
+        - tool: restart_service
+          decision: require_approval
+          approver_roles: [oncall]

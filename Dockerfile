@@ -5,7 +5,8 @@
 #   tether-worker  the worker process
 #   tether migrate the one-shot migrate service
 #   tether         the CLI
-# Workloads, the dev token issuer and other dev tools are not part of this image.
+# MVP: the reference workload ships in the wheel (entry point) and config/ holds the dev
+# bootstrap file. The dev token issuer and other dev tools are not part of this image.
 
 FROM python:3.12-slim AS build
 COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /usr/local/bin/uv
@@ -18,6 +19,7 @@ WORKDIR /src
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY src ./src
+COPY workloads ./workloads
 RUN uv sync --locked --no-dev --no-editable
 
 FROM python:3.12-slim AS runtime
@@ -25,6 +27,8 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 COPY --from=build /opt/venv /opt/venv
+COPY config /app/config
+COPY workloads/incident_remediation/scenarios /app/scenarios
 RUN useradd --system --uid 10001 --no-create-home tether
 USER tether
 WORKDIR /tmp
