@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,7 +34,12 @@ class Settings(BaseSettings):
     # Upper bound on how long a readiness/database check may wait for a connection.
     readiness_timeout_seconds: float = 2.0
 
+    # Stored on each run at submission as deadline_at = submission time + this (§11.4).
+    run_max_duration_seconds: int = Field(default=3600, gt=0)
+
     worker_poll_interval_seconds: float = 1.0
+    # How long a leased job stays invisible to other workers before it can be reclaimed.
+    worker_lease_seconds: float = Field(default=60.0, gt=0)
     worker_heartbeat_file: Path = _default_heartbeat_file()
     worker_heartbeat_max_age_seconds: float = 30.0
 

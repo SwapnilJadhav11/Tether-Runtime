@@ -1,6 +1,7 @@
 """FastAPI application factory and the ``tether-api`` entrypoint.
 
-S1.2 serves only the unauthenticated liveness and readiness probes, which return no data.
+Serves the unauthenticated liveness and readiness probes, which return no data, and the
+``/v1/tasks`` router.
 """
 
 from __future__ import annotations
@@ -12,8 +13,9 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from tether.api.routers import tasks
 from tether.settings import Settings
-from tether.storage.engine import create_pool, database_is_reachable
+from tether.storage.engine import create_database_engine, create_pool, database_is_reachable
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -21,15 +23,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        pool = create_pool(resolved.database_url.get_secret_value(), name="tether-api")
+        dsn = resolved.database_url.get_secret_value()
+        pool = create_pool(dsn, name="tether-api")
         await pool.open(wait=False)
         app.state.db_pool = pool
+        app.state.db_engine = create_database_engine(dsn)
         try:
             yield
         finally:
+            await app.state.db_engine.dispose()
             await pool.close()
 
     app = FastAPI(title="Tether", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app.state.settings = resolved
+    app.include_router(tasks.router)
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:

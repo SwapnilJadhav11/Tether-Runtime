@@ -1,21 +1,32 @@
 """Worker process entrypoint.
 
-S1.2 runs an idle loop: it checks database connectivity each interval and, while the database
-is reachable, refreshes a heartbeat file that the container healthcheck reads. Job leasing
-arrives with the job queue (S2.1).
+Each poll interval the worker checks database connectivity and, while the database is reachable,
+refreshes a heartbeat file that the container healthcheck reads and processes every due job.
+Walking-skeleton scope: only ``advance_run`` jobs are leased.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import signal
 import sys
 import time
 from pathlib import Path
 
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from tether.core.statuses import JobKind
+from tether.queue import postgres as queue
 from tether.settings import Settings
-from tether.storage.engine import create_pool, database_is_reachable
+from tether.storage.engine import create_database_engine, create_pool, database_is_reachable
+from tether.worker.handlers import advance_run
+
+logger = logging.getLogger(__name__)
+
+# A job whose run lock is held elsewhere is retried after this delay, without using an attempt.
+CONTENDED_RETRY_SECONDS = 1.0
 
 
 def heartbeat_is_fresh(path: Path, *, max_age_seconds: float) -> bool:
@@ -26,16 +37,43 @@ def heartbeat_is_fresh(path: Path, *, max_age_seconds: float) -> bool:
     return time.time() - modified <= max_age_seconds
 
 
+async def process_next_job(engine: AsyncEngine, settings: Settings) -> bool:
+    """Lease and process one due job; ``False`` if there was none."""
+    job = await queue.lease_one(
+        engine, kinds=(JobKind.ADVANCE_RUN,), lease_seconds=settings.worker_lease_seconds
+    )
+    if job is None:
+        return False
+    outcome = await advance_run.handle(engine, job)
+    if outcome is advance_run.Outcome.COMPLETED:
+        await queue.complete(engine, job)
+    elif outcome is advance_run.Outcome.CONTENDED:
+        await queue.release(engine, job, delay_seconds=CONTENDED_RETRY_SECONDS, refund_attempt=True)
+    else:
+        # Fenced: leave the run to the newer driver; this job is retried and re-checks the run.
+        await queue.release(engine, job, delay_seconds=0, refund_attempt=False)
+    return True
+
+
 async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
-    pool = create_pool(settings.database_url.get_secret_value(), name="tether-worker")
+    dsn = settings.database_url.get_secret_value()
+    pool = create_pool(dsn, name="tether-worker")
+    engine = create_database_engine(dsn)
     await pool.open(wait=False)
     try:
         while not stop.is_set():
             if await database_is_reachable(pool, timeout=settings.readiness_timeout_seconds):
                 settings.worker_heartbeat_file.touch()
+                try:
+                    while not stop.is_set() and await process_next_job(engine, settings):
+                        pass
+                except Exception:
+                    # The job keeps its lease and is retried after it expires; keep serving.
+                    logger.exception("job processing failed")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=settings.worker_poll_interval_seconds)
     finally:
+        await engine.dispose()
         await pool.close()
 
 
