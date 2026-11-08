@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Iterable
 from typing import Any, cast
 
-from sqlalchemy import func, select, update
+from sqlalchemy import Select, and_, case, func, or_, select, update
 from sqlalchemy.engine import RowMapping
 
 from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind, JobState, RunStatus
@@ -62,15 +62,66 @@ class RunsRepository(ScopedRepository):
         row = (await self._connection.execute(statement)).first()
         return None if row is None else (int(row[0]), RunStatus(row[1]))
 
+    def _with_stop(self) -> Select[Any]:
+        """The run row plus the stop predicate by database time (ADR-0006, invariant 29).
+
+        ``stopped``: cancel requested or the deadline reached. ``stop_status``: the terminal status
+        a stop leads to; whichever stop came first wins.
+        """
+        runs = self.table
+        deadline_reached = func.clock_timestamp() >= runs.c.deadline_at
+        cancelled_first = and_(
+            runs.c.cancel_requested_at.is_not(None),
+            runs.c.cancel_requested_at <= runs.c.deadline_at,
+        )
+        return select(
+            runs,
+            or_(runs.c.cancel_requested_at.is_not(None), deadline_reached).label("stopped"),
+            deadline_reached.label("deadline_reached"),
+            case(
+                (cancelled_first, RunStatus.CANCELLED.value),
+                (deadline_reached, RunStatus.TIMED_OUT.value),
+                (runs.c.cancel_requested_at.is_not(None), RunStatus.CANCELLED.value),
+            ).label("stop_status"),
+        )
+
     async def share_lock(self, run_id: uuid.UUID) -> RowMapping:
         """Share-lock the run row (``FOR SHARE``). ``stopped`` is the stop predicate now."""
-        runs = self.table
-        statement = self.scoped(
-            select(runs, (func.clock_timestamp() >= runs.c.deadline_at).label("stopped")).where(
-                runs.c.id == run_id
-            )
-        ).with_for_update(read=True)
+        statement = self.scoped(self._with_stop().where(self.table.c.id == run_id))
+        statement = statement.with_for_update(read=True)
         return cast("RowMapping", (await self._connection.execute(statement)).mappings().one())
+
+    async def lock(self, run_id: uuid.UUID) -> RowMapping | None:
+        """Lock the run row ``FOR UPDATE`` (TX9, TX10, TX-EA); ``None`` if not in scope."""
+        statement = self.scoped(self._with_stop().where(self.table.c.id == run_id))
+        row = (await self._connection.execute(statement.with_for_update())).mappings().first()
+        return cast("RowMapping | None", row)
+
+    async def request_cancel(self, run_id: uuid.UUID, requested_by: str) -> None:
+        """TX9's stop flag. A request, never a status: only the run driver writes status."""
+        runs = self.table
+        await self._connection.execute(
+            update(runs)
+            .where(
+                runs.c.workspace_id == self.scope.workspace_id,
+                runs.c.id == run_id,
+                runs.c.cancel_requested_at.is_(None),
+            )
+            .values(cancel_requested_at=func.clock_timestamp(), cancel_requested_by=requested_by)
+        )
+
+    async def record_deadline_exceeded(self, run_id: uuid.UUID) -> None:
+        """TX10's marker: the stored deadline has passed (the deadline itself never changes)."""
+        runs = self.table
+        await self._connection.execute(
+            update(runs)
+            .where(
+                runs.c.workspace_id == self.scope.workspace_id,
+                runs.c.id == run_id,
+                runs.c.deadline_exceeded_at.is_(None),
+            )
+            .values(deadline_exceeded_at=func.clock_timestamp())
+        )
 
     async def guard(self, run_id: uuid.UUID, generation: int) -> RowMapping:
         """``share_lock`` for a run-driver write, asserting the fencing token (ADR-0005)."""
@@ -125,17 +176,20 @@ class JobsRepository(ScopedRepository):
         *,
         ref_id: uuid.UUID | None = None,
         payload: dict[str, Any] | None = None,
+        run_after: Any = None,
     ) -> None:
-        await self.add(
-            {
-                "id": uuid.uuid4(),
-                "kind": kind,
-                "run_id": run_id,
-                "ref_id": ref_id,
-                "payload": payload or {},
-                "max_attempts": MAX_ATTEMPTS[kind],
-            }
-        )
+        """Insert a job in the caller's transaction; ``run_after`` delays it (a timer)."""
+        values: dict[str, Any] = {
+            "id": uuid.uuid4(),
+            "kind": kind,
+            "run_id": run_id,
+            "ref_id": ref_id,
+            "payload": payload or {},
+            "max_attempts": MAX_ATTEMPTS[kind],
+        }
+        if run_after is not None:
+            values["run_after"] = run_after
+        await self.add(values)
 
     async def mark_dead(self, job_id: uuid.UUID, lease_token: uuid.UUID) -> bool:
         """TX12's last write: ``leased → dead``, refused unless this lease is still current."""

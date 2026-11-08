@@ -268,9 +268,11 @@ async def test_no_decision_is_made_under_a_stale_policy_version(
     assert run_status(seeded, run_id)[0] == "running"
     assert events(seeded, run_id) == ["RUN_SUBMITTED"]
     # Re-queued for later without consuming an attempt.
-    assert rows(seeded, "SELECT state, attempts FROM tether.jobs WHERE run_id = %s", run_id) == [
-        ("ready", 0)
-    ]
+    assert rows(
+        seeded,
+        "SELECT state, attempts FROM tether.jobs WHERE run_id = %s AND kind = 'advance_run'",
+        run_id,
+    ) == [("ready", 0)]
 
 
 # --- M6: execute_tool (TX6 dispatch commit, TX6r re-dispatch, TX7 outcome) -----------------

@@ -2,8 +2,9 @@
 
 Each poll interval the worker checks database connectivity and, while the database is reachable,
 refreshes a heartbeat file that the container healthcheck reads and processes every due job.
-MVP scope: ``advance_run`` and ``execute_tool`` jobs are leased; timers are not implemented. A job
-leased past its ``max_attempts`` goes to its TX12 dead-letter transition instead of its handler.
+It leases ``advance_run``, ``execute_tool`` and the two timers (``run_deadline``,
+``expire_approval``). A job leased past its ``max_attempts`` goes to its TX12 dead-letter
+transition instead of its handler.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from tether.queue import postgres as queue
 from tether.runtime.driver import WorkerRuntime
 from tether.settings import Settings
 from tether.storage.engine import create_pool, database_is_reachable
-from tether.worker.handlers import advance_run, execute_tool
+from tether.worker.handlers import advance_run, execute_tool, timers
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,11 @@ def heartbeat_is_fresh(path: Path, *, max_age_seconds: float) -> bool:
     return time.time() - modified <= max_age_seconds
 
 
-HANDLED_KINDS = (JobKind.ADVANCE_RUN, JobKind.EXECUTE_TOOL)
+TIMER_KINDS = {
+    JobKind.RUN_DEADLINE: timers.run_deadline,
+    JobKind.EXPIRE_APPROVAL: timers.expire_approval,
+}
+HANDLED_KINDS = (JobKind.ADVANCE_RUN, JobKind.EXECUTE_TOOL, *TIMER_KINDS)
 
 
 async def process_next_job(runtime: WorkerRuntime, kinds: Sequence[str] | None = None) -> bool:
@@ -53,6 +58,8 @@ async def process_next_job(runtime: WorkerRuntime, kinds: Sequence[str] | None =
         # Bounded delivery (§11 AD-08): TX12 instead of the handler; it marks the job dead.
         if job.kind == JobKind.EXECUTE_TOOL:
             await execute_tool.dead_letter(runtime, job)
+        elif job.kind in TIMER_KINDS:
+            await timers.dead_letter(runtime, job)
         elif await advance_run.dead_letter(runtime, job) is advance_run.Outcome.CONTENDED:
             # Another driver holds the run: try TX12 again later, without spending an attempt.
             await queue.release(
@@ -67,6 +74,10 @@ async def process_next_job(runtime: WorkerRuntime, kinds: Sequence[str] | None =
         else:
             # A retry is this job delivered again after its backoff; the attempt stays spent.
             await queue.release(engine, job, delay_seconds=retry_in, refund_attempt=False)
+        return True
+    if job.kind in TIMER_KINDS:
+        await TIMER_KINDS[JobKind(job.kind)](runtime, job)
+        await queue.complete(engine, job)
         return True
     outcome = await advance_run.handle(runtime, job)
     if outcome is advance_run.Outcome.COMPLETED:

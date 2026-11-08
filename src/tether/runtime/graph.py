@@ -158,7 +158,29 @@ def _tool_message(call_id: str, outcome: str, content: Any) -> dict[str, Any]:
 
 
 def build_graph(ctx: RunContext) -> StateGraph[RunState]:
+    async def stopped(uow: UnitOfWork, run: Any) -> RunState:
+        """A stopped run ends ``cancelled`` or ``timed_out`` (ADR-0006). The summary names every
+        reconciled outcome, so a reconciled stop is never reported as clean."""
+        status = RunStatus(run["stop_status"])
+        reason = (
+            f"cancelled by {run['cancel_requested_by']}"
+            if status == RunStatus.CANCELLED
+            else "deadline passed"
+        )
+        entries = await uow.repository(LedgerRepository, ctx.scope).for_run(ctx.run_id)
+        reconciled = [
+            f"{entry['tool']} {entry['resolution']}"
+            for entry in entries
+            if str(entry["resolution"] or "").startswith("reconciled_")
+        ]
+        return {"end_status": status, "final_text": "; ".join([reason, *reconciled])}
+
     async def call_model(state: RunState) -> RunState:
+        # G0: the stop predicate before every provider attempt (§9.2).
+        async with UnitOfWork(ctx.engine) as uow:
+            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
+            if run["stopped"]:
+                return await stopped(uow, run)
         if state["turns"] >= ctx.max_turns:
             return {"end_status": RunStatus.FAILED, "final_text": "model turn budget exhausted"}
         history = [NeutralMessage.model_validate(m) for m in state["history"]]
@@ -184,6 +206,11 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "finished_at": func.clock_timestamp(),
                 }
             )
+            # A stop committed while the request was in flight: the response is recorded for
+            # cost above, and its proposals are never governed (§9.2).
+            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
+            if run["stopped"]:
+                return await stopped(uow, run)
         if turn is None:
             return {"end_status": RunStatus.FAILED, "final_text": failure}
         first = state["next_step_ordinal"]
@@ -233,7 +260,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             if adopted is not None:
                 return {"decision": adopted.payload}
             if run["stopped"]:
-                return {"end_status": RunStatus.TIMED_OUT, "final_text": "deadline passed"}
+                return await stopped(uow, run)
             descriptor = ctx.registry.offered(call["tool"])
             args: BaseModel | list[str] = (
                 _validate(descriptor, call["arguments"])
@@ -300,13 +327,16 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 return {"approval_id": str(existing["id"])}
             run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             if run["stopped"]:
-                return {"end_status": RunStatus.TIMED_OUT, "final_text": "deadline passed"}
+                return await stopped(uow, run)
             descriptor = _required(ctx.registry.offered(call["tool"]), "offered tool")
             args = _validate(descriptor, call["arguments"])
             if isinstance(args, list):
                 raise RuntimeError("a decided call no longer validates")
             approval_id = uuid.uuid4()
             masked = mask(args)
+            expiry = func.clock_timestamp() + func.make_interval(
+                0, 0, 0, 0, 0, 0, ctx.approval_ttl_seconds
+            )
             await approvals.add(
                 {
                     "id": approval_id,
@@ -317,8 +347,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "tool_version": descriptor.version,
                     "arguments_masked": masked,
                     "preconditions_masked": {},
-                    "expires_at": func.clock_timestamp()
-                    + func.make_interval(0, 0, 0, 0, 0, 0, ctx.approval_ttl_seconds),
+                    "expires_at": expiry,
                 }
             )
             await uow.repository(AuditRepository, ctx.scope).append(
@@ -332,6 +361,11 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "arguments": masked,
                 },
                 tool=descriptor.name,
+            )
+            # TX3's timer (TX-EA). The same expression, evaluated after the insert, makes it due
+            # no earlier than the stored expiry.
+            await uow.repository(JobsRepository, ctx.scope).enqueue(
+                JobKind.EXPIRE_APPROVAL, ctx.run_id, ref_id=approval_id, run_after=expiry
             )
         return {"approval_id": str(approval_id)}
 
@@ -369,7 +403,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 return {"ledger_id": str(existing["id"])}
             run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             if run["stopped"]:
-                return {"end_status": RunStatus.TIMED_OUT, "final_text": "deadline passed"}
+                return await stopped(uow, run)
             descriptor = ctx.registry.offered(call["tool"])
             args = _validate(descriptor, call["arguments"]) if descriptor else []
             if descriptor is None or isinstance(args, list):

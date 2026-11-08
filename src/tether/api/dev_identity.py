@@ -2,8 +2,8 @@
 
 ADR-0013 requires the workspace, agent and requester to come from a validated tasks JWT plus an
 API key, and the approver from an approvals token. Until S1.8 exists, the MVP takes them
-from the request instead: a ``dev_identity`` body object on submit, on approval decisions and
-on reconciliations, and a ``dev_workspace_id`` query parameter on reads.
+from the request instead: a ``dev_identity`` body object on submit, on approval decisions, on
+reconciliations and on cancellations, and a ``dev_workspace_id`` query parameter on reads.
 
 Rules that keep the shortcut contained:
 - Every route that uses it is refused with ``404`` when ``TETHER_ENV`` is ``prod``.
@@ -90,6 +90,18 @@ def dev_reconciler(dev_identity: Annotated[DevApprover, Body()]) -> Reconciler:
         workspace_id=dev_identity.workspace_id,
         person={"sub": dev_identity.sub, "roles": list(dev_identity.roles)},
     )
+
+
+@dataclass(frozen=True)
+class Canceller:
+    """Who is cancelling a run: their workspace and subject (only the requester may, PRD)."""
+
+    workspace_id: str
+    sub: str
+
+
+def dev_canceller(dev_identity: Annotated[DevApprover, Body(embed=True)]) -> Canceller:
+    return Canceller(workspace_id=dev_identity.workspace_id, sub=dev_identity.sub)
 
 
 def dev_read_scope(dev_workspace_id: Annotated[str, Query(min_length=1)]) -> WorkspaceScope:

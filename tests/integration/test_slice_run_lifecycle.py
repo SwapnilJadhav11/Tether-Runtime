@@ -137,12 +137,13 @@ def run_row(seeded: Any, run_id: uuid.UUID) -> tuple[Any, ...]:
     return rows[0]
 
 
-def job_rows(seeded: Any, run_id: uuid.UUID) -> list[tuple[Any, ...]]:
+def job_rows(seeded: Any, run_id: uuid.UUID, kind: str = "advance_run") -> list[tuple[Any, ...]]:
     return query(
         seeded,
         "SELECT kind, state, attempts, workspace_id, run_after > clock_timestamp()"
-        " FROM tether.jobs WHERE run_id = %s",
+        " FROM tether.jobs WHERE run_id = %s AND kind = %s",
         run_id,
+        kind,
     )
 
 
@@ -162,6 +163,8 @@ async def test_submit_persists_a_queued_run_and_one_ready_advance_run_job(
     assert task_input == {"message": "hello #scenario=answer"}
     assert has_deadline
     assert job_rows(seeded, run_id) == [("advance_run", "ready", 0, "ws-a", False)]
+    # TX1 also enqueues the run's deadline timer, due in the future (§11.4).
+    assert job_rows(seeded, run_id, "run_deadline") == [("run_deadline", "ready", 0, "ws-a", True)]
     # TX1 writes the chain's genesis event (ADR-0015).
     assert query(
         seeded, "SELECT seq, event_type, actor FROM tether.audit_events WHERE run_id = %s", run_id

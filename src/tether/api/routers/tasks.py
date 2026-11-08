@@ -1,7 +1,6 @@
-"""``/v1/tasks``: submit a run (TX1) and read it back.
+"""``/v1/tasks``: submit a run (TX1), read it back, and cancel it (TX9).
 
-Walking-skeleton scope: identity comes from the temporary dev/test shortcut (S1.8 replaces it),
-and TX1 enqueues no ``run_deadline`` job yet (S5.1).
+Identity comes from the temporary dev/test shortcut (S1.8 replaces it).
 """
 
 from __future__ import annotations
@@ -16,10 +15,18 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from tether.api.dev_identity import Principal, dev_read_scope, dev_submit_principal, refuse_in_prod
+from tether.api.dev_identity import (
+    Canceller,
+    Principal,
+    dev_canceller,
+    dev_read_scope,
+    dev_submit_principal,
+    refuse_in_prod,
+)
 from tether.audit.chain import verify_run
 from tether.core.ids import WorkspaceId
 from tether.core.statuses import JobKind, RunStatus
+from tether.runtime import stop_requests
 from tether.secrets.keyring import KeyFamily
 from tether.storage.repos.approvals import ApprovalsRepository
 from tether.storage.repos.audit import AuditRepository
@@ -75,6 +82,9 @@ class RunView(BaseModel):
     outcome_summary: str | None
     deadline_at: datetime
     created_at: datetime
+    cancel_requested_at: datetime | None
+    cancel_requested_by: str | None
+    deadline_exceeded_at: datetime | None
     approvals: list[ApprovalView]
     ledger: list[LedgerView]
     audit: list[AuditView]
@@ -116,13 +126,60 @@ async def submit_run(
                 actor=principal.requester["sub"],
                 payload={"agent_id": principal.agent_id, "requester": principal.requester},
             )
-            await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run_id)
+            jobs = uow.repository(JobsRepository, scope)
+            await jobs.enqueue(JobKind.ADVANCE_RUN, run_id)
+            # TX1's timer (§11.4). The same expression, evaluated after the run insert, makes it
+            # due no earlier than the stored deadline it enforces.
+            await jobs.enqueue(JobKind.RUN_DEADLINE, run_id, run_after=deadline_at)
     except IntegrityError as error:
         # The agent does not exist in this workspace: not found, as for any out-of-scope id.
         if isinstance(error.orig, pg_errors.ForeignKeyViolation):
             raise HTTPException(status.HTTP_404_NOT_FOUND) from None
         raise
     return SubmittedRun(run_id=run_id, status=RunStatus.QUEUED)
+
+
+class CancelRequested(BaseModel):
+    run_id: uuid.UUID
+    status: str
+    cancel_requested_at: datetime | None
+    cancel_requested_by: str | None
+
+
+@router.post("/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+async def cancel_run(
+    request: Request,
+    run_id: uuid.UUID,
+    canceller: Annotated[Canceller, Depends(dev_canceller)],
+) -> CancelRequested:
+    """TX9: record the requester's cancel request; the run driver ends the run (ADR-0006).
+
+    Only the run's requester may cancel it here; anyone else, another workspace or an unknown run
+    gets ``404``. Repeating it, or cancelling a terminal run, changes nothing.
+    """
+    scope = WorkspaceScope(WorkspaceId(canceller.workspace_id))
+    async with UnitOfWork(request.app.state.db_engine) as uow:
+        runs = uow.repository(RunsRepository, scope)
+        run = await runs.lock(run_id)
+        if run is None or run["requester_snapshot"].get("sub") != canceller.sub:
+            raise HTTPException(status.HTTP_404_NOT_FOUND)
+        await stop_requests.request_cancel(
+            uow, request.app.state.keyring, scope, run, by=canceller.sub
+        )
+        current = await runs.get(run_id)
+    current = _required_row(current)
+    return CancelRequested(
+        run_id=run_id,
+        status=current["status"],
+        cancel_requested_at=current["cancel_requested_at"],
+        cancel_requested_by=current["cancel_requested_by"],
+    )
+
+
+def _required_row(row: Any) -> Any:
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    return row
 
 
 @router.get("/runs/{run_id}")

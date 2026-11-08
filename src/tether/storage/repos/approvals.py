@@ -43,6 +43,38 @@ class ApprovalsRepository(ScopedRepository):
         row = (await self._connection.execute(statement)).mappings().first()
         return cast("RowMapping | None", row)
 
+    async def close_pending(self, run_id: uuid.UUID) -> list[RowMapping]:
+        """TX9/TX10: every pending approval of the run becomes ``closed`` (non-actionable)."""
+        approvals = self.table
+        statement = (
+            update(approvals)
+            .where(
+                approvals.c.workspace_id == self.scope.workspace_id,
+                approvals.c.run_id == run_id,
+                approvals.c.status == "pending",
+            )
+            .values(status="closed")
+            .returning(approvals.c.id, approvals.c.step_ordinal, approvals.c.tool)
+        )
+        rows = (await self._connection.execute(statement)).mappings().all()
+        return sorted(rows, key=lambda row: row["step_ordinal"])
+
+    async def expire(self, approval_id: uuid.UUID) -> bool:
+        """TX-EA: ``pending → expired`` once its expiry has passed. False if refused."""
+        approvals = self.table
+        statement = (
+            update(approvals)
+            .where(
+                approvals.c.workspace_id == self.scope.workspace_id,
+                approvals.c.id == approval_id,
+                approvals.c.status == "pending",
+                func.clock_timestamp() >= approvals.c.expires_at,
+            )
+            .values(status="expired")
+            .returning(approvals.c.id)
+        )
+        return (await self._connection.execute(statement)).first() is not None
+
     async def decide(
         self,
         approval_id: uuid.UUID,
