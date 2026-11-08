@@ -1,20 +1,27 @@
 """``execute_tool``: the only place a tool's side effect happens (§12, ADR-0007, ADR-0008).
 
-TX6 commits ``pending → dispatched`` (and its audit event) before the external call. A redelivery
-of a ``dispatched`` entry re-sends only for idempotent tools after committing TX6r; otherwise the
-outcome is unknown and the entry becomes ``indeterminate``. TX7 records the masked outcome,
-audits it and wakes the run. Outcomes are honest: an unknown write result is never a failure.
+TX6 commits ``pending → dispatched`` (and its audit event) before the external call. TX7 records
+the masked outcome, audits it and wakes the run. Outcomes are honest: an unknown write result is
+never a failure.
+
+Retries (§12.3, §12.4): an unknown outcome of a read or an idempotent write leaves the entry
+``dispatched`` and the job is released with a PD-13 backoff as its ``run_after``. The next
+delivery re-sends with the same key, but only after committing the stop-gated TX6r record. The
+tool's send budget (PD-14) is shared by retries and redeliveries; when it is spent, the unknown
+outcome is final: ``indeterminate`` for a write, a typed failure for a read. A non-idempotent
+write is never re-sent. ``dead_letter`` is TX12 for a job delivered past ``max_attempts``.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.engine import RowMapping
 
 from tether.core.hashing import call_hashes_equal
 from tether.core.statuses import JobKind
+from tether.queue import backoff
 from tether.queue.postgres import LeasedJob
 from tether.registry.masking import mask
 from tether.runtime.driver import WorkerRuntime
@@ -28,7 +35,22 @@ from tether.storage.uow import UnitOfWork
 
 TERMINAL_LEDGER_STATES = frozenset({"completed", "failed", "indeterminate", "abandoned"})
 
-Send = tuple[RowMapping, ToolDescriptor, BaseModel]
+# entry (as before this send), descriptor, validated arguments, this send's attempt number
+Send = tuple[RowMapping, ToolDescriptor, BaseModel, int]
+
+
+class _StaleLease(Exception):  # noqa: N818 - a control-flow signal that rolls TX12 back
+    """Another lessee owns the job now: TX12 must not commit."""
+
+
+def _resendable(entry: RowMapping) -> bool:
+    # Reads are recorded as idempotent: sending one again has no effect to duplicate.
+    return bool(entry["idempotency_support"] == "idempotent")
+
+
+def _unknown_state(entry: RowMapping) -> str:
+    """Where an unknown outcome ends once it may not be re-sent (ADR-0007)."""
+    return "indeterminate" if entry["effect"] == "write" else "failed"
 
 
 def _descriptor(
@@ -114,12 +136,21 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
                 return None
             event = "DISPATCHED"
         else:
-            # Redelivery of a dispatched entry (ADR-0008): re-send only when safe.
-            if run["stopped"] or entry["idempotency_support"] != "idempotent":
-                unknown = "indeterminate" if entry["effect"] == "write" else "failed"
-                reason = "outcome unknown after redelivery; not re-sent"
+            # A re-send of a dispatched entry, retry or redelivery (ADR-0008): only when safe.
+            refusal: str | None = None
+            if run["stopped"] or not _resendable(entry):
+                refusal = "outcome unknown after redelivery; not re-sent"
+            elif entry["attempts"] >= descriptor.max_attempts:
+                refusal = f"outcome unknown after {entry['attempts']} attempts; not re-sent"
+            if refusal is not None:
                 await _record(
-                    uow, runtime, scope, entry, expected=state, new=unknown, reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new=_unknown_state(entry),
+                    reason=refusal,
                 )
                 return None
             event = "REDISPATCHED"
@@ -132,17 +163,18 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
             payload={"ledger_id": str(entry["id"]), "attempt": attempt},
             tool=entry["tool"],
         )
-    return entry, descriptor, args
+    return entry, descriptor, args, attempt
 
 
-async def handle(runtime: WorkerRuntime, job: LeasedJob) -> None:
+async def handle(runtime: WorkerRuntime, job: LeasedJob) -> float | None:
+    """Run one delivery. Returns the retry delay in seconds, or ``None`` when the job is done."""
     scope = WorkspaceScope.for_job(
         job_workspace_id=job.workspace_id, run_workspace_id=job.run_workspace_id
     )
     prepared = await _prepare(runtime, scope, job)
     if prepared is None:
-        return
-    entry, descriptor, args = prepared
+        return None
+    entry, descriptor, args, attempt = prepared
     output: dict[str, Any] | None = None
     reason: str | None = None
     context = ToolContext(idempotency_key=entry["idempotency_key"])
@@ -153,10 +185,55 @@ async def handle(runtime: WorkerRuntime, job: LeasedJob) -> None:
     except ToolNotApplied as not_applied:
         new, reason = "failed", f"not applied: {not_applied.reason}"
     except Exception as error:
+        # Unknown outcome. Re-send with the same key while the budget lasts, but only when that
+        # cannot duplicate an effect. Invalid output is never retried (PD-33).
+        retry = (
+            _resendable(entry)
+            and attempt < descriptor.max_attempts
+            and not isinstance(error, ValidationError)
+        )
+        if retry:
+            return backoff.tool_backoff_seconds(attempt)
         # ADR-0007: a write whose result is unknown is indeterminate, never failed.
-        new = "indeterminate" if descriptor.effect == "write" else "failed"
-        reason = f"outcome unknown: {type(error).__name__}"
+        new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
     async with UnitOfWork(runtime.engine) as uow:
         await _record(
             uow, runtime, scope, entry, expected="dispatched", new=new, output=output, reason=reason
         )
+    return None
+
+
+async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
+    """TX12 for ``execute_tool``: the entry's domain outcome, in the transaction that marks the job
+    ``dead`` (ADR-0004). Nothing is sent. Refused as a whole if this lease is no longer current."""
+    scope = WorkspaceScope.for_job(
+        job_workspace_id=job.workspace_id, run_workspace_id=job.run_workspace_id
+    )
+    try:
+        async with UnitOfWork(runtime.engine) as uow:
+            # Lock order: run row → ledger row → audit head → jobs (§13.1).
+            await uow.repository(RunsRepository, scope).share_lock(job.run_id)
+            entry = None
+            if job.ref_id is not None:
+                entry = await uow.repository(LedgerRepository, scope).lock(job.ref_id)
+            if entry is not None and entry["state"] == "pending":
+                # No call is reachable without TX6: this one never left Tether.
+                reason = "not applied: delivery exhausted before dispatch"
+                await _record(
+                    uow, runtime, scope, entry, expected="pending", new="failed", reason=reason
+                )
+            elif entry is not None and entry["state"] == "dispatched":
+                reason = "outcome unknown: delivery exhausted"
+                await _record(
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected="dispatched",
+                    new=_unknown_state(entry),
+                    reason=reason,
+                )
+            if not await uow.repository(JobsRepository, scope).mark_dead(job.id, job.lease_token):
+                raise _StaleLease
+    except _StaleLease:
+        return

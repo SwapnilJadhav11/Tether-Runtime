@@ -2,7 +2,8 @@
 
 Each poll interval the worker checks database connectivity and, while the database is reachable,
 refreshes a heartbeat file that the container healthcheck reads and processes every due job.
-MVP scope: ``advance_run`` and ``execute_tool`` jobs are leased; timers are not implemented.
+MVP scope: ``advance_run`` and ``execute_tool`` jobs are leased; timers are not implemented. A job
+leased past its ``max_attempts`` goes to its TX12 dead-letter transition instead of its handler.
 """
 
 from __future__ import annotations
@@ -48,10 +49,24 @@ async def process_next_job(runtime: WorkerRuntime, kinds: Sequence[str] | None =
     )
     if job is None:
         return False
+    if job.attempts > job.max_attempts:
+        # Bounded delivery (§11 AD-08): TX12 instead of the handler; it marks the job dead.
+        if job.kind == JobKind.EXECUTE_TOOL:
+            await execute_tool.dead_letter(runtime, job)
+        elif await advance_run.dead_letter(runtime, job) is advance_run.Outcome.CONTENDED:
+            # Another driver holds the run: try TX12 again later, without spending an attempt.
+            await queue.release(
+                engine, job, delay_seconds=CONTENDED_RETRY_SECONDS, refund_attempt=True
+            )
+        return True
     if job.kind == JobKind.EXECUTE_TOOL:
-        await execute_tool.handle(runtime, job)
-        # TX7 is already committed; completing needs the current lease token (no rollback).
-        await queue.complete(engine, job)
+        retry_in = await execute_tool.handle(runtime, job)
+        if retry_in is None:
+            # TX7 is already committed; completing needs the current lease token (no rollback).
+            await queue.complete(engine, job)
+        else:
+            # A retry is this job delivered again after its backoff; the attempt stays spent.
+            await queue.release(engine, job, delay_seconds=retry_in, refund_attempt=False)
         return True
     outcome = await advance_run.handle(runtime, job)
     if outcome is advance_run.Outcome.COMPLETED:

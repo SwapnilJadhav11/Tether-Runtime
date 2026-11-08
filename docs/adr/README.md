@@ -25,6 +25,7 @@ Architecture Decision Records (ADRs) for Tether V1. Each ADR records one signifi
 | [0015](0015-per-run-hmac-audit-and-authoritative-reconstruction.md) | Per-run HMAC audit chain with write-ahead critical events; Postgres is the reconstruction record | accepted | 2026-10-06 |
 | [0016](0016-provider-neutral-history-and-fallback.md) | Provider-neutral history with capability-qualified, per-turn fallback | accepted | 2026-10-06 |
 | [0017](0017-sensitive-data-masking-choke-point.md) | Sensitive-data masking at a single choke point | accepted | 2026-10-06 |
+| [0018](0018-awaiting-reconciliation-hold.md) | Clarification of ADR-0006: a run awaiting reconciliation is held until its ledger entries are resolved | accepted | 2026-11-08 |
 
 ## Mapping from architecture §24 (ADR candidates)
 

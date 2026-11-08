@@ -8,8 +8,12 @@ from typing import Any, cast
 from sqlalchemy import select, update
 from sqlalchemy.engine import RowMapping
 
+from tether.core.statuses import LedgerState
 from tether.storage import tables
 from tether.storage.repos.base import ScopedRepository
+
+# A run cannot finish while one of its entries is in one of these states.
+UNRESOLVED_STATES = (LedgerState.PENDING, LedgerState.DISPATCHED, LedgerState.INDETERMINATE)
 
 
 class LedgerRepository(ScopedRepository):
@@ -31,6 +35,18 @@ class LedgerRepository(ScopedRepository):
         )
         row = (await self._connection.execute(statement)).mappings().first()
         return cast("RowMapping | None", row)
+
+    async def unresolved(self, run_id: uuid.UUID) -> bool:
+        """Whether the run has an entry still in flight or ``indeterminate`` (ADR-0004 TX12)."""
+        statement = self.scoped(
+            select(self.table.c.id)
+            .where(
+                self.table.c.run_id == run_id,
+                self.table.c.state.in_(UNRESOLVED_STATES),
+            )
+            .limit(1)
+        )
+        return (await self._connection.execute(statement)).first() is not None
 
     async def lock(self, entry_id: uuid.UUID) -> RowMapping | None:
         statement = self.scoped(select(self.table).where(self.table.c.id == entry_id))

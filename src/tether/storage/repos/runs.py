@@ -9,7 +9,7 @@ from typing import Any, cast
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import RowMapping
 
-from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind, RunStatus
+from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind, JobState, RunStatus
 from tether.storage import tables
 from tether.storage.repos.base import ScopedRepository
 
@@ -42,6 +42,25 @@ class RunsRepository(ScopedRepository):
         result = await self._connection.execute(statement)
         generation = result.scalar_one_or_none()
         return None if generation is None else int(generation)
+
+    async def fence(self, run_id: uuid.UUID) -> tuple[int, RunStatus] | None:
+        """Take the next fencing token without changing the status (TX12, ADR-0005).
+
+        Returns the new token and the current status, or ``None`` if the run is terminal.
+        """
+        runs = self.table
+        statement = (
+            update(runs)
+            .where(
+                runs.c.workspace_id == self.scope.workspace_id,
+                runs.c.id == run_id,
+                runs.c.status.in_(NON_TERMINAL),
+            )
+            .values(driver_generation=runs.c.driver_generation + 1)
+            .returning(runs.c.driver_generation, runs.c.status)
+        )
+        row = (await self._connection.execute(statement)).first()
+        return None if row is None else (int(row[0]), RunStatus(row[1]))
 
     async def share_lock(self, run_id: uuid.UUID) -> RowMapping:
         """Share-lock the run row (``FOR SHARE``). ``stopped`` is the stop predicate now."""
@@ -117,6 +136,22 @@ class JobsRepository(ScopedRepository):
                 "max_attempts": MAX_ATTEMPTS[kind],
             }
         )
+
+    async def mark_dead(self, job_id: uuid.UUID, lease_token: uuid.UUID) -> bool:
+        """TX12's last write: ``leased → dead``, refused unless this lease is still current."""
+        jobs = self.table
+        statement = (
+            update(jobs)
+            .where(
+                jobs.c.workspace_id == self.scope.workspace_id,
+                jobs.c.id == job_id,
+                jobs.c.state == JobState.LEASED,
+                jobs.c.lease_token == lease_token,
+            )
+            .values(state=JobState.DEAD, lease_token=None, lease_expires_at=None)
+            .returning(jobs.c.id)
+        )
+        return (await self._connection.execute(statement)).first() is not None
 
 
 class ModelCallsRepository(ScopedRepository):

@@ -51,8 +51,13 @@ class ToolDescriptor:
     handler: ToolHandler
     # Required for writes: whether the target honours the forwarded idempotency key.
     idempotency: IdempotencySupport | None = None
+    # Send attempts per call (PD-14), shared by retries and redeliveries. Only reads and
+    # idempotent writes are ever re-sent; a non-idempotent write is sent at most once.
+    max_attempts: int = 3
 
     def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError(f"tool {self.name}: max_attempts must be at least 1")
         if not _NAME.fullmatch(self.name):
             raise ValueError(f"invalid tool name {self.name!r}")
         if not self.version or not self.description:

@@ -4,8 +4,10 @@ At-least-once and polling-only. Leasing spans workspaces by design (a worker ser
 so these functions work on the ``jobs`` table directly; job handlers then act through repositories
 scoped to the job's workspace. Every time check uses ``clock_timestamp()`` (invariant 29).
 
-Walking-skeleton scope: lease heartbeats, retry backoff and dead-lettering (TX12) arrive with
-S2.1. A job that has used all its attempts is simply no longer leased.
+Bounded delivery (§11 AD-08): every lease adds an attempt. A lease that takes ``attempts`` past
+``max_attempts`` hands the job to the worker's TX12 dead-letter transition instead of its handler;
+that transaction marks the job ``dead``. A retry is a release with a delayed ``run_after``.
+Not yet: lease heartbeats.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class LeasedJob:
     run_workspace_id: str
     lease_token: uuid.UUID
     attempts: int
+    max_attempts: int
     ref_id: uuid.UUID | None
     payload: dict[str, Any]
 
@@ -46,13 +49,16 @@ def _seconds_from_now(seconds: float) -> Any:
 async def lease_one(
     engine: AsyncEngine, *, kinds: Sequence[str], lease_seconds: float
 ) -> LeasedJob | None:
-    """Lease the next due job of one of ``kinds``, or a job whose lease has expired."""
+    """Lease the next due job of one of ``kinds``, or a job whose lease has expired.
+
+    An exhausted job is leased too (``attempts > max_attempts`` afterwards): the caller must
+    dead-letter it (TX12), never run its handler.
+    """
     now = func.clock_timestamp()
     candidate = (
         select(_JOBS.c.id)
         .where(
             _JOBS.c.kind.in_(list(kinds)),
-            _JOBS.c.attempts < _JOBS.c.max_attempts,
             or_(
                 and_(_JOBS.c.state == JobState.READY, _JOBS.c.run_after <= now),
                 and_(_JOBS.c.state == JobState.LEASED, _JOBS.c.lease_expires_at <= now),
@@ -80,6 +86,7 @@ async def lease_one(
             _RUNS.c.workspace_id.label("run_workspace_id"),
             _JOBS.c.lease_token,
             _JOBS.c.attempts,
+            _JOBS.c.max_attempts,
             _JOBS.c.ref_id,
             _JOBS.c.payload,
         )
