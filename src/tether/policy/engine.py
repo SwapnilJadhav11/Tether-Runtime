@@ -53,6 +53,18 @@ def evaluate_action(
     return Decision("deny", ("no matching rule",), workspace.policy_version)
 
 
+def evaluate_reconciliation_eligibility(
+    workspace: WorkspaceConfig, *, reconciler: Mapping[str, Any], requester: Mapping[str, Any]
+) -> bool:
+    """A reconciler needs a configured reconciler role and must not be the requester (ADR-0007).
+
+    Deny-by-default: a policy without reconciler roles lets nobody reconcile.
+    """
+    if reconciler.get("sub") == requester.get("sub"):
+        return False
+    return bool(_roles(reconciler) & set(workspace.policy.reconciliation.reconciler_roles))
+
+
 def evaluate_approval_eligibility(
     decision: Decision, *, approver: Mapping[str, Any], requester: Mapping[str, Any]
 ) -> bool:

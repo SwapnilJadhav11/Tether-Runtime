@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tether.core.hashing import CallEnvelope, call_hash, call_hashes_equal, idempotency_key
 from tether.core.ids import AgentId, RunId, WorkspaceId
 from tether.core.results import CallOutcome
-from tether.core.statuses import JobKind, RunStatus
+from tether.core.statuses import JobKind, LedgerResolution, RunStatus
 from tether.policy.config import WorkspaceConfig
 from tether.policy.engine import PolicyStaleError, evaluate_action
 from tether.providers.history import ModelTurn, NeutralMessage
@@ -447,12 +447,27 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             async with UnitOfWork(ctx.engine) as uow:
                 entry = await uow.repository(LedgerRepository, ctx.scope).get(uuid.UUID(ledger_id))
             entry = _required(entry, "ledger entry")
+            resolution = entry["resolution"]
             if entry["state"] == "completed":
+                if resolution == LedgerResolution.RECONCILED_APPLIED:
+                    # A human confirmed the write happened; its real output is unknown.
+                    return {"result": _result(CallOutcome.APPLIED, {"resolution": resolution})}
                 return {"result": _result(CallOutcome.APPLIED, entry["outcome_payload_masked"])}
             if entry["state"] == "failed":
+                if resolution == LedgerResolution.RECONCILED_NOT_APPLIED:
+                    return {"result": _result(CallOutcome.NOT_APPLIED, {"resolution": resolution})}
                 return {"result": _result(CallOutcome.FAILED, entry["outcome_reason"])}
+            if entry["state"] == "abandoned":
+                # ADR-0007: abandon terminates the run; no further model call (TX11).
+                return {
+                    "end_status": RunStatus.ABANDONED,
+                    "final_text": f"{entry['tool']} abandoned by reconciliation",
+                }
             waiting = entry["state"] == "indeterminate"
             interrupt("awaiting_reconciliation" if waiting else "awaiting_tool")
+
+    def after_await_tool(state: RunState) -> str:
+        return "finalize" if state.get("end_status") else "append_result"
 
     async def append_result(state: RunState) -> RunState:
         call = state["current"]
@@ -527,7 +542,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     graph.add_conditional_edges(
         "authorize_call", after_authorize, ["finalize", "append_result", "await_tool"]
     )
-    graph.add_edge("await_tool", "append_result")
+    graph.add_conditional_edges("await_tool", after_await_tool, ["finalize", "append_result"])
     graph.add_edge("append_result", "next_call")
     graph.add_edge("finalize", END)
     return graph

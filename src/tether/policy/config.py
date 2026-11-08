@@ -40,8 +40,16 @@ class PolicyRule(_Strict):
     approver_roles: tuple[str, ...] = ()
 
 
+class ReconciliationPolicy(_Strict):
+    """Who may resolve an ``indeterminate`` ledger entry (ADR-0007). Empty means nobody."""
+
+    # A reconciler needs one of these roles and must not be the run's requester.
+    reconciler_roles: tuple[str, ...] = ()
+
+
 class PolicyConfig(_Strict):
     rules: tuple[PolicyRule, ...] = ()
+    reconciliation: ReconciliationPolicy = ReconciliationPolicy()
 
 
 class AgentConfig(_Strict):

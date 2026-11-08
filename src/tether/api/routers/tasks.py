@@ -54,6 +54,8 @@ class LedgerView(BaseModel):
     attempts: int
     outcome: dict[str, Any] | None
     outcome_reason: str | None
+    resolution: str | None
+    resolved_by: str | None
 
 
 class AuditView(BaseModel):

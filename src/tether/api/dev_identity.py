@@ -2,8 +2,8 @@
 
 ADR-0013 requires the workspace, agent and requester to come from a validated tasks JWT plus an
 API key, and the approver from an approvals token. Until S1.8 exists, the MVP takes them
-from the request instead: a ``dev_identity`` body object on submit and on approval decisions,
-and a ``dev_workspace_id`` query parameter on reads.
+from the request instead: a ``dev_identity`` body object on submit, on approval decisions and
+on reconciliations, and a ``dev_workspace_id`` query parameter on reads.
 
 Rules that keep the shortcut contained:
 - Every route that uses it is refused with ``404`` when ``TETHER_ENV`` is ``prod``.
@@ -72,6 +72,21 @@ def dev_submit_principal(dev_identity: Annotated[DevIdentity, Body()]) -> Princi
 
 def dev_approver(dev_identity: Annotated[DevApprover, Body()]) -> Approver:
     return Approver(
+        workspace_id=dev_identity.workspace_id,
+        person={"sub": dev_identity.sub, "roles": list(dev_identity.roles)},
+    )
+
+
+@dataclass(frozen=True)
+class Reconciler:
+    """Who is resolving an ``indeterminate`` ledger entry: workspace + ``{sub, roles}``."""
+
+    workspace_id: str
+    person: dict[str, Any]
+
+
+def dev_reconciler(dev_identity: Annotated[DevApprover, Body()]) -> Reconciler:
+    return Reconciler(
         workspace_id=dev_identity.workspace_id,
         person={"sub": dev_identity.sub, "roles": list(dev_identity.roles)},
     )

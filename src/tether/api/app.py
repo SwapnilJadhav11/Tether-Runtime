@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from tether.api.routers import approvals, tasks
+from tether.api.routers import approvals, ops, tasks
 from tether.policy.config import BootstrapFile, load_bootstrap
 from tether.secrets.env_provider import EnvSecretsProvider
 from tether.secrets.keyring import KeyRing
@@ -45,6 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(tasks.router)
     app.include_router(approvals.router)
+    app.include_router(ops.router)
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:

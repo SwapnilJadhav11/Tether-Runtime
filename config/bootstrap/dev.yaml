@@ -12,3 +12,6 @@ workspaces:
         - tool: restart_service
           decision: require_approval
           approver_roles: [oncall]
+      # Who may resolve an indeterminate write (ADR-0007); never the run's requester.
+      reconciliation:
+        reconciler_roles: [reconciler]
