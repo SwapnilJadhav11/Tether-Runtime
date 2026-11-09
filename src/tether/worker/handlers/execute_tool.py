@@ -251,6 +251,10 @@ async def _send(
     if retry_in is not None:
         return retry_in
     async with UnitOfWork(runtime.engine) as uow:
+        # TX7. Lock order: run row → ledger row → audit head → jobs (§13.1). Without the run row
+        # first, the inserts' foreign-key checks lock it after the audit head, which deadlocks
+        # with a stop (TX9/TX10/TX-EA) holding the run row and waiting for that head.
+        await uow.repository(RunsRepository, scope).share_lock(entry["run_id"])
         await _record(
             uow, runtime, scope, entry, expected="dispatched", new=new, output=output, reason=reason
         )
