@@ -249,7 +249,7 @@ async def decide(
     seeded: Any, tmp_path: Path, approval_id: Any, action: str = "approve"
 ) -> httpx.Response:
     body = {
-        "dev_identity": {"workspace_id": WS, "sub": "bob", "roles": ["oncall"]},
+        "dev_identity": {"workspace_id": WS, "sub": "bob", "roles": ["approver", "oncall"]},
         "reason": "looks right",
     }
     return await call_api(
@@ -600,7 +600,7 @@ async def test_t26_cancel_is_requester_only_workspace_scoped_and_idempotent(
     other = await cancel(seeded, tmp_path, run_id, workspace=OTHER_WS)
     assert other.status_code == 404
     assert (await cancel(seeded, tmp_path, uuid.uuid4())).status_code == 404
-    assert (await cancel(seeded, tmp_path, run_id, env="prod")).status_code == 404
+    assert (await cancel(seeded, tmp_path, run_id, env="prod")).status_code == 401
     assert run_row(seeded, run_id)[2] is None
     wakes_before = wakes(seeded, run_id)
     first = await cancel(seeded, tmp_path, run_id)

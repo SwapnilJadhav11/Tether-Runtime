@@ -207,8 +207,9 @@ async def test_dev_identity_shortcut_is_refused_in_prod(client: Client, seeded: 
         fetched = await http.get(
             f"/v1/tasks/runs/{seeded.run_a}", params={"dev_workspace_id": "ws-a"}
         )
-    assert submitted.status_code == 404
-    assert fetched.status_code == 404
+    # In prod the dev shortcut is not a credential: an unauthenticated request (ADR-0013).
+    assert submitted.status_code == 401
+    assert fetched.status_code == 401
     assert query(seeded, "SELECT count(*) FROM tether.runs") == before
 
 

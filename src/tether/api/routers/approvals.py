@@ -1,9 +1,9 @@
-"""``/v1/approvals``: approve or reject a pending call (TX4).
+"""``/v1/approvals`` (audience ``tether-approvals``): approve or reject a pending call (TX4).
 
-Walking-skeleton scope: the approver identity comes from the temporary dev/test shortcut
-(S1.8 replaces it). Eligibility is decided by policy under the active version (ADR-0009):
-the approver needs an approver role from the matching rule and must not be the requester.
-Anything the caller may not act on is ``404`` (ADR-0013).
+Authorization order (ADR-0013): audience and token, then workspace, then the ``approver`` role
+from the validated token, then policy eligibility under the active version (ADR-0009): a role
+listed by the matching rule, and never the run's requester. Anything the caller may not act on is
+``404``.
 """
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from tether.api.dev_identity import Approver, dev_approver, refuse_in_prod
+from tether.authz.deps import approvals_principal
 from tether.core.ids import WorkspaceId
 from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind
+from tether.identity.principal import Principal
 from tether.policy.engine import evaluate_action, evaluate_approval_eligibility
 from tether.storage.repos.approvals import ApprovalsRepository
 from tether.storage.repos.audit import AuditRepository
@@ -24,9 +25,10 @@ from tether.storage.repos.runs import JobsRepository, PolicyVersionsRepository, 
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
-router = APIRouter(prefix="/v1/approvals", dependencies=[Depends(refuse_in_prod)])
+router = APIRouter(prefix="/v1/approvals")
 
 _DECISIONS = {"approve": "approved", "reject": "rejected"}
+APPROVER_ROLE = "approver"
 
 
 class DecidedApproval(BaseModel):
@@ -39,15 +41,16 @@ async def decide_approval(
     request: Request,
     approval_id: uuid.UUID,
     action: Literal["approve", "reject"],
-    approver: Annotated[Approver, Depends(dev_approver)],
+    principal: Annotated[Principal, Depends(approvals_principal)],
     reason: Annotated[str, Body(max_length=500)] = "",
 ) -> DecidedApproval:
     not_found = HTTPException(status.HTTP_404_NOT_FOUND)
     conflict = HTTPException(status.HTTP_409_CONFLICT, "approval is no longer pending")
-    scope = WorkspaceScope(WorkspaceId(approver.workspace_id))
-    workspace = request.app.state.bootstrap.workspace(approver.workspace_id)
-    if workspace is None:
+    scope = WorkspaceScope(WorkspaceId(principal.workspace_id))
+    workspace = request.app.state.bootstrap.workspace(principal.workspace_id)
+    if workspace is None or not principal.has_role(APPROVER_ROLE):
         raise not_found
+    approver = principal.requester  # ``{sub, roles}`` of the deciding person
     new_status = _DECISIONS[action]
     async with UnitOfWork(request.app.state.db_engine) as uow:
         approvals = uow.repository(ApprovalsRepository, scope)
@@ -66,7 +69,7 @@ async def decide_approval(
             workspace, tool=approval["tool"], requester=run["requester_snapshot"]
         )
         if not evaluate_approval_eligibility(
-            decision, approver=approver.person, requester=run["requester_snapshot"]
+            decision, approver=approver, requester=run["requester_snapshot"]
         ):
             raise not_found
         if (
@@ -79,7 +82,7 @@ async def decide_approval(
         decided = await approvals.decide(
             approval_id,
             status=new_status,
-            decided_by=approver.person["sub"],
+            decided_by=principal.subject,
             reason=reason,
             policy_version=decision.policy_version,
         )
@@ -91,7 +94,7 @@ async def decide_approval(
             dedupe_key=f"approval_decided:{approval_id}",
             event_type="APPROVAL_DECIDED",
             payload={"approval_id": str(approval_id), "status": new_status, "reason": reason},
-            actor=approver.person["sub"],
+            actor=principal.subject,
             tool=approval["tool"],
             policy_version=decision.policy_version,
         )

@@ -4,7 +4,7 @@
     uv run python scripts/smoke_submit.py
 
 Submits a task as alice (operator), waits for the restart to need approval, approves it as
-bob (oncall), waits for the run to finish and prints the inspection view. Uses the dev-only
+bob (approver), waits for the run to finish and prints the inspection view. Uses the dev-only
 identity shortcut, which the api refuses outside dev and test.
 """
 
@@ -65,7 +65,7 @@ def main() -> None:
         decided = http.post(
             f"/v1/approvals/{approval['id']}/approve",
             json={
-                "dev_identity": {"workspace_id": WORKSPACE, "sub": "bob", "roles": ["oncall"]},
+                "dev_identity": {"workspace_id": WORKSPACE, "sub": "bob", "roles": ["approver"]},
                 "reason": "checkout is unhealthy; restart approved",
             },
         )

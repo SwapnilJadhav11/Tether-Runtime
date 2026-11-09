@@ -1,9 +1,10 @@
-"""``/v1/ops``: resolve an ``indeterminate`` ledger entry (TX8, ADR-0007).
+"""``/v1/ops`` (audience ``tether-ops``): reconcile an ``indeterminate`` entry (TX8, ADR-0007)
+and cancel any run of the workspace as its ``workspace_admin`` (TX9).
 
-Only a human resolves an unknown write outcome. The reconciler identity comes from the temporary
-dev/test shortcut (S1.8 replaces it). Eligibility is policy, decided under the active version
-(ADR-0009): a configured reconciler role, and never the run's requester. Anything the caller may
-not act on is ``404`` (ADR-0013).
+Authorization order (ADR-0013): audience and token, then workspace, then the role from the
+validated token (``reconciler`` or ``workspace_admin``), then, for reconciliation, policy
+eligibility under the active version (ADR-0009): a configured reconciler role, and never the
+run's requester. Anything the caller may not act on is ``404``.
 
 TX8 commits, in one transaction: the conditional ``indeterminate → completed / failed /
 abandoned`` with its resolution, reconciler and justification; the critical ``RECONCILED``
@@ -19,7 +20,8 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from tether.api.dev_identity import Reconciler, dev_reconciler, refuse_in_prod
+from tether.api.routers.tasks import CancelRequested, cancel_as
+from tether.authz.deps import ops_principal
 from tether.core.ids import WorkspaceId
 from tether.core.statuses import (
     TERMINAL_RUN_STATUSES,
@@ -27,6 +29,7 @@ from tether.core.statuses import (
     LedgerResolution,
     LedgerState,
 )
+from tether.identity.principal import Principal
 from tether.policy.engine import evaluate_reconciliation_eligibility
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.ledger import LedgerRepository
@@ -34,7 +37,10 @@ from tether.storage.repos.runs import JobsRepository, PolicyVersionsRepository, 
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
-router = APIRouter(prefix="/v1/ops", dependencies=[Depends(refuse_in_prod)])
+router = APIRouter(prefix="/v1/ops")
+
+RECONCILER_ROLE = "reconciler"
+WORKSPACE_ADMIN_ROLE = "workspace_admin"
 
 Outcome = Literal["applied", "not_applied", "abandon"]
 
@@ -55,7 +61,7 @@ class Reconciled(BaseModel):
 async def reconcile_entry(
     request: Request,
     ledger_id: uuid.UUID,
-    reconciler: Annotated[Reconciler, Depends(dev_reconciler)],
+    principal: Annotated[Principal, Depends(ops_principal)],
     outcome: Annotated[Outcome, Body()],
     justification: Annotated[str, Body(min_length=1, max_length=2000)],
 ) -> Reconciled:
@@ -63,10 +69,11 @@ async def reconcile_entry(
     conflict = HTTPException(
         status.HTTP_409_CONFLICT, "ledger entry is not awaiting reconciliation"
     )
-    scope = WorkspaceScope(WorkspaceId(reconciler.workspace_id))
-    workspace = request.app.state.bootstrap.workspace(reconciler.workspace_id)
-    if workspace is None:
+    scope = WorkspaceScope(WorkspaceId(principal.workspace_id))
+    workspace = request.app.state.bootstrap.workspace(principal.workspace_id)
+    if workspace is None or not principal.has_role(RECONCILER_ROLE):
         raise not_found
+    reconciler = principal.requester  # ``{sub, roles}`` of the reconciling person
     new_state, resolution = _RESOLUTIONS[outcome]
     resolved = Reconciled(ledger_id=ledger_id, state=new_state, resolution=resolution)
     async with UnitOfWork(request.app.state.db_engine) as uow:
@@ -83,7 +90,7 @@ async def reconcile_entry(
         if active != workspace.policy_version:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "policy is reloading")
         if not evaluate_reconciliation_eligibility(
-            workspace, reconciler=reconciler.person, requester=run["requester_snapshot"]
+            workspace, reconciler=reconciler, requester=run["requester_snapshot"]
         ):
             raise not_found
         if entry["state"] != LedgerState.INDETERMINATE:
@@ -97,7 +104,7 @@ async def reconcile_entry(
             expected=LedgerState.INDETERMINATE,
             new=new_state,
             resolution=resolution,
-            resolved_by=reconciler.person["sub"],
+            resolved_by=principal.subject,
             justification=justification,
         )
         if not changed:
@@ -113,9 +120,25 @@ async def reconcile_entry(
                 "resolution": resolution.value,
                 "justification": justification,
             },
-            actor=reconciler.person["sub"],
+            actor=principal.subject,
             tool=entry["tool"],
             policy_version=workspace.policy_version,
         )
         await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run["id"])
     return resolved
+
+
+@router.post("/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+async def admin_cancel_run(
+    request: Request,
+    run_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(ops_principal)],
+) -> CancelRequested:
+    """TX9 for a ``workspace_admin``: any run in their workspace (PRD authorization table).
+
+    Approvers cannot cancel (they reject). Anyone without the role, another workspace or an
+    unknown run gets ``404``.
+    """
+    if not principal.has_role(WORKSPACE_ADMIN_ROLE):
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    return await cancel_as(request, principal, run_id, may_cancel=lambda run: True)

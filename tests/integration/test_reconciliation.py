@@ -565,5 +565,6 @@ async def test_t25_the_dev_reconciler_shortcut_is_refused_in_prod(
 ) -> None:
     run_id, ledger_id = await indeterminate_run(runtime, seeded, tmp_path)
     response = await reconcile(seeded, tmp_path, ledger_id, "applied", env="prod")
-    assert response.status_code == 404
+    # In prod the dev shortcut is not a credential: an unauthenticated request (ADR-0013).
+    assert response.status_code == 401
     assert ledger(seeded, run_id)[0][5] is None

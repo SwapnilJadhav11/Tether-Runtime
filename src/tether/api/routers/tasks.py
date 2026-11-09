@@ -1,11 +1,11 @@
-"""``/v1/tasks``: submit a run (TX1), read it back, and cancel it (TX9).
-
-Identity comes from the temporary dev/test shortcut (S1.8 replaces it).
+"""``/v1/tasks`` (audience ``tether-tasks`` + workspace API key): submit a run (TX1), read it
+back, and cancel it (TX9). Reading and cancelling are for the run's requester only (ADR-0013).
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -13,19 +13,14 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from psycopg import errors as pg_errors
 from pydantic import BaseModel
 from sqlalchemy import func
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
 
-from tether.api.dev_identity import (
-    Canceller,
-    Principal,
-    dev_canceller,
-    dev_read_scope,
-    dev_submit_principal,
-    refuse_in_prod,
-)
 from tether.audit.chain import verify_run
+from tether.authz.deps import RunReader, Submission, run_reader, submission, tasks_principal
 from tether.core.ids import WorkspaceId
 from tether.core.statuses import JobKind, RunStatus
+from tether.identity.principal import Principal
 from tether.runtime import stop_requests
 from tether.secrets.keyring import KeyFamily
 from tether.storage.repos.approvals import ApprovalsRepository
@@ -35,7 +30,7 @@ from tether.storage.repos.runs import JobsRepository, RunsRepository
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
-router = APIRouter(prefix="/v1/tasks", dependencies=[Depends(refuse_in_prod)])
+router = APIRouter(prefix="/v1/tasks")
 
 
 class SubmittedRun(BaseModel):
@@ -94,11 +89,16 @@ class RunView(BaseModel):
 @router.post("/runs", status_code=status.HTTP_201_CREATED)
 async def submit_run(
     request: Request,
-    principal: Annotated[Principal, Depends(dev_submit_principal)],
+    submitted: Annotated[Submission, Depends(submission)],
     task_input: Annotated[dict[str, Any], Body()],
 ) -> SubmittedRun:
-    """TX1: run row, genesis audit event and first ``advance_run`` job, all or nothing."""
+    """TX1: run row, genesis audit event and first ``advance_run`` job, all or nothing.
+
+    The workspace and the agent come from the credentials (API key binding), the requester from
+    the validated token; nothing in ``task_input`` identifies anyone.
+    """
     settings = request.app.state.settings
+    principal = submitted.principal
     scope = WorkspaceScope(WorkspaceId(principal.workspace_id))
     run_id = uuid.uuid4()
     deadline_at = func.clock_timestamp() + func.make_interval(
@@ -109,7 +109,7 @@ async def submit_run(
             await uow.repository(RunsRepository, scope).add(
                 {
                     "id": run_id,
-                    "agent_id": principal.agent_id,
+                    "agent_id": submitted.agent_id,
                     "requester_snapshot": principal.requester,
                     "task_input": task_input,
                     "status": RunStatus.QUEUED,
@@ -124,7 +124,7 @@ async def submit_run(
                 dedupe_key="run_submitted",
                 event_type="RUN_SUBMITTED",
                 actor=principal.requester["sub"],
-                payload={"agent_id": principal.agent_id, "requester": principal.requester},
+                payload={"agent_id": submitted.agent_id, "requester": principal.requester},
             )
             jobs = uow.repository(JobsRepository, scope)
             await jobs.enqueue(JobKind.ADVANCE_RUN, run_id)
@@ -146,25 +146,40 @@ class CancelRequested(BaseModel):
     cancel_requested_by: str | None
 
 
+def is_requester(principal: Principal) -> Callable[[RowMapping], bool]:
+    return lambda run: bool(run["requester_snapshot"].get("sub") == principal.subject)
+
+
 @router.post("/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
 async def cancel_run(
     request: Request,
     run_id: uuid.UUID,
-    canceller: Annotated[Canceller, Depends(dev_canceller)],
+    principal: Annotated[Principal, Depends(tasks_principal)],
 ) -> CancelRequested:
-    """TX9: record the requester's cancel request; the run driver ends the run (ADR-0006).
+    """TX9 for the run's requester; the run driver ends the run (ADR-0006).
 
-    Only the run's requester may cancel it here; anyone else, another workspace or an unknown run
-    gets ``404``. Repeating it, or cancelling a terminal run, changes nothing.
+    Anyone else, another workspace or an unknown run gets ``404``. Repeating it, or cancelling a
+    terminal run, changes nothing.
     """
-    scope = WorkspaceScope(WorkspaceId(canceller.workspace_id))
+    return await cancel_as(request, principal, run_id, may_cancel=is_requester(principal))
+
+
+async def cancel_as(
+    request: Request,
+    principal: Principal,
+    run_id: uuid.UUID,
+    *,
+    may_cancel: Callable[[RowMapping], bool],
+) -> CancelRequested:
+    """TX9 in the principal's workspace, if ``may_cancel`` allows it for this run; else ``404``."""
+    scope = WorkspaceScope(WorkspaceId(principal.workspace_id))
     async with UnitOfWork(request.app.state.db_engine) as uow:
         runs = uow.repository(RunsRepository, scope)
         run = await runs.lock(run_id)
-        if run is None or run["requester_snapshot"].get("sub") != canceller.sub:
+        if run is None or not may_cancel(run):
             raise HTTPException(status.HTTP_404_NOT_FOUND)
         await stop_requests.request_cancel(
-            uow, request.app.state.keyring, scope, run, by=canceller.sub
+            uow, request.app.state.keyring, scope, run, by=principal.subject
         )
         current = await runs.get(run_id)
     current = _required_row(current)
@@ -186,11 +201,14 @@ def _required_row(row: Any) -> Any:
 async def get_run(
     request: Request,
     run_id: uuid.UUID,
-    scope: Annotated[WorkspaceScope, Depends(dev_read_scope)],
+    reader: Annotated[RunReader, Depends(run_reader)],
 ) -> RunView:
+    scope = reader.scope
     async with UnitOfWork(request.app.state.db_engine) as uow:
         row = await uow.repository(RunsRepository, scope).get(run_id)
-        if row is None:
+        # With real credentials, only the run's requester may read it (PRD authorization table).
+        owner = None if row is None else row["requester_snapshot"].get("sub")
+        if row is None or (reader.requester is not None and owner != reader.requester):
             raise HTTPException(status.HTTP_404_NOT_FOUND)
         approvals = await uow.repository(ApprovalsRepository, scope).for_run(run_id)
         ledger = await uow.repository(LedgerRepository, scope).for_run(run_id)

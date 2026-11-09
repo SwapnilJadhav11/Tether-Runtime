@@ -440,7 +440,7 @@ async def test_an_eligible_approval_executes_the_write_and_completes_the_run(
 ) -> None:
     run_id = await awaiting_approval(runtime, submit, tmp_path)
     approval_id = approval(seeded, run_id)[0]
-    response = await decide(seeded, tmp_path, approval_id, "approve", "bob", ["oncall"])
+    response = await decide(seeded, tmp_path, approval_id, "approve", "bob", ["approver", "oncall"])
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "approved"
     await drain(runtime)
@@ -464,9 +464,9 @@ async def test_an_eligible_approval_executes_the_write_and_completes_the_run(
 @pytest.mark.parametrize(
     ("sub", "roles", "workspace"),
     [
-        ("alice", ["oncall"], WS),  # the requester cannot approve their own call
+        ("alice", ["approver", "oncall"], WS),  # the requester cannot approve their own call
         ("carol", ["viewer"], WS),  # no approver role
-        ("bob", ["oncall"], "ws-a"),  # another workspace: not found
+        ("bob", ["approver", "oncall"], "ws-a"),  # another workspace: not found
     ],
 )
 @pytest.mark.asyncio
@@ -493,7 +493,7 @@ async def test_a_rejected_call_is_never_executed(
 ) -> None:
     run_id = await awaiting_approval(runtime, submit, tmp_path)
     approval_id = approval(seeded, run_id)[0]
-    response = await decide(seeded, tmp_path, approval_id, "reject", "bob", ["oncall"])
+    response = await decide(seeded, tmp_path, approval_id, "reject", "bob", ["approver", "oncall"])
     assert response.status_code == 200
     await drain(runtime)
     assert run_status(seeded, run_id)[0] == "succeeded"
@@ -506,9 +506,9 @@ async def test_an_approval_is_decided_once_and_only_before_it_expires(
 ) -> None:
     run_id = await awaiting_approval(runtime, submit, tmp_path)
     approval_id = approval(seeded, run_id)[0]
-    first = await decide(seeded, tmp_path, approval_id, "reject", "bob", ["oncall"])
+    first = await decide(seeded, tmp_path, approval_id, "reject", "bob", ["approver", "oncall"])
     assert first.status_code == 200
-    again = await decide(seeded, tmp_path, approval_id, "approve", "bob", ["oncall"])
+    again = await decide(seeded, tmp_path, approval_id, "approve", "bob", ["approver", "oncall"])
     assert again.status_code == 409
 
     other = await awaiting_approval(runtime, submit, tmp_path)
@@ -519,7 +519,7 @@ async def test_an_approval_is_decided_once_and_only_before_it_expires(
         " WHERE id = %s RETURNING id",
         other_id,
     )
-    late = await decide(seeded, tmp_path, other_id, "approve", "bob", ["oncall"])
+    late = await decide(seeded, tmp_path, other_id, "approve", "bob", ["approver", "oncall"])
     assert late.status_code == 409
     assert approval(seeded, other)[1] == "pending"
 
@@ -530,8 +530,11 @@ async def test_the_dev_approver_shortcut_is_refused_in_prod(
 ) -> None:
     run_id = await awaiting_approval(runtime, submit, tmp_path)
     approval_id = approval(seeded, run_id)[0]
-    response = await decide(seeded, tmp_path, approval_id, "approve", "bob", ["oncall"], env="prod")
-    assert response.status_code == 404
+    response = await decide(
+        seeded, tmp_path, approval_id, "approve", "bob", ["approver", "oncall"], env="prod"
+    )
+    # In prod the dev shortcut is not a credential: an unauthenticated request (ADR-0013).
+    assert response.status_code == 401
     assert approval(seeded, run_id)[1] == "pending"
 
 
@@ -560,7 +563,7 @@ async def test_a_governed_run_can_be_inspected_end_to_end(
         "restart_service",
         {"service": "checkout"},
     )
-    await decide(seeded, tmp_path, pending["id"], "approve", "bob", ["oncall"])
+    await decide(seeded, tmp_path, pending["id"], "approve", "bob", ["approver", "oncall"])
     await drain(runtime)
 
     response = await inspect_run(seeded, tmp_path, run_id)

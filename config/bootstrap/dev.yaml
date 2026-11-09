@@ -1,17 +1,53 @@
 # Dev bootstrap (ADR-0014): applied by the migrate service with `tether bootstrap apply`.
 # The api and worker load the same file; decisions are made only under its active version.
+# Identity holds no secrets (ADR-0013, PD-20): issuer PUBLIC keys only, and API key hashes only.
+# Their private halves and the raw key live in tools/dev_issuer/.keys/ (git-ignored, dev only):
+# regenerate with `tools/dev_issuer/keys.py` and `tether apikey new`, then replace the lines below.
 workspaces:
   - id: ops-demo
     agents:
       - id: incident-remediator
         workload: incident_remediation
+    issuers:
+      - id: tasks
+        iss: https://dev-issuer.tether.local/ops-demo/tether-tasks
+        audiences: [tether-tasks]
+        algorithm: EdDSA
+        public_keys:
+          tasks-1: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEAAM3WpgdsEGoGJyjRA3Jb13GyoK3An5htBaIdAJu8JYA=
+            -----END PUBLIC KEY-----
+      - id: approvals
+        iss: https://dev-issuer.tether.local/ops-demo/tether-approvals
+        audiences: [tether-approvals]
+        algorithm: EdDSA
+        public_keys:
+          approvals-1: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEAR5a1M3GDbdcmivfQyw246b4EsCwovtxtI+rAYBRmjbU=
+            -----END PUBLIC KEY-----
+      - id: ops
+        iss: https://dev-issuer.tether.local/ops-demo/tether-ops
+        audiences: [tether-ops]
+        algorithm: EdDSA
+        public_keys:
+          ops-1: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEAreypLrJJEqmysidS3xr5D4i9+u0p7hl2mq+GgraC0wg=
+            -----END PUBLIC KEY-----
+    api_keys:
+      - key_id: demo-app
+        salt: 8c8349cef8058cc636d14092e01be029
+        secret_hash: ddd193cf234717509779b4731272b3f51d8265fdc29b950caea4fe2a8328f4b2
+        agents: [incident-remediator]
     policy:
       rules:
         - tool: get_service_health
           decision: allow
         - tool: restart_service
           decision: require_approval
-          approver_roles: [oncall]
+          approver_roles: [approver]
       # Who may resolve an indeterminate write (ADR-0007); never the run's requester.
       reconciliation:
         reconciler_roles: [reconciler]

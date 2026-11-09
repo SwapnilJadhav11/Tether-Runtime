@@ -7,12 +7,13 @@ from alembic import command
 from alembic.config import Config
 from pydantic import ValidationError
 
-from tether.cli import bootstrap
+from tether.cli import apikey, bootstrap
 from tether.runtime.checkpointer import setup_langgraph_schema
 from tether.settings import MigrationSettings
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="Tether administration.")
 app.add_typer(bootstrap.app, name="bootstrap")
+app.add_typer(apikey.app, name="apikey")
 
 MIGRATIONS_LOCATION = "tether.storage:migrations"
 
