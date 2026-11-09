@@ -18,7 +18,7 @@
 - **Implementation baseline:** commit `ec352540a8fd9f70309b12af53f013b87c2258e4` (`hardening/v1-baseline`, CI green). It is the starting point for the revised V1, **not** a completed or frozen V1.
 - **Authority:** the revised PRD defines requirements; the scope delta records dispositions and owner decisions D-1–D-12, U-001, U-002; accepted ADRs are unchanged except ADR-0007, superseded by ADR-0019 (accepted 2026-11-09); ADR-0019 is required design, implemented in W5.1.
 - **Categories used below:** *baseline* = done at `ec35254` with automated evidence; *partial*; *not started*; *revised* = scope changed by the direction; *deferred*; *removed*.
-- **Active step rule:** exactly one step is active at a time, named by the owner and recorded in `CLAUDE.md`. **Active step now: W1.1 (documentation reconciliation, this pass).** When W1.1 is accepted, the owner names the next step; the recommended next is **W2.1**.
+- **Active step rule:** exactly one step is active at a time, named by the owner and recorded in `CLAUDE.md`. W1.1 was accepted and committed on 2026-11-09 (`8714715`); W1.2 is done (ADR-0019 accepted). **Active step now: W2.1 (guarantee card acceptance and evidence map), named by the owner on 2026-11-09, not yet started.**
 
 ### 0.2 Original steps mapped to the baseline
 
@@ -62,11 +62,11 @@
 Each step lists: affected requirements/decisions · dependencies · acceptance · evidence · documentation · decision gate. Step IDs are `W<workstream>.<n>`; PR titles use them. Chaos and race coverage from the baseline is preserved and extended in every step that touches the runtime.
 
 **W1 — Documentation inventory, traceability, ADR discrepancy resolution** *(documentation only)*
-- **W1.1 Reconciliation pass** · TDR-001–022, D-1–D-12 · — · scope delta, guarantee card, ADR-0019 draft, PRD revision, architecture amendments, operations and testing docs, CLAUDE.md, README · link and stale-claim check · docs only · gate: owner acceptance of the reconciled documents. **Active.**
+- **W1.1 Reconciliation pass** · TDR-001–022, D-1–D-12 · — · scope delta, guarantee card, ADR-0019 draft, PRD revision, architecture amendments, operations and testing docs, CLAUDE.md, README · link and stale-claim check · docs only · gate: owner acceptance of the reconciled documents. **Done 2026-11-09 (`8714715`).**
 - **W1.2 ADR-0019 decision** · D-3, U-009 · W1.1 · **Done 2026-11-09 (OD-1):** accepted with the required semantics; ADR-0007 superseded; four defaults recorded in the ADR, revisable before W5.1 · ADR index and architecture markers updated · no gate.
 
 **W2 — Guarantee card and kernel conformance (D-6)**
-- **W2.1 Guarantee card acceptance and evidence map** · TDR-015, U-004 · W1.1 · owner accepts the G-* wording; `docs/testing/strategy.md` matrix complete · — · gate: owner (U-004).
+- **W2.1 Guarantee card acceptance and evidence map** · TDR-015, U-004, OD-2 · W1.1 · every §1 guarantee backed only by baseline behaviour and tests; planned items separately labelled; `docs/testing/strategy.md` matrix complete · docs only · gate: owner accepts the exact G-* wording (U-004). **Active (not yet started).**
 - **W2.2 Hash-checked create-or-get and `REPLAY_DIVERGENCE`** · D-6.1; ADR-0003 rule 4, ADR-0005 rule 6; invariant 3 · W2.1 · adoption in `govern_call`, `request_approval` and ledger-first `authorize_call` compare the stored call hash; mismatch → `REPLAY_DIVERGENCE` audit, run `failed` after in-flight entries drain · tests: divergence fails closed (negative), node-end replay suite, chaos extension · guarantee card G-1/G-8 limitations removed · no gate.
 - **W2.3 Audited `skipped` calls** · D-6.2; ADR-0012 rule 4, ADR-0005 rule 3 · W2.2 · fenced decision-class audit event per skipped ordinal; T-12 reconstruction shows them · tests: multi-call scenarios, reconstruction · G-13 limitation removed · no gate.
 - **W2.4 Versioned audit MAC with `created_at`** · D-6.3; ADR-0015 rule 1, AD-12 · W2.1 · `created_at` read in-transaction, stored and MACed; `mac_version` per event; v1 chains verify · tests: T-13 timestamp tamper case, mixed-version chain verifies · G-13 limitation removed · no gate.
