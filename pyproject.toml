@@ -212,6 +212,15 @@ sequence = [
 default_item_type = "cmd"
 envfile = "deploy/compose/.env"
 
+[tool.poe.tasks.test-chaos]
+help = "Chaos and race suite (crash injection, competing workers, 50x races, real process kills)"
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "pytest tests/chaos -m chaos",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
 [tool.poe.tasks.smoke]
 help = "Build and start the full compose stack, wait until every service is healthy, then list them"
 sequence = [
