@@ -45,3 +45,70 @@ jobs:
 
       - name: Unit tests
         run: uv run poe test-unit
+
+  # The database-backed suites run on Linux against deploy/compose/docker-compose.test.yml (a
+  # tmpfs Postgres started fresh per job), with throwaway credentials generated in the runner.
+  integration:
+    name: integration + LangGraph contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python (from .python-version)
+        run: uv python install
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Throwaway test database credentials
+        run: >-
+          uv run python -c "import secrets, pathlib;
+          names = ('TETHER_POSTGRES_PASSWORD', 'TETHER_MIGRATOR_DB_PASSWORD', 'TETHER_APP_DB_PASSWORD');
+          pathlib.Path('deploy/compose/.env').write_text(''.join(f'{n}={secrets.token_urlsafe(24)}\n' for n in names))"
+
+      - name: Integration tests
+        run: uv run poe test-integration
+
+      - name: LangGraph contract tests
+        run: uv run poe test-contract
+
+      - name: Stop the test database
+        if: always()
+        run: docker compose -f deploy/compose/docker-compose.test.yml down -v
+
+  chaos:
+    name: chaos and races
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python (from .python-version)
+        run: uv python install
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Throwaway test database credentials
+        run: >-
+          uv run python -c "import secrets, pathlib;
+          names = ('TETHER_POSTGRES_PASSWORD', 'TETHER_MIGRATOR_DB_PASSWORD', 'TETHER_APP_DB_PASSWORD');
+          pathlib.Path('deploy/compose/.env').write_text(''.join(f'{n}={secrets.token_urlsafe(24)}\n' for n in names))"
+
+      - name: Chaos and race suite
+        run: uv run poe test-chaos
+
+      - name: Stop the test database
+        if: always()
+        run: docker compose -f deploy/compose/docker-compose.test.yml down -v
