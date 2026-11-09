@@ -25,6 +25,7 @@ from enum import StrEnum
 from typing import NoReturn
 
 from tether.core.errors import InvalidKeyMaterialError, KeyUnavailableError, SecretNotFoundError
+from tether.observability.logging import register_secret
 from tether.secrets.provider import SecretsProvider, SecretValue
 
 KEY_LENGTH = 32
@@ -79,7 +80,10 @@ class KeyRing:
             encoded = self._provider.get(f"TETHER_{family.upper()}_KEY_{key_id}").reveal()
         except SecretNotFoundError:
             raise KeyUnavailableError(f"{family} key {key_id} is not available") from None
-        return KeyMaterial(family, key_id, SecretValue(_decode(encoded, family, key_id)))
+        material = _decode(encoded, family, key_id)
+        # ADR-0017: known secret values are scrubbed from every log line.
+        register_secret(encoded)
+        return KeyMaterial(family, key_id, SecretValue(material))
 
     def active_key(self, family: KeyFamily) -> KeyMaterial:
         return self.key(family, self.active_key_id(family))

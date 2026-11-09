@@ -18,6 +18,8 @@ x-app-env: &app-env
   TETHER_BOOTSTRAP_FILE: /app/config/bootstrap/dev.yaml
   TETHER_SCENARIOS_DIR: /app/scenarios
   DEMO_TARGET_URL: http://demo-target:8000
+  # Best-effort telemetry (ADR-0015): api and worker run normally if the collector is down.
+  TETHER_OTEL_ENDPOINT: http://otel-collector:4318
   # Separate audit and call-binding key families (ADR-0010); values come from .env only.
   TETHER_AUDIT_ACTIVE_KEY_ID: ${TETHER_AUDIT_ACTIVE_KEY_ID:?set TETHER_AUDIT_ACTIVE_KEY_ID in deploy/compose/.env}
   TETHER_AUDIT_KEY_DEV1: ${TETHER_AUDIT_KEY_DEV1:?set TETHER_AUDIT_KEY_DEV1 in deploy/compose/.env}

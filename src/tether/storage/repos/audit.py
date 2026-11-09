@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import RowMapping
 
 from tether.audit.chain import compute_mac, mac_record
+from tether.observability import tracing
 from tether.secrets.keyring import KeyFamily, KeyRing
 from tether.storage import tables
 from tether.storage.repos.base import ScopedRepository
@@ -144,6 +145,8 @@ class AuditRepository(ScopedRepository):
                 tool=tool,
                 payload_masked=payload,
                 policy_version=policy_version,
+                # Correlation only, outside the MAC (ADR-0015 §7, architecture §16).
+                trace_id=tracing.current_trace_id(),
                 prev_mac=record.prev_mac,
                 mac=mac,
                 key_id=record.key_id,

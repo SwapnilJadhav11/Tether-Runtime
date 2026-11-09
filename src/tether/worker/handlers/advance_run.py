@@ -17,6 +17,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tether.core.statuses import JobKind, RunStatus
+from tether.observability import metrics
+from tether.observability.logging import get_logger
 from tether.policy.engine import PolicyStaleError
 from tether.queue.postgres import LeasedJob
 from tether.runtime.driver import WorkerRuntime, drive
@@ -28,6 +30,7 @@ from tether.storage.uow import UnitOfWork
 
 # ADR-0004: the run outcome when ``advance_run`` exhausts its deliveries with nothing in flight.
 SYSTEM_ERROR = "system_error"
+_log = get_logger(__name__)
 
 _TRY_LOCK = text("SELECT pg_try_advisory_lock(hashtextextended(:name, 0))")
 _UNLOCK = text("SELECT pg_advisory_unlock(hashtextextended(:name, 0))")
@@ -114,6 +117,7 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> Outcome:
                     job.id, job.lease_token
                 ):
                     raise _StaleLease
+                uow.on_commit(lambda: metrics.job_dead_lettered(job.kind))
         except _StaleLease:
             pass
     return Outcome.COMPLETED
@@ -155,6 +159,13 @@ async def _dead_letter_run(
             payload={"status": new.value, "summary": SYSTEM_ERROR},
         )
     await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, job.run_id)
+
+    def recorded() -> None:
+        _log.warning("run dead-lettered", attempts=job.attempts, status=new.value)
+        if not held:
+            metrics.run_finished(new.value, None)
+
+    uow.on_commit(recorded)
 
 
 async def handle(runtime: WorkerRuntime, job: LeasedJob) -> Outcome:

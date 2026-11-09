@@ -10,6 +10,7 @@ from sqlalchemy import Select, and_, case, func, or_, select, update
 from sqlalchemy.engine import RowMapping
 
 from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind, JobState, RunStatus
+from tether.observability import tracing
 from tether.storage import tables
 from tether.storage.repos.base import ScopedRepository
 
@@ -186,6 +187,8 @@ class JobsRepository(ScopedRepository):
             "ref_id": ref_id,
             "payload": payload or {},
             "max_attempts": MAX_ATTEMPTS[kind],
+            # The enqueuing span: the job's span links to it (AD-13); telemetry only.
+            "trace_parent": tracing.current_traceparent(),
         }
         if run_after is not None:
             values["run_after"] = run_after

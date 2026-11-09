@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tether.core.statuses import JobState
@@ -40,6 +40,11 @@ class LeasedJob:
     max_attempts: int
     ref_id: uuid.UUID | None
     payload: dict[str, Any]
+    # Telemetry only (AD-13), never used for a decision: the context that enqueued the job, the
+    # run's root context, and how long the job waited after it was due.
+    trace_parent: str | None = None
+    run_trace_parent: str | None = None
+    waited_seconds: float = 0.0
 
 
 def _seconds_from_now(seconds: float) -> Any:
@@ -89,11 +94,37 @@ async def lease_one(
             _JOBS.c.max_attempts,
             _JOBS.c.ref_id,
             _JOBS.c.payload,
+            _JOBS.c.trace_parent,
+            _RUNS.c.trace_parent.label("run_trace_parent"),
+            func.extract("epoch", now - _JOBS.c.run_after).label("waited_seconds"),
         )
     )
     async with engine.begin() as connection:
         row = (await connection.execute(statement)).mappings().first()
-    return None if row is None else LeasedJob(**row)
+    if row is None:
+        return None
+    return LeasedJob(**{**row, "waited_seconds": float(row["waited_seconds"] or 0)})
+
+
+async def depth(engine: AsyncEngine) -> dict[tuple[str, str], int]:
+    """Open jobs by (kind, state): ``due``, ``scheduled`` (``run_after`` ahead) or ``leased``.
+
+    A read-only aggregate across workspaces, like leasing itself; telemetry only.
+    """
+    now = func.clock_timestamp()
+    state = case(
+        (and_(_JOBS.c.state == JobState.READY, _JOBS.c.run_after <= now), "due"),
+        (_JOBS.c.state == JobState.READY, "scheduled"),
+        else_="leased",
+    ).label("state")
+    statement = (
+        select(_JOBS.c.kind, state, func.count())
+        .where(_JOBS.c.state.in_([JobState.READY, JobState.LEASED]))
+        .group_by(_JOBS.c.kind, state)
+    )
+    async with engine.connect() as connection:
+        result = await connection.execute(statement)
+        return {(str(kind), str(label)): int(count) for kind, label, count in result}
 
 
 async def complete(engine: AsyncEngine, job: LeasedJob) -> bool:

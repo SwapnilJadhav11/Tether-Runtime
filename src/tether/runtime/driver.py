@@ -16,6 +16,8 @@ from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tether.core.statuses import RunStatus
+from tether.observability import metrics, tracing
+from tether.observability.logging import get_logger
 from tether.policy.config import BootstrapFile, load_bootstrap
 from tether.providers.protocol import ModelProvider
 from tether.registry.registry import ToolRegistry, load_workload
@@ -33,6 +35,7 @@ from tether.testing.scripted import ScriptedProvider
 
 # Opaque, meaningless resume value (§9.3; pinned by the S1.3 contract suite).
 WAKE = "tether:wake"
+_log = get_logger(__name__)
 
 _WAIT_STATUS = {
     "awaiting_tool": RunStatus.AWAITING_TOOL,
@@ -108,6 +111,8 @@ async def _fail(runtime: WorkerRuntime, scope: WorkspaceScope, run_id: uuid.UUID
             event_type="RUN_FINISHED",
             payload={"status": "failed", "summary": "agent is not configured"},
         )
+        uow.on_commit(lambda: metrics.run_finished(RunStatus.FAILED.value, None))
+    _log.warning("run failed: agent is not configured", status=RunStatus.FAILED.value)
 
 
 async def drive(
@@ -141,19 +146,32 @@ async def drive(
     snapshot = await graph.aget_state(config)
     if not snapshot.values:
         invocation: Any = initial_state(registry.workload.agent.system_prompt, run["task_input"])
+        mode = "start"
     elif snapshot.interrupts:
         invocation = Command(resume=WAKE)
+        mode = "resume"
     elif snapshot.next:
         invocation = None  # crashed mid-step: continue from the last checkpoint
+        mode = "recover"
     else:
         return  # the graph already finished; finalize recorded the terminal status
-    await graph.ainvoke(invocation, config, durability="sync")
-    snapshot = await graph.aget_state(config)
-    if snapshot.interrupts:
-        waiting = _WAIT_STATUS[snapshot.interrupts[0].value]
-        async with UnitOfWork(runtime.engine) as uow:
-            runs = uow.repository(RunsRepository, scope)
-            await runs.guard(run_id, generation)
-            await runs.transition(
-                run_id, expected=RunStatus.RUNNING, new=waiting, generation=generation
-            )
+    with tracing.span(
+        "run.drive",
+        attributes={
+            "tether.run_id": run_id,
+            "tether.driver.generation": generation,
+            "tether.driver.mode": mode,
+        },
+    ) as current:
+        await graph.ainvoke(invocation, config, durability="sync")
+        snapshot = await graph.aget_state(config)
+        if snapshot.interrupts:
+            waiting = _WAIT_STATUS[snapshot.interrupts[0].value]
+            tracing.annotate(current, **{"tether.run.waiting": waiting.value})
+            async with UnitOfWork(runtime.engine) as uow:
+                runs = uow.repository(RunsRepository, scope)
+                await runs.guard(run_id, generation)
+                await runs.transition(
+                    run_id, expected=RunStatus.RUNNING, new=waiting, generation=generation
+                )
+            _log.info("run waiting", status=waiting.value)

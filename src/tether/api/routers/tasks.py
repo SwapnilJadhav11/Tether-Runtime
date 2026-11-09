@@ -21,6 +21,8 @@ from tether.authz.deps import RunReader, Submission, run_reader, submission, tas
 from tether.core.ids import WorkspaceId
 from tether.core.statuses import JobKind, RunStatus
 from tether.identity.principal import Principal
+from tether.observability import metrics, tracing
+from tether.observability.logging import get_logger
 from tether.runtime import stop_requests
 from tether.secrets.keyring import KeyFamily
 from tether.storage.repos.approvals import ApprovalsRepository
@@ -31,6 +33,7 @@ from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
 router = APIRouter(prefix="/v1/tasks")
+_log = get_logger(__name__)
 
 
 class SubmittedRun(BaseModel):
@@ -104,6 +107,7 @@ async def submit_run(
     deadline_at = func.clock_timestamp() + func.make_interval(
         0, 0, 0, 0, 0, 0, settings.run_max_duration_seconds
     )
+    tracing.annotate_current(**{"tether.run_id": run_id, "tether.workspace_id": scope.workspace_id})
     try:
         async with UnitOfWork(request.app.state.db_engine) as uow:
             await uow.repository(RunsRepository, scope).add(
@@ -116,6 +120,8 @@ async def submit_run(
                     "deadline_at": deadline_at,
                     # Pin the call-binding key for every call hash of this run (ADR-0010).
                     "binding_key_id": request.app.state.keyring.active_key_id(KeyFamily.BINDING),
+                    # The run's root trace context: every job span joins this trace (AD-13).
+                    "trace_parent": tracing.current_traceparent(),
                 }
             )
             await uow.repository(AuditRepository, scope).append(
@@ -131,11 +137,18 @@ async def submit_run(
             # TX1's timer (§11.4). The same expression, evaluated after the run insert, makes it
             # due no earlier than the stored deadline it enforces.
             await jobs.enqueue(JobKind.RUN_DEADLINE, run_id, run_after=deadline_at)
+            uow.on_commit(metrics.run_started)
     except IntegrityError as error:
         # The agent does not exist in this workspace: not found, as for any out-of-scope id.
         if isinstance(error.orig, pg_errors.ForeignKeyViolation):
             raise HTTPException(status.HTTP_404_NOT_FOUND) from None
         raise
+    _log.info(
+        "run submitted",
+        run_id=run_id,
+        workspace_id=scope.workspace_id,
+        agent_id=submitted.agent_id,
+    )
     return SubmittedRun(run_id=run_id, status=RunStatus.QUEUED)
 
 
@@ -178,11 +191,20 @@ async def cancel_as(
         run = await runs.lock(run_id)
         if run is None or not may_cancel(run):
             raise HTTPException(status.HTTP_404_NOT_FOUND)
-        await stop_requests.request_cancel(
-            uow, request.app.state.keyring, scope, run, by=principal.subject
+        tracing.annotate_current(
+            **{"tether.run_id": run_id, "tether.workspace_id": scope.workspace_id}
         )
+        # TX9 joins the run's trace (its wake job links back to this request).
+        with tracing.span(
+            "run.cancel", parent=run["trace_parent"], links=[tracing.current_traceparent()]
+        ):
+            changed = await stop_requests.request_cancel(
+                uow, request.app.state.keyring, scope, run, by=principal.subject
+            )
         current = await runs.get(run_id)
     current = _required_row(current)
+    if changed:
+        _log.info("cancel requested", run_id=run_id, workspace_id=scope.workspace_id)
     return CancelRequested(
         run_id=run_id,
         status=current["status"],

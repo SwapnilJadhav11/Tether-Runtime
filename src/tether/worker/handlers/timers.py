@@ -9,7 +9,11 @@ a no-op.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind
+from tether.observability import metrics
+from tether.observability.logging import get_logger
 from tether.queue.postgres import LeasedJob
 from tether.runtime import stop_requests
 from tether.runtime.driver import WorkerRuntime
@@ -18,6 +22,8 @@ from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.runs import JobsRepository, RunsRepository
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
+
+_log = get_logger(__name__)
 
 
 def _scope(job: LeasedJob) -> WorkspaceScope:
@@ -58,6 +64,14 @@ async def expire_approval(runtime: WorkerRuntime, job: LeasedJob) -> None:
             tool=approval["tool"],
         )
         await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, job.run_id)
+        waited = (datetime.now(UTC) - approval["created_at"]).total_seconds()
+        tool = str(approval["tool"])
+
+        def expired() -> None:
+            metrics.approval_resolved("expired", waited)
+            _log.info("approval expired", tool=tool)
+
+        uow.on_commit(expired)
 
 
 class _StaleLease(Exception):  # noqa: N818 - a control-flow signal that rolls TX12 back
@@ -74,5 +88,6 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
             if not await jobs.mark_dead(job.id, job.lease_token):
                 raise _StaleLease
             await jobs.enqueue(JobKind.ADVANCE_RUN, job.run_id)
+            uow.on_commit(lambda: metrics.job_dead_lettered(job.kind))
     except _StaleLease:
         return

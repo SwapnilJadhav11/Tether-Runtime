@@ -9,6 +9,7 @@ data only through workspace-scoped repositories bound to that transaction.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from types import TracebackType
 from typing import Self
 
@@ -37,6 +38,17 @@ class UnitOfWork:
         self._engine = engine
         self._connection: AsyncConnection | None = None
         self._active = False
+        self._after_commit: list[Callable[[], None]] = []
+
+    def on_commit(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` after this transaction commits; never after a rollback.
+
+        For best-effort side channels only (metrics, logs): a callback's failure is ignored and
+        cannot affect the committed transaction or the caller.
+        """
+        if not self._active:
+            raise UnitOfWorkError("on_commit is only available inside an active Unit of Work")
+        self._after_commit.append(callback)
 
     async def __aenter__(self) -> Self:
         # Claim the guard before the first await, so concurrent entry cannot open two
@@ -65,6 +77,7 @@ class UnitOfWork:
     ) -> None:
         connection, self._connection = self._connection, None
         self._active = False
+        callbacks, self._after_commit = self._after_commit, []
         if connection is None:
             return
         # Commit/rollback and close run in their own task, shielded from cancellation of the
@@ -74,6 +87,14 @@ class UnitOfWork:
         _PENDING_CLEANUPS.add(cleanup)
         cleanup.add_done_callback(_PENDING_CLEANUPS.discard)
         await asyncio.shield(cleanup)
+        if exc_type is not None:
+            return
+        # Committed (a failed commit raised above): run the best-effort callbacks.
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:  # noqa: S112 - telemetry must never affect a committed transaction
+                continue
 
     def repository[R: ScopedRepository](self, repository: type[R], scope: WorkspaceScope) -> R:
         """A repository bound to this transaction and limited to ``scope``."""

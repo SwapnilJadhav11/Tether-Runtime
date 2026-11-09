@@ -1,5 +1,6 @@
-# OpenTelemetry collector (architecture §19): receives OTLP from api and worker and forwards
-# traces to Jaeger. Instrumentation in the Tether processes arrives in S1.9.
+# OpenTelemetry collector (architecture §19): receives OTLP from api and worker, forwards traces
+# to Jaeger, and prints metrics to its own log (V1 has no Prometheus/Grafana, AD-13):
+#   docker compose -f deploy/compose/docker-compose.yml logs otel-collector
 receivers:
   otlp:
     protocols:
@@ -16,6 +17,8 @@ exporters:
     endpoint: jaeger:4317
     tls:
       insecure: true
+  debug/metrics:
+    verbosity: detailed
 
 service:
   pipelines:
@@ -23,3 +26,7 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug/metrics]

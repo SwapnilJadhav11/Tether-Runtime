@@ -14,6 +14,7 @@ write is never re-sent. ``dead_letter`` is TX12 for a job delivered past ``max_a
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -21,6 +22,8 @@ from sqlalchemy.engine import RowMapping
 
 from tether.core.hashing import call_hashes_equal
 from tether.core.statuses import JobKind
+from tether.observability import metrics, tracing
+from tether.observability.logging import bound, get_logger
 from tether.queue import backoff
 from tether.queue.postgres import LeasedJob
 from tether.registry.masking import mask
@@ -34,6 +37,7 @@ from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
 TERMINAL_LEDGER_STATES = frozenset({"completed", "failed", "indeterminate", "abandoned"})
+_log = get_logger(__name__)
 
 # entry (as before this send), descriptor, validated arguments, this send's attempt number
 Send = tuple[RowMapping, ToolDescriptor, BaseModel, int]
@@ -96,6 +100,16 @@ async def _record(
         tool=entry["tool"],
     )
     await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, entry["run_id"])
+    tool = str(entry["tool"])
+
+    def recorded() -> None:
+        if new == "indeterminate":
+            metrics.ledger_indeterminate(tool)
+            _log.warning("tool outcome indeterminate", tool=tool, reason=reason)
+        else:
+            _log.info("tool outcome", tool=tool, state=new, reason=reason)
+
+    uow.on_commit(recorded)
 
 
 async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob) -> Send | None:
@@ -175,27 +189,67 @@ async def handle(runtime: WorkerRuntime, job: LeasedJob) -> float | None:
     if prepared is None:
         return None
     entry, descriptor, args, attempt = prepared
+    with bound(tool=descriptor.name):
+        return await _send(runtime, scope, entry, descriptor, args, attempt)
+
+
+async def _send(
+    runtime: WorkerRuntime,
+    scope: WorkspaceScope,
+    entry: RowMapping,
+    descriptor: ToolDescriptor,
+    args: BaseModel,
+    attempt: int,
+) -> float | None:
+    """One send to the tool and its TX7; returns the retry delay, or ``None`` when done."""
     output: dict[str, Any] | None = None
     reason: str | None = None
     context = ToolContext(idempotency_key=entry["idempotency_key"])
-    try:
-        result = await descriptor.handler(args, context)
-        output = mask(descriptor.output_model.model_validate(result.model_dump()))
-        new = "completed"
-    except ToolNotApplied as not_applied:
-        new, reason = "failed", f"not applied: {not_applied.reason}"
-    except Exception as error:
-        # Unknown outcome. Re-send with the same key while the budget lasts, but only when that
-        # cannot duplicate an effect. Invalid output is never retried (PD-33).
-        retry = (
-            _resendable(entry)
-            and attempt < descriptor.max_attempts
-            and not isinstance(error, ValidationError)
-        )
-        if retry:
-            return backoff.tool_backoff_seconds(attempt)
-        # ADR-0007: a write whose result is unknown is indeterminate, never failed.
-        new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
+    # Identifiers and bounded descriptors only: never arguments or outputs (ADR-0017).
+    with tracing.span(
+        "tool.execute",
+        attributes={
+            "tether.tool": descriptor.name,
+            "tether.tool.version": descriptor.version,
+            "tether.tool.effect": descriptor.effect,
+            "tether.tool.attempt": attempt,
+            "tether.tool.max_attempts": descriptor.max_attempts,
+        },
+    ) as current:
+        started = time.monotonic()
+        retry_in: float | None = None
+        try:
+            result = await descriptor.handler(args, context)
+            output = mask(descriptor.output_model.model_validate(result.model_dump()))
+            new = outcome = "completed"
+        except ToolNotApplied as not_applied:
+            new, reason, outcome = "failed", f"not applied: {not_applied.reason}", "not_applied"
+        except Exception as error:
+            outcome = "unknown"
+            tracing.mark_error(current, type(error).__name__)
+            # Unknown outcome. Re-send with the same key while the budget lasts, but only when
+            # that cannot duplicate an effect. Invalid output is never retried (PD-33).
+            retry = (
+                _resendable(entry)
+                and attempt < descriptor.max_attempts
+                and not isinstance(error, ValidationError)
+            )
+            if retry:
+                retry_in = backoff.tool_backoff_seconds(attempt)
+                metrics.tool_retry(descriptor.name)
+                tracing.event("tool.retry_scheduled", **{"tether.retry.delay_s": retry_in})
+                _log.warning(
+                    "tool outcome unknown; retry scheduled",
+                    attempt=attempt,
+                    error=type(error).__name__,
+                    delay_s=round(retry_in, 3),
+                )
+            # ADR-0007: a write whose result is unknown is indeterminate, never failed.
+            new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
+        metrics.tool_executed(descriptor.name, outcome, time.monotonic() - started)
+        tracing.annotate(current, **{"tether.tool.outcome": outcome})
+    if retry_in is not None:
+        return retry_in
     async with UnitOfWork(runtime.engine) as uow:
         await _record(
             uow, runtime, scope, entry, expected="dispatched", new=new, output=output, reason=reason
@@ -235,5 +289,11 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
                 )
             if not await uow.repository(JobsRepository, scope).mark_dead(job.id, job.lease_token):
                 raise _StaleLease
+            uow.on_commit(lambda: _dead_lettered(job))
     except _StaleLease:
         return
+
+
+def _dead_lettered(job: LeasedJob) -> None:
+    metrics.job_dead_lettered(job.kind)
+    _log.warning("job dead-lettered", attempts=job.attempts, max_attempts=job.max_attempts)

@@ -9,6 +9,7 @@ listed by the matching rule, and never the run's requester. Anything the caller 
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
@@ -18,6 +19,8 @@ from tether.authz.deps import approvals_principal
 from tether.core.ids import WorkspaceId
 from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind
 from tether.identity.principal import Principal
+from tether.observability import metrics, tracing
+from tether.observability.logging import get_logger
 from tether.policy.engine import evaluate_action, evaluate_approval_eligibility
 from tether.storage.repos.approvals import ApprovalsRepository
 from tether.storage.repos.audit import AuditRepository
@@ -26,6 +29,7 @@ from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
 router = APIRouter(prefix="/v1/approvals")
+_log = get_logger(__name__)
 
 _DECISIONS = {"approve": "approved", "reject": "rejected"}
 APPROVER_ROLE = "approver"
@@ -79,24 +83,44 @@ async def decide_approval(
             or run["status"] in TERMINAL_RUN_STATUSES
         ):
             raise conflict
-        decided = await approvals.decide(
-            approval_id,
-            status=new_status,
-            decided_by=principal.subject,
-            reason=reason,
-            policy_version=decision.policy_version,
+        tracing.annotate_current(
+            **{"tether.run_id": run["id"], "tether.workspace_id": scope.workspace_id}
         )
-        if not decided:
-            raise conflict
-        await uow.repository(AuditRepository, scope).append(
-            request.app.state.keyring,
-            run_id=run["id"],
-            dedupe_key=f"approval_decided:{approval_id}",
-            event_type="APPROVAL_DECIDED",
-            payload={"approval_id": str(approval_id), "status": new_status, "reason": reason},
-            actor=principal.subject,
-            tool=approval["tool"],
-            policy_version=decision.policy_version,
-        )
-        await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run["id"])
+        # The decision joins the run's trace, linked to this request (AD-13); its audit event and
+        # wake job carry that context.
+        with tracing.span(
+            "approval.decide",
+            parent=run["trace_parent"],
+            links=[tracing.current_traceparent()],
+            attributes={"tether.tool": approval["tool"], "tether.approval.status": new_status},
+        ):
+            decided = await approvals.decide(
+                approval_id,
+                status=new_status,
+                decided_by=principal.subject,
+                reason=reason,
+                policy_version=decision.policy_version,
+            )
+            if not decided:
+                raise conflict
+            await uow.repository(AuditRepository, scope).append(
+                request.app.state.keyring,
+                run_id=run["id"],
+                dedupe_key=f"approval_decided:{approval_id}",
+                event_type="APPROVAL_DECIDED",
+                payload={"approval_id": str(approval_id), "status": new_status, "reason": reason},
+                actor=principal.subject,
+                tool=approval["tool"],
+                policy_version=decision.policy_version,
+            )
+            await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run["id"])
+        waited = (datetime.now(UTC) - approval["created_at"]).total_seconds()
+        uow.on_commit(lambda: metrics.approval_resolved(new_status, waited))
+    _log.info(
+        "approval decided",
+        run_id=run["id"],
+        workspace_id=scope.workspace_id,
+        tool=approval["tool"],
+        status=new_status,
+    )
     return DecidedApproval(id=approval_id, status=new_status)

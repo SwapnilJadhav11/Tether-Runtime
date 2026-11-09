@@ -30,6 +30,8 @@ from tether.core.statuses import (
     LedgerState,
 )
 from tether.identity.principal import Principal
+from tether.observability import metrics, tracing
+from tether.observability.logging import get_logger
 from tether.policy.engine import evaluate_reconciliation_eligibility
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.ledger import LedgerRepository
@@ -38,6 +40,7 @@ from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
 
 router = APIRouter(prefix="/v1/ops")
+_log = get_logger(__name__)
 
 RECONCILER_ROLE = "reconciler"
 WORKSPACE_ADMIN_ROLE = "workspace_admin"
@@ -99,32 +102,50 @@ async def reconcile_entry(
             raise conflict
         if run["status"] in TERMINAL_RUN_STATUSES:
             raise conflict
-        changed = await ledger.transition(
-            ledger_id,
-            expected=LedgerState.INDETERMINATE,
-            new=new_state,
-            resolution=resolution,
-            resolved_by=principal.subject,
-            justification=justification,
+        tracing.annotate_current(
+            **{"tether.run_id": run["id"], "tether.workspace_id": scope.workspace_id}
         )
-        if not changed:
-            raise conflict
-        await uow.repository(AuditRepository, scope).append(
-            request.app.state.keyring,
-            run_id=run["id"],
-            dedupe_key=f"reconciled:{ledger_id}",
-            event_type="RECONCILED",
-            payload={
-                "ledger_id": str(ledger_id),
-                "outcome": outcome,
-                "resolution": resolution.value,
-                "justification": justification,
-            },
-            actor=principal.subject,
-            tool=entry["tool"],
-            policy_version=workspace.policy_version,
-        )
-        await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run["id"])
+        # TX8 joins the run's trace, linked to this request (AD-13).
+        with tracing.span(
+            "ledger.reconcile",
+            parent=run["trace_parent"],
+            links=[tracing.current_traceparent()],
+            attributes={"tether.tool": entry["tool"], "tether.reconciliation.outcome": outcome},
+        ):
+            changed = await ledger.transition(
+                ledger_id,
+                expected=LedgerState.INDETERMINATE,
+                new=new_state,
+                resolution=resolution,
+                resolved_by=principal.subject,
+                justification=justification,
+            )
+            if not changed:
+                raise conflict
+            await uow.repository(AuditRepository, scope).append(
+                request.app.state.keyring,
+                run_id=run["id"],
+                dedupe_key=f"reconciled:{ledger_id}",
+                event_type="RECONCILED",
+                payload={
+                    "ledger_id": str(ledger_id),
+                    "outcome": outcome,
+                    "resolution": resolution.value,
+                    "justification": justification,
+                },
+                actor=principal.subject,
+                tool=entry["tool"],
+                policy_version=workspace.policy_version,
+            )
+            await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run["id"])
+        uow.on_commit(lambda: metrics.reconciled(outcome))
+    _log.info(
+        "ledger entry reconciled",
+        run_id=run["id"],
+        workspace_id=scope.workspace_id,
+        tool=entry["tool"],
+        outcome=outcome,
+    )
     return resolved
 
 

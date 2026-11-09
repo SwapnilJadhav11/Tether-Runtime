@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     worker_heartbeat_file: Path = _default_heartbeat_file()
     worker_heartbeat_max_age_seconds: float = 30.0
 
+    # Telemetry (S1.9, best-effort per ADR-0015). Without an endpoint, spans and metrics are
+    # still produced (trace context is persisted) but not exported.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    # OTLP/HTTP base URL of the collector, e.g. http://otel-collector:4318.
+    otel_endpoint: str | None = None
+    # Upper bound for one export attempt, retries included: a dead collector never blocks.
+    otel_export_timeout_seconds: float = Field(default=2.0, gt=0)
+    # How often metrics are exported (and the worker samples queue depth).
+    otel_metric_interval_seconds: float = Field(default=15.0, gt=0)
+
 
 class MigrationSettings(BaseSettings):
     """Settings for the one-shot ``migrate`` process, which runs as the migrator role."""

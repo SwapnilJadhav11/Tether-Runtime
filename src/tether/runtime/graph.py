@@ -9,8 +9,10 @@ Decisions are keyed by step ordinal and adopted on replay, never re-decided.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -23,6 +25,8 @@ from tether.core.hashing import CallEnvelope, call_hash, call_hashes_equal, idem
 from tether.core.ids import AgentId, RunId, WorkspaceId
 from tether.core.results import CallOutcome
 from tether.core.statuses import JobKind, LedgerResolution, RunStatus
+from tether.observability import metrics, tracing
+from tether.observability.logging import get_logger
 from tether.policy.config import WorkspaceConfig
 from tether.policy.engine import PolicyStaleError, evaluate_action
 from tether.providers.history import ModelTurn, NeutralMessage
@@ -43,6 +47,10 @@ from tether.storage.repos.runs import (
 )
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
+
+_log = get_logger(__name__)
+# The metric label for a proposed tool that is not registered: model text never becomes a label.
+_UNREGISTERED = "unregistered"
 
 
 class RunState(TypedDict, total=False):
@@ -157,6 +165,17 @@ def _tool_message(call_id: str, outcome: str, content: Any) -> dict[str, Any]:
     return message.model_dump(mode="json")
 
 
+def _record_decision(uow: UnitOfWork, current: Any, decision: str, tool: str, step: int) -> None:
+    """Telemetry for a newly recorded decision, emitted only once TX2 commits."""
+    tracing.annotate(current, **{"tether.policy.decision": decision})
+
+    def committed() -> None:
+        metrics.policy_decision(decision, tool)
+        _log.info("policy decision", decision=decision, tool=tool, step=step)
+
+    uow.on_commit(committed)
+
+
 def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     async def stopped(uow: UnitOfWork, run: Any) -> RunState:
         """A stopped run ends ``cancelled`` or ``timed_out`` (ADR-0006). The summary names every
@@ -186,10 +205,31 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         history = [NeutralMessage.model_validate(m) for m in state["history"]]
         turn: ModelTurn | None = None
         failure = ""
-        try:
-            turn = await ctx.provider.complete(history, ctx.registry.manifest())
-        except ProviderError as error:
-            failure = f"model call failed: {error}"
+        with tracing.span(
+            "model.call",
+            attributes={
+                "tether.model.provider": ctx.provider.name,
+                "tether.model.name": ctx.provider.model,
+                "tether.model.turn": state["turns"],
+            },
+        ) as current:
+            started = time.monotonic()
+            try:
+                turn = await ctx.provider.complete(history, ctx.registry.manifest())
+            except ProviderError as error:
+                failure = f"model call failed: {error}"
+                tracing.mark_error(current, type(error).__name__)
+            outcome = "failed" if turn is None else "succeeded"
+            metrics.model_call(ctx.provider.name, outcome, time.monotonic() - started)
+            tracing.annotate(
+                current,
+                **{
+                    "tether.model.outcome": outcome,
+                    "tether.model.tool_calls": 0 if turn is None else len(turn.tool_calls),
+                },
+            )
+        if turn is None:
+            _log.warning("model call failed", provider=ctx.provider.name, turn=state["turns"])
         async with UnitOfWork(ctx.engine) as uow:
             await uow.repository(ModelCallsRepository, ctx.scope).add(
                 {
@@ -253,56 +293,74 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         call = state["current"]
         call = _required(call, "current call")
         dedupe = f"decision:{call['step_ordinal']}"
-        async with UnitOfWork(ctx.engine) as uow:
-            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
-            audit = uow.repository(AuditRepository, ctx.scope)
-            adopted = await audit.find(ctx.run_id, dedupe)
-            if adopted is not None:
-                return {"decision": adopted.payload}
-            if run["stopped"]:
-                return await stopped(uow, run)
-            descriptor = ctx.registry.offered(call["tool"])
-            args: BaseModel | list[str] = (
-                _validate(descriptor, call["arguments"])
-                if descriptor is not None
-                else ["tool is not offered to this agent"]
-            )
-            if descriptor is None or isinstance(args, list):
-                payload: dict[str, Any] = {
-                    "decision": "invalid",
-                    "reasons": args if isinstance(args, list) else [],
-                    "call_hash": None,
+        with tracing.span(
+            "policy.govern",
+            attributes={"tether.tool": call["tool"], "tether.step": call["step_ordinal"]},
+        ) as current:
+            async with UnitOfWork(ctx.engine) as uow:
+                run = await uow.repository(RunsRepository, ctx.scope).guard(
+                    ctx.run_id, ctx.generation
+                )
+                audit = uow.repository(AuditRepository, ctx.scope)
+                adopted = await audit.find(ctx.run_id, dedupe)
+                if adopted is not None:
+                    tracing.annotate(
+                        current,
+                        **{
+                            "tether.policy.decision": adopted.payload.get("decision"),
+                            "tether.policy.adopted": True,
+                        },
+                    )
+                    return {"decision": adopted.payload}
+                if run["stopped"]:
+                    return await stopped(uow, run)
+                descriptor = ctx.registry.offered(call["tool"])
+                args: BaseModel | list[str] = (
+                    _validate(descriptor, call["arguments"])
+                    if descriptor is not None
+                    else ["tool is not offered to this agent"]
+                )
+                if descriptor is None or isinstance(args, list):
+                    payload: dict[str, Any] = {
+                        "decision": "invalid",
+                        "reasons": args if isinstance(args, list) else [],
+                        "call_hash": None,
+                    }
+                    await audit.append(
+                        ctx.keys,
+                        run_id=ctx.run_id,
+                        dedupe_key=dedupe,
+                        event_type="CALL_INVALID",
+                        payload=payload,
+                        tool=call["tool"],
+                    )
+                    label = descriptor.name if descriptor is not None else _UNREGISTERED
+                    _record_decision(uow, current, "invalid", label, call["step_ordinal"])
+                    return {"decision": payload}
+                await _assert_current_policy(uow, ctx)
+                decision = evaluate_action(
+                    ctx.workspace, tool=descriptor.name, requester=run["requester_snapshot"]
+                )
+                payload = {
+                    "decision": decision.outcome,
+                    "reasons": list(decision.reasons),
+                    "call_hash": call_hash_for(ctx.keys, run, descriptor, args),
+                    "tool_version": descriptor.version,
+                    "approver_roles": list(decision.approver_roles),
                 }
                 await audit.append(
                     ctx.keys,
                     run_id=ctx.run_id,
                     dedupe_key=dedupe,
-                    event_type="CALL_INVALID",
+                    event_type="POLICY_DECISION",
                     payload=payload,
-                    tool=call["tool"],
+                    tool=descriptor.name,
+                    policy_version=decision.policy_version,
+                )
+                _record_decision(
+                    uow, current, decision.outcome, descriptor.name, call["step_ordinal"]
                 )
                 return {"decision": payload}
-            await _assert_current_policy(uow, ctx)
-            decision = evaluate_action(
-                ctx.workspace, tool=descriptor.name, requester=run["requester_snapshot"]
-            )
-            payload = {
-                "decision": decision.outcome,
-                "reasons": list(decision.reasons),
-                "call_hash": call_hash_for(ctx.keys, run, descriptor, args),
-                "tool_version": descriptor.version,
-                "approver_roles": list(decision.approver_roles),
-            }
-            await audit.append(
-                ctx.keys,
-                run_id=ctx.run_id,
-                dedupe_key=dedupe,
-                event_type="POLICY_DECISION",
-                payload=payload,
-                tool=descriptor.name,
-                policy_version=decision.policy_version,
-            )
-            return {"decision": payload}
 
     def after_govern(state: RunState) -> str:
         if state.get("end_status"):
@@ -367,6 +425,10 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             await uow.repository(JobsRepository, ctx.scope).enqueue(
                 JobKind.EXPIRE_APPROVAL, ctx.run_id, ref_id=approval_id, run_after=expiry
             )
+            tracing.event("approval.requested", **{"tether.tool": descriptor.name})
+            uow.on_commit(
+                lambda: _log.info("approval requested", tool=descriptor.name, step=ordinal)
+            )
         return {"approval_id": str(approval_id)}
 
     def after_request(state: RunState) -> str:
@@ -391,6 +453,23 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         return "append_result" if state.get("result") else "authorize_call"
 
     async def authorize_call(state: RunState) -> RunState:
+        """TX5 in a span; the outcome (authorized, or why not) is the span's attribute."""
+        call = _required(state["current"], "current call")
+        with tracing.span(
+            "tool.authorize",
+            attributes={"tether.tool": call["tool"], "tether.step": call["step_ordinal"]},
+        ) as current:
+            update = await _authorize(state)
+            result = update.get("result")
+            if result is not None:
+                outcome = str(result["outcome"])
+                _log.info("call not authorized", outcome=outcome, step=call["step_ordinal"])
+            else:
+                outcome = "stopped" if update.get("end_status") else "authorized"
+            tracing.annotate(current, **{"tether.authorization": outcome})
+            return update
+
+    async def _authorize(state: RunState) -> RunState:
         """TX5: ledger-first; else re-evaluate current policy and create the ledger entry."""
         call, decided = state["current"], state["decision"]
         call = _required(call, "current call")
@@ -534,8 +613,8 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         summary = state.get("final_text")
         async with UnitOfWork(ctx.engine) as uow:
             runs = uow.repository(RunsRepository, ctx.scope)
-            await runs.guard(ctx.run_id, ctx.generation)
-            await runs.transition(
+            run = await runs.guard(ctx.run_id, ctx.generation)
+            changed = await runs.transition(
                 ctx.run_id,
                 expected=NON_TERMINAL,
                 new=status,
@@ -549,6 +628,15 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 event_type="RUN_FINISHED",
                 payload={"status": status.value, "summary": summary},
             )
+            if changed:
+                tracing.event("run.finished", **{"tether.run.status": status.value})
+                duration = (datetime.now(UTC) - run["created_at"]).total_seconds()
+
+                def finished() -> None:
+                    metrics.run_finished(status.value, duration)
+                    _log.info("run finished", status=status.value, duration_s=round(duration, 3))
+
+                uow.on_commit(finished)
         return {}
 
     graph = StateGraph(RunState)
