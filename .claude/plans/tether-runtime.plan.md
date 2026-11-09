@@ -2,13 +2,123 @@
 
 ## 1. Header
 
-- **Title:** Tether V1 reference slice — implementation plan
-- **Source PRD:** `.claude/PRPs/prds/tether-runtime.prd.md` (frozen V1 requirements baseline)
-- **Architecture:** `docs/architecture/tether-v1-architecture.md` (revised after architect review)
-- **ADR index:** `docs/adr/README.md` (ADR-0001 … ADR-0017, all `accepted`)
-- **Scope:** Full V1 reference slice (PRD Phases 1–7 and 10 in the base schedule; Phases 8–9 are tier-1 slip candidates)
+- **Title:** Tether V1 — implementation plan (re-baselined 2026-11-09)
+- **Source PRD:** `.claude/PRPs/prds/tether-runtime.prd.md` (revision 2026-11-09)
+- **Product direction and scope delta:** `docs/product/tether-v1-direction-2026-11.md`, `docs/product/tether-v1-scope-delta.md`
+- **Architecture:** `docs/architecture/tether-v1-architecture.md` (amended 2026-11-09)
+- **ADR index:** `docs/adr/README.md` (ADR-0001 … ADR-0019; ADR-0007 superseded by ADR-0019, accepted 2026-11-09)
+- **Scope:** Revised V1 per §0; the original 38-step sequence (§5–§7) is retained for historical traceability
 - **Complexity:** Large
-- **Status:** Approved — active implementation plan
+- **Status:** Approved plan, re-baselined on commit `ec35254`. **Read §0 first.**
+
+## 0. Re-baseline (2026-11-09) — read this first
+
+### 0.1 Baseline
+
+- **Implementation baseline:** commit `ec352540a8fd9f70309b12af53f013b87c2258e4` (`hardening/v1-baseline`, CI green). It is the starting point for the revised V1, **not** a completed or frozen V1.
+- **Authority:** the revised PRD defines requirements; the scope delta records dispositions and owner decisions D-1–D-12, U-001, U-002; accepted ADRs are unchanged except ADR-0007, superseded by ADR-0019 (accepted 2026-11-09); ADR-0019 is required design, implemented in W5.1.
+- **Categories used below:** *baseline* = done at `ec35254` with automated evidence; *partial*; *not started*; *revised* = scope changed by the direction; *deferred*; *removed*.
+- **Active step rule:** exactly one step is active at a time, named by the owner and recorded in `CLAUDE.md`. **Active step now: W1.1 (documentation reconciliation, this pass).** When W1.1 is accepted, the owner names the next step; the recommended next is **W2.1**.
+
+### 0.2 Original steps mapped to the baseline
+
+| Step | Baseline status | Notes / where it continues |
+|---|---|---|
+| S1.1–S1.5 | baseline | repository, compose, LangGraph contract suite, primitives, schema and scoped repositories |
+| S1.6 | partial | chain and write-ahead exist; `tether audit verify` missing; MAC omits `created_at` → W2.3, W2.4 |
+| S1.7 | partial | bootstrap apply, `apikey new`, dev issuer; no `fixture-b`, no `test.yaml` → W4.4 |
+| S1.8 | baseline (core) | JWT/API-key validation, route-bound audiences, `401`/`404` rules for existing routes; T-24 → W4.4 |
+| S1.9 | baseline | observability slice |
+| S2.1 | partial | queue, leases, backoff, TX12; **no heartbeat** → W6.1 |
+| S2.2 | partial | SDK subset (name, version, effect, idempotency, `max_attempts`, `Sensitive`); no `ToolSource`, risk, permissions, preconditions, timeout, `on_exhausted`, verify → W3.2 |
+| S2.3 | baseline | masking choke point |
+| S2.4 | partial | rules by tool + requester roles; no agent/permission/risk inputs → W3.1 |
+| S2.5 | partial | in-memory demo target → extended only as tests need (W9.3) |
+| S2.6 | partial | two tools, one scenario → extended as tests need (W9.3) |
+| S2.7 | partial | `ModelProvider.complete()` and scripted provider; no `capabilities()`, no provider selection → W3.3 |
+| S2.8, S2.9 | baseline | run driver, graph, TX1, execute_tool, requester GET |
+| S3.1 | baseline (different mechanism) | in-process chaos harness replaces `os._exit` fault points (owner-approved); T-12 v0 |
+| S3.2 | not started | hash-checked create-or-get, `REPLAY_DIVERGENCE` → **W2.2 (D-6.1)** |
+| S3.3 | partial | tool retries and classification; `fail_run` and PD-33 → W3.2 |
+| S3.4 | partial | TX12, indeterminate hold (ADR-0018); `LATE_RESULT` superseded by ADR-0019 evidence events; ADR-0011 post-dispatch case → W5.2 |
+| S4.1 | partial | gate, TX5 mapping, expiry timer; per-tool expiry → W4.2 |
+| S4.2 | partial | approve/reject only; list, detail, approver run view → **W4.1** |
+| S4.3 | not started | T-01 on the full reference workload → W9.3 |
+| S4.4 | partial | C-03–C-07 proven on harness test tools; on the real tools → W9.3 |
+| S5.1, S5.2 | baseline | cancellation, deadline, reconciliation, 50× races |
+| S6.1 | partial | `skipped` in history only; no repair/denial bound → **W2.3 (D-6.2)**, W3.4 (D-11) |
+| S6.2 | revised | provider retry required; fallback and cost **deferred** (D-5, D-7) → W3.3 |
+| S6.3 | revised | OpenAI only; Ollama **deferred** → W9.1 |
+| S7.1 | partial/revised | auditor/admin run view and access events required; cross-run audit query **deferred** (D-10) → W4.3 |
+| S7.2 | not started | T-24 → W4.4 |
+| S7.3 | partial | telemetry done; full T-16 sink scan → W10.2 |
+| S7.4 | not started | measured limits replace fixed targets → W10.3 |
+| S8.1 | revised | README/guarantees done in W1; demo script, `keys check-retirement` **deferred** (TDR-022) |
+| S9.1 | revised | second workload is **V1** (W9.2); multi-workspace UX **deferred** |
+| S9.2 | deferred/removed | approval UI, budgets deferred; sharing, inline override removed (D-7) |
+
+### 0.3 Revised V1 workstreams (dependency-ordered)
+
+Each step lists: affected requirements/decisions · dependencies · acceptance · evidence · documentation · decision gate. Step IDs are `W<workstream>.<n>`; PR titles use them. Chaos and race coverage from the baseline is preserved and extended in every step that touches the runtime.
+
+**W1 — Documentation inventory, traceability, ADR discrepancy resolution** *(documentation only)*
+- **W1.1 Reconciliation pass** · TDR-001–022, D-1–D-12 · — · scope delta, guarantee card, ADR-0019 draft, PRD revision, architecture amendments, operations and testing docs, CLAUDE.md, README · link and stale-claim check · docs only · gate: owner acceptance of the reconciled documents. **Active.**
+- **W1.2 ADR-0019 decision** · D-3, U-009 · W1.1 · **Done 2026-11-09 (OD-1):** accepted with the required semantics; ADR-0007 superseded; four defaults recorded in the ADR, revisable before W5.1 · ADR index and architecture markers updated · no gate.
+
+**W2 — Guarantee card and kernel conformance (D-6)**
+- **W2.1 Guarantee card acceptance and evidence map** · TDR-015, U-004 · W1.1 · owner accepts the G-* wording; `docs/testing/strategy.md` matrix complete · — · gate: owner (U-004).
+- **W2.2 Hash-checked create-or-get and `REPLAY_DIVERGENCE`** · D-6.1; ADR-0003 rule 4, ADR-0005 rule 6; invariant 3 · W2.1 · adoption in `govern_call`, `request_approval` and ledger-first `authorize_call` compare the stored call hash; mismatch → `REPLAY_DIVERGENCE` audit, run `failed` after in-flight entries drain · tests: divergence fails closed (negative), node-end replay suite, chaos extension · guarantee card G-1/G-8 limitations removed · no gate.
+- **W2.3 Audited `skipped` calls** · D-6.2; ADR-0012 rule 4, ADR-0005 rule 3 · W2.2 · fenced decision-class audit event per skipped ordinal; T-12 reconstruction shows them · tests: multi-call scenarios, reconstruction · G-13 limitation removed · no gate.
+- **W2.4 Versioned audit MAC with `created_at`** · D-6.3; ADR-0015 rule 1, AD-12 · W2.1 · `created_at` read in-transaction, stored and MACed; `mac_version` per event; v1 chains verify · tests: T-13 timestamp tamper case, mixed-version chain verifies · G-13 limitation removed · no gate.
+
+**W3 — Stable provider, policy and governance-aware tool contracts**
+- **W3.1 `PolicyEngine` interface and trusted inputs** · TDR-008, U-008 · W2.1 · interface with action/approval/reconciliation methods; inputs: requester, agent, workspace, tool, permissions, risk; built-in evaluator stays simple; user × agent intersection · tests: T-06 decision table extended · architecture §6 · gate: U-008 schema sign-off.
+- **W3.2 Tool contract completion** · TDR-009, U-008 · W3.1 · risk, permissions, preconditions (in the hash envelope), timeout, `on_exhausted`, `ToolSource` protocol; `verify` fields per ADR-0019 · tests: registry, T-04 `fail_run`, T-21 preconditions · architecture §7 · gate: U-008.
+- **W3.3 Provider selection, capabilities and bounded retry** · TDR-003, D-5 · W2.1 · provider chosen by configuration; `capabilities()`; retry with stop predicate per attempt; every attempt recorded; scripted provider loads only with explicit `dev`/`test` · tests: T-10 retry variant, T-32 part · architecture §8 · no gate.
+- **W3.4 Repair/denial bound** · D-11 · W3.3 · one small explicit bound (or ≤ 2 counters); run `failed` with the reason · tests: T-22 · no gate.
+
+**W4 — Approval operational API and authorization surface**
+- **W4.1 Approval list and detail; approver run view** · TDR-006, D-10 · W3.1 · `GET /v1/approvals/approvals`, `GET …/{id}`, `GET /v1/approvals/runs/{id}`; eligibility filtering; masked detail per PRD · tests: T-28 · architecture §14 · gate: U-010 for race/revalidation detail.
+- **W4.2 Per-tool approval expiry with default and maximum** · D-8, OD-7 · W3.2 · define the configuration semantics first (where the per-tool value lives, how the maximum is enforced, how overrides enter the policy version), then propose the default and maximum values · TX3 uses them; decision-time enforcement unchanged · tests: T-15 · gate: owner confirms the semantics and the values proposed by this step; no value is chosen before it.
+- **W4.3 Auditor/admin run view, `tether audit verify`, access events** · D-10 · W2.4 · `GET /v1/ops/runs/{id}`; CLI verify; async access-event writer · tests: T-12 complete, T-13 CLI · no gate.
+- **W4.4 Authorization matrix T-24 with `fixture-b`** · P-15, P-20 · W4.1, W4.3 · second fixture workspace; data-driven matrix; route inventory guard · tests: T-24 · `tests/authz/` populated, `test-authz` task · no gate.
+
+**W5 — Outcome verification and human reconciliation** *(ADR-0019 accepted 2026-11-09)*
+- **W5.1 Verification gate and outcome transactions** · ADR-0019 rules 7–12 · W3.2 · `verify_outcome` job, TX-V1, TX-V2, resolution values, evidence columns; human wins on conflict · tests: T-27 gate matrix, late probe, human-wins race, no-mutation contract against the demo target · architecture §12.2.1 markers removed; invariants 36–37 proven · no gate.
+- **W5.2 Remaining ledger edge cases** · ADR-0011 version-gone-after-dispatch; `on_exhausted` interplay · W5.1 · tests per ADR-0011 · no gate.
+
+**W6 — Heartbeat-safe long-running execution**
+- **W6.1 Lease heartbeats** · TDR-010; ADR-0004 rule 2, ADR-0005 rule 5 · W2.1 · heartbeat extends the lease conditional on the token; loss aborts the handler; configurable interval/base/maximum · tests: T-29, chaos extension (heartbeat loss = worker death) · architecture §11 marker removed; guarantee P-5 → G · no gate.
+
+**W7 — Production/dev separation and security hardening**
+- **W7.1 Explicit `TETHER_ENV` and dev/test binding** · D-12, TDR-020 · W3.3 · no default; startup fails when absent/invalid; dev shortcut, scripted provider and scenarios require explicit `dev`/`test` · tests: T-32 · `docs/operations/production-configuration.md` gaps closed · no gate.
+- **W7.2 Production build without demo components** · D-12 · W7.1 · image variant/build arg; scenario files and demo-only workloads excluded; production env example with placeholders · tests: build inspection · no gate.
+
+**W8 — PostgreSQL backup/failover documentation and validation**
+- **W8.1 Recovery objectives, recovery posture and restore drill** · TDR-021, U-007, OD-4 · W1.1 · owner sets RPO/RTO/topology within the OD-4 position (committed history never rolled back under normal HA; a data-loss restore is a recovery discontinuity; operator-controlled recovery posture before dispatch resumes; no reconstruction of unknowable external effects); decide whether a "recovery mode" that lists and holds dispatchable entries is built or the manual procedure stands; drill performed in a scratch instance and recorded · `docs/operations/postgres-recovery.md` gates closed · gate: U-007.
+
+**W9 — Real OpenAI provider, real external API, second workload**
+- **W9.1 OpenAI adapter** · TDR-004 · W3.3 · adapter behind `ModelProvider`; key via `SecretsProvider`; parallel calls disabled; contract suite on scripted + OpenAI · tests: T-11 (manual dispatch), adapter round-trips · architecture §8 · no gate.
+- **W9.2 Repository change-control workload against the GitHub sandbox** · U-001, U-002, TDR-012/013, OD-9 · W9.1, W4.1, (W5.1 for verification) · SDK-only workload; marker-based idempotency strategy validated; OD-9 rules applied: dedicated sandbox/test repository, least-privilege credentials, no personal or production repositories, deterministic fixtures where practical, documented cleanup/reset, credentials outside Git under production secret rules · tests: T-30 (credentialed), T-31, T-14 · PRD second-workload section finalised · gate: the concrete repository, token scope and cleanup procedure are proposed in this step and confirmed by the owner before credentials are issued.
+- **W9.3 Complete the incident workload proof** · P-27 · W3.2 · remaining tools/fixtures as tests need them; T-01 end to end; C-03–C-07 on the real write tools · tests: T-01, T-05–T-09, T-20, T-21, T-23 · no gate.
+
+**W10 — Automated reliability and performance suites**
+- **W10.1 Chaos extensions and flake gate** · TDR-019 · continuous · every runtime step adds harness cases; 20× repeat before release claims · no gate.
+- **W10.2 Full T-16 sink scan** · ADR-0017 · W4.3 · spans, logs, DB, every audience's API, model context, verification evidence · tests: T-16 · no gate.
+- **W10.3 Measured limits** · TDR-018, U-006 · W6.1, W9.1 · P-01–P-03 measured; published in the guarantee card §3 · `tests/perf/`, `test-perf` · gate: U-006 (owner approves published numbers).
+
+**W11 — LangGraph/Temporal/custom-glue comparison and thesis review**
+- **W11.1 Comparison protocol and execution** · TDR-016, U-011, OD-8 · W9.2 · Tether vs LangGraph + custom glue vs Temporal + custom glue; fairness rules fixed by OD-8: same logical workload, same consequential action, same external target where practical, same injected failure points; compare code/glue required, recovery semantics, ambiguous-write behaviour, approval binding, auditability and operator burden; not designed to make Tether win; conclusions may weaken the thesis · report under `docs/product/` · gate: U-011 (owner approves the concrete protocol before execution).
+
+### 0.4 Deferred and removed (not scheduled)
+
+Deferred: Ollama adapter; live provider failover (ADR-0016 design kept); dollar-cost estimates and pricing; approval UI; per-workspace budgets; multi-workspace UX; cross-run audit-query product; `keys check-retirement` and key-lifecycle automation; OIDC/JWKS; production service principals; Cedar/OPA; MCP; Kubernetes; webhooks; sandbox; eval platform; cloud demo; checkpoint encryption; RLS; WORM/anchor; retention implementation. Removed: cross-workspace tool sharing; inline human override.
+
+### 0.5 Validation tasks at the baseline
+
+Existing `poe` tasks: `lint`, `typecheck`, `contracts`, `test-unit`, `test-integration`, `test-contract`, `test-chaos`, `smoke` (and the mutating `format`). Planned: `test-authz` (W4.4), `test-perf` (W10.3), `test-live` (W9.1/W9.2). §9 below lists the original intent; where it disagrees with `pyproject.toml`, this section and `docs/testing/strategy.md` are authoritative and the discrepancy is surfaced, not hidden.
+
+---
 
 ## 2. Summary
 
@@ -20,13 +130,13 @@ This plan builds Tether V1 as a dependency-ordered sequence of 38 PR-sized steps
 
 | ID | PRD open question | Needed by step | Recommended default (confirm at step) | How earlier steps proceed without it |
 |----|-------------------|----------------|----------------------------------------|---------------------------------------|
-| PQ-1 | Hosted provider: Anthropic or OpenAI | S6.3 | Anthropic Messages API, small/fast model tier — **owner decision, confirm by D15 (before S6.3)** | Everything up to S6.2 uses the vendor-neutral `ModelProvider` protocol and the test-only scripted provider; no step before S6.3 imports a vendor SDK |
-| PQ-2 | Default primary vs fallback | S6.3 (config), S8.1 (demo) | Demo: hosted primary → Ollama fallback (reasoning reliability; fallback is free). CI: scripted-primary/scripted-secondary pair — **confirm at S6.3** | Config-only by ADR-0016; T-10 scripted variants need no real providers |
-| PQ-3 | Ollama model for multi-step tool calling | S6.3 / T-11 | Time-boxed (≤2 h) spike in week 3 (lane B) comparing tool-capable 7–14B instruct models (e.g. a Qwen-family instruct model and `llama3.1:8b`); pick the first that completes the `happy_path_config` flow 3/3 times — **confirm at S6.3** | Scripted provider for all deterministic tests; the Ollama container exists from S1.2, but its model is pulled only by the `live` compose profile |
-| PQ-4 | Model-pricing source | S6.2 | Static, version-controlled `config/pricing.yaml` (per provider/model price per 1M input/output tokens, with `as_of` date and a source note; Ollama = 0) — **confirm at S6.2** | `model_calls.cost_usd` is nullable until S6.2; T-12 checks cost presence only from S6.2 onwards |
-| PQ-5 | Data retention | None in the slice | No deletion or cleanup jobs; README states "demo/non-production only until retention is decided" (S8.1) | Not blocking |
-| PQ-6 | Optional real external integration | Post-slice | None | Not blocking |
-| PQ-7 | Inline human override semantics | S9.2 only | Do not build without a PRD revision of its design | Not blocking |
+| PQ-1 | Hosted provider: Anthropic or OpenAI | W9.1 | **Resolved 2026-11-09 (TDR-004): OpenAI**, user-supplied key via `SecretsProvider`. The earlier Anthropic default is superseded. | Everything before W9.1 uses the vendor-neutral `ModelProvider` protocol and the test-only scripted provider |
+| PQ-2 | Default primary vs fallback | — | **Deferred 2026-11-09 (D-5):** no fallback in V1; ADR-0016 remains the design | Not blocking |
+| PQ-3 | Ollama model for multi-step tool calling | — | **Deferred 2026-11-09 (D-5):** Ollama is post-V1 | Not blocking |
+| PQ-4 | Model-pricing source | — | **Deferred 2026-11-09 (D-7):** dollar-cost estimates post-V1; usage recorded per attempt | `model_calls.cost_usd` stays nullable |
+| PQ-5 | Data retention | None in the slice | No deletion or cleanup jobs; README states non-production only until retention is decided | Not blocking |
+| PQ-6 | Real external integration | W9.2 | **Resolved 2026-11-09 (U-001): GitHub API against a dedicated sandbox repository.** Credentials/test-data strategy `TBD (owner)` | W9.2 is gated on that strategy |
+| PQ-7 | Inline human override semantics | — | **Removed from V1 2026-11-09 (D-7)** | Not blocking |
 | PQ-8 | User/customer validation | Ongoing | Out of plan scope | Not blocking |
 
 ### 3.2 Architecture §25 planning questions (and ADR-delegated details), resolved
@@ -198,6 +308,8 @@ flowchart TB
 Thick borders mark the critical path. Dotted edges lead to tier-1 slip steps.
 
 ## 7. Detailed steps
+
+> **Historical (2026-10-06 sequence).** The steps below are retained for traceability; their baseline status and successors are in §0.2, and new work is scheduled only through the W-steps in §0.3. Do not start an S-step.
 
 Size key: **S** ≈ 0.5 day, **M** ≈ 1 day, **L** ≈ 2 days. Model tier: **strongest** for correctness-critical steps, **default** otherwise.
 
@@ -991,7 +1103,7 @@ Size key: **S** ≈ 0.5 day, **M** ≈ 1 day, **L** ≈ 2 days. Model tier: **st
 | 0016 Provider-neutral history and fallback | S2.7, S6.1, S6.2, S6.3 |
 | 0017 Sensitive-data masking choke point | S1.4, S1.9, S2.3, S2.6, S2.9, S7.1, S7.3 |
 
-All 17 ADRs map to at least one step.
+All 17 ADRs of the original plan map to at least one step. Added later: ADR-0018 (clarification, realised in the retry/dead-letter slice; §0.2 S3.4) and ADR-0019 (accepted 2026-11-09, supersedes ADR-0007; W1.2 done, W5.1).
 
 ### 8b. Invariant → establishing step → proving tests
 
@@ -1080,7 +1192,9 @@ All 35 invariants are mapped.
 
 ## 9. Validation commands
 
-All commands below are **to be created**: S1.1 creates the task skeletons and later steps fill them in. They run through `uv run poe <task>`, so they work cross-platform on the Windows host. Integration, chaos and perf suites need Docker and are expected to run on Linux (CI, or the compose test container).
+*2026-11-09:* the table below is the original intent. At the baseline, `lint`, `typecheck`, `contracts`, `test-unit`, `test-integration`, `test-contract`, `test-chaos` and `smoke` exist in `pyproject.toml`; `test-authz`, `test-perf`, `test-live`, `demo` and `ci` do **not** (see §0.5 and `docs/testing/strategy.md`). The `tether audit verify` command does not exist yet (W4.3).
+
+All commands below were **to be created**: S1.1 creates the task skeletons and later steps fill them in. They run through `uv run poe <task>`, so they work cross-platform on the Windows host. Integration, chaos and perf suites need Docker and are expected to run on Linux (CI, or the compose test container).
 
 | Command | Runs | Created in |
 |---------|------|-----------|
@@ -1215,15 +1329,18 @@ Delivery:
 - [ ] PD defaults that changed during implementation recorded (step ID + reason)
 - [ ] §15 items resolved or explicitly carried forward (doc fixes / ADR-0006 clarification note)
 
-## 14. Out of scope for this plan (post-V1, from the PRD)
+## 14. Out of scope for this plan (post-V1 or removed; revised 2026-11-09, see scope delta §3.3–3.4)
 
-- MCP tool sources; OIDC provider integration and mid-run revocation; Cedar/OPA; Kubernetes/Helm; webhooks/notifications; post-execution confirmation checkpoints; public cloud demo
-- Service principals and machine-triggered runs; platform-admin HTTP API; runtime platform-admin role
-- Untrusted tool code sandboxing; evaluation platform; prompt management/versioning; RAG/vector DB/agent memory as platform features
-- Prompt-injection detection; compliance claims; WORM / external audit anchor; global cross-run chain; whole-run deletion and tail-truncation detection
+- MCP tool sources; OIDC provider integration and mid-run revocation; Cedar/OPA adapters; Kubernetes/Helm; webhooks/notifications; a human post-execution confirmation step (automatic verification is V1 per ADR-0019); public cloud demo
+- **Production** service principals and machine-triggered production runs (controlled dev/test automation identities are V1, D-4); platform-admin HTTP API; runtime platform-admin role
+- Untrusted tool code sandboxing; evaluation platform; prompt management/versioning; RAG/vector DB/agent memory as platform features; multi-agent framework; agent marketplace; general chat application; full authorization-policy language
+- Prompt-injection detection; compliance claims; WORM / external audit anchor; global cross-run chain; whole-run deletion and tail-truncation detection; general cross-run audit-query product (D-10)
 - Checkpoint encryption at rest; Postgres row-level security (recorded hardening seam)
-- Contract Intelligence second workload; optional real external integration; data-retention implementation; platform-stage SLA/HA
-- Inline human override (unless a PRD revision defines it); exactly-once for non-participating APIs
+- Ollama adapter and automatic live provider failover (D-5); dollar-cost estimates and pricing tables (D-7); approval UI; per-workspace cost budgets; multi-workspace UX and multiple real workspaces; key-lifecycle automation (`keys check-retirement`); data-retention implementation; platform-stage SLA/HA
+- **Removed from V1:** cross-workspace tool sharing; inline human override (D-7)
+- Exactly-once for non-participating APIs
+
+*No longer out of scope (now V1):* a real external API (GitHub sandbox, U-001); a second workload (repository change control, U-002); lease heartbeats; approval list/detail; a real hosted provider (OpenAI).
 
 ## 15. Contradictions found
 

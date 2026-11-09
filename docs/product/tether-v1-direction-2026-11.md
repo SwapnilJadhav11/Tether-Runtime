@@ -3,6 +3,7 @@
 > **Status:** Accepted product direction; documentation reconciliation required  
 > **Decision date:** 2026-11-09  
 > **Repository snapshot reviewed:** `SwapnilJadhav11/Tether-Runtime`, branch `main`, commit `c611d9aa702d59610e9b053b9385309982482f04`  
+> **Implementation baseline for the reconciliation (refreshed 2026-11-09):** hardening commit `ec352540a8fd9f70309b12af53f013b87c2258e4` (branch `hardening/v1-baseline`, CI green). It adds the chaos and race suite (`tests/chaos/`, 18 tests: C-01–C-07, 50× races, competing workers, a real-process kill), a TX7 lock-order fix with its regression test, and CI jobs for the integration, LangGraph-contract and chaos suites. Statements in this record about placeholder chaos tests predate that commit; §8.5 is corrected below. The owner's decisions on the open items of §6 are recorded in [`tether-v1-scope-delta.md`](tether-v1-scope-delta.md).  
 > **Applies to:** Tether V1 product definition, architecture, planning, implementation claims, and validation  
 > **Intended audience:** Maintainers, architects, reviewers, and coding agents working in this repository  
 > **Primary follow-up:** Reconcile the PRD, ADRs, architecture, README, `CLAUDE.md`, implementation plan, and test/operations documentation against this record
@@ -449,7 +450,7 @@ Claude's audit motivated this direction and reportedly found the following. The 
 | Scale | One job per worker, polling, no heartbeat, and a single PostgreSQL dependency were raised as limits. | Measure and publish limits; add heartbeat and database operations work without claiming hyperscale. |
 | Security hygiene | A development environment toggle may enable a dev identity shortcut, and demo/test artifacts may ship in production builds. | Inspect defaults and build contents; document and plan fail-closed separation. |
 | Key lifecycle | Key IDs exist but rotation/retirement operations may be incomplete. | State the post-V1 limitation accurately. |
-| Proof | Important reliability experiments may be manual rather than automated. | Convert accepted guarantees into repeatable tests and CI evidence. |
+| Proof | Important reliability experiments may be manual rather than automated. | Convert accepted guarantees into repeatable tests and CI evidence. *Baseline `ec35254`: the crash, race and lock-order cases are automated and run in CI; authorization-matrix, performance and live-provider suites are still missing.* |
 | Real-world proof | The current demo may depend on controlled/in-memory systems rather than a real provider and external API. | Add TDR-004 and TDR-013 proof without removing deterministic chaos coverage. |
 
 ## 8. Repository-specific reconciliation map
@@ -515,7 +516,7 @@ These are evidence-backed gap statements, not authorization to patch the impleme
 - **Create `docs/product/tether-v1-guarantees.md`:** bounded guarantee statements with code/test evidence and limitations.
 - **Create a scope/traceability artifact:** either in the revised PRD or `docs/product/tether-v1-scope-delta.md`; do not create two competing sources.
 - **Create `docs/operations/postgres-recovery.md`:** backup, restore, outage, recovery verification, recommended HA posture, RPO/RTO decision gates, and effects on jobs/leases/ledger/audit.
-- **Update test strategy/CI documentation:** `tests/chaos`, `tests/authz`, and `tests/perf` are currently placeholders, while integration coverage exists. The plan must distinguish implemented tests from intended suites.
+- **Update test strategy/CI documentation:** at the hardening baseline (`ec35254`) `tests/chaos` holds the C-01–C-07 crash suite, the 50× race suite and one real-process kill test, all run in CI; `tests/authz` and `tests/perf` are still empty. The plan must distinguish implemented tests from intended suites, and the chaos suite must be preserved and extended, not replaced.
 
 ## 9. Documentation implications
 

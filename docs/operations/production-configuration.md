@@ -1,0 +1,59 @@
+# Production configuration and dev/test separation
+
+> **Status:** required V1 documentation (direction record TDR-020; owner decision D-12)
+> **Baseline:** commit `ec35254`. Several controls described here are **required, not yet implemented**; §4 lists the gap for each.
+
+## 1. Principle
+
+Production operation must fail closed. A production process never silently selects an environment, never accepts a caller-stated identity, never loads a test provider or scenario file, and never ships demo components. Anything dev- or test-only is available only when the operator has explicitly asked for a `dev` or `test` environment.
+
+## 2. Required production configuration
+
+| Setting | Required value in production | Purpose |
+|---|---|---|
+| `TETHER_ENV` | `prod`, **explicit** | Selects the production startup path. **D-12:** absent or invalid → `tether-api` and `tether-worker` must refuse to start. |
+| `TETHER_DATABASE_URL` | `postgresql://tether_app:…@…/tether` | Least-privilege application role (no DDL, no DELETE, append-only audit) |
+| `TETHER_MIGRATOR_DATABASE_URL` | `tether_migrator` role, used only by `tether migrate` and `tether bootstrap apply` | Separates schema and configuration writes from runtime |
+| `TETHER_BOOTSTRAP_FILE` | path to the reviewed, version-controlled bootstrap YAML | Workspaces, issuers (public keys only), API-key hashes, agents, policy (ADR-0014) |
+| `TETHER_AUDIT_ACTIVE_KEY_ID`, `TETHER_AUDIT_KEY_<ID>` | 32-byte random secrets, independent per key ID | Audit HMAC chain (ADR-0015) |
+| `TETHER_BINDING_ACTIVE_KEY_ID`, `TETHER_BINDING_KEY_<ID>` | independent from the audit family | Call-binding HMAC (ADR-0010) |
+| Provider credentials (OpenAI key) | via the secrets mechanism of the host, never in bootstrap files or images | TDR-004 |
+| `TETHER_RUN_MAX_DURATION_SECONDS` | deliberate value (development default 3600) | Run deadline (D-8) |
+| `TETHER_APPROVAL_TTL_SECONDS` | deliberate value within the maximum (per-tool expiry planned, D-8) | Approval expiry |
+| `TETHER_OTEL_ENDPOINT` | collector URL, or unset | Telemetry is best-effort |
+| `TETHER_LOG_LEVEL` | `INFO` or `WARNING` | Logs are JSON with scrubbing |
+
+Settings that must **not** be set or must have no effect in production: `TETHER_SCENARIOS_DIR` (scripted provider scenarios), any dev identity body or query parameter.
+
+## 3. Controls that separate development and test from production
+
+| Control | Design | At baseline `ec35254` |
+|---|---|---|
+| Explicit environment | `TETHER_ENV` must be present and one of `dev`, `test`, `prod` | `Settings.env` defaults to `dev` when unset (`src/tether/settings.py:26`). **Gap (D-12).** |
+| Dev identity shortcut | Only with `TETHER_ENV ∈ {dev, test}` and no `Authorization` header; produces the same `Principal` and passes the same authorization as a real token; `401` in `prod` | Implemented and isolated in `src/tether/api/dev_identity.py`; depends on the environment default above |
+| Scripted model provider | Loads only with an explicit `dev`/`test`; the production provider is selected by configuration | Refuses only `prod`; it is the driver's **default** provider (`src/tether/runtime/driver.py:88`); no provider setting exists. **Gap (D-12, TDR-004).** |
+| Scenario files | Dev/test only | Copied into the runtime image (`Dockerfile`: `COPY workloads/incident_remediation/scenarios /app/scenarios`). **Gap (D-12).** |
+| Demo components | `demo-target-service` is a separate container and must not be in the production stack; the reference workload is a demo client | Workload wheel is installed in the runtime image by design (entry point); demo target is a separate image. Production build must exclude demo-only workloads. **Gap (D-12).** |
+| Issuer private keys | Never deployed with Tether; dev minting tool outside the image | Correct: `tools/dev_issuer/.keys/` is git-ignored; `config/bootstrap/dev.yaml` holds public keys and API-key hashes only; bootstrap rejects private key material |
+| Secrets in bootstrap | None; salted hashes only | Correct |
+| Admin surface | No admin HTTP API; configuration changes are apply + restart | Correct (ADR-0014) |
+| Policy version | Processes refuse to start or decide under a stale policy version | Correct (ADR-0009) |
+
+## 4. Required changes before a production claim (D-12)
+
+1. Make `TETHER_ENV` mandatory: no default; invalid or missing → startup error naming the variable.
+2. Select the model provider by configuration; the scripted provider is constructible only when `TETHER_ENV` is `dev` or `test`, and the production configuration must name a real provider (OpenAI first).
+3. Build a production image variant (or build argument) that contains no scenario files and no demo-only workload; keep the dev image for Compose.
+4. Add `T-32`: unit tests for the startup refusal and the environment binding of the dev shortcut and scripted provider; a build inspection that the production image lacks scenario files.
+5. Document the Compose stack as **development only** (`TETHER_ENV=dev` is set explicitly in `deploy/compose/docker-compose.yml`), and provide a production example environment file with placeholders only.
+
+## 5. Production startup checklist
+
+- [ ] `TETHER_ENV=prod` set explicitly
+- [ ] Database roles created by the init script; `tether migrate` and `tether bootstrap apply` run by the migrator role before `api`/`worker`
+- [ ] Bootstrap file reviewed: public keys only, API-key hashes only, one policy per workspace
+- [ ] Audit and binding keys present for every key ID referenced by non-terminal runs
+- [ ] Provider credential present through the host's secret mechanism
+- [ ] No `TETHER_SCENARIOS_DIR`, no demo target in the stack
+- [ ] `/readyz` ready; worker heartbeat fresh
+- [ ] Backup and restore procedure in place (`postgres-recovery.md`)
