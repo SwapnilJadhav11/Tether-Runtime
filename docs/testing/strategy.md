@@ -1,6 +1,6 @@
-# Test strategy and guarantee-to-test matrix
+# Test strategy and guarantee evidence map
 
-> **Status:** V1 documentation (direction record TDR-019); suites marked **planned** do not exist yet
+> **Status:** V1 documentation (direction record TDR-019); suites marked **planned** do not exist yet. §4 is the W2.1 evidence map, built by reading each cited test's assertions against commit `ec35254`; the guarantee wording it maps was accepted by the owner on 2026-11-12 (U-004 closed).
 > **Baseline:** commit `ec35254` (CI green)
 
 ## 1. Suites: implemented vs intended
@@ -9,68 +9,100 @@
 |---|---|---|---|---|
 | Lint, format check | — | `lint` | `static` (Ubuntu + Windows) | implemented |
 | Strict typing | — | `typecheck` | `static` | implemented |
-| Architecture and import contracts (T-14, package layout, no `now()` in SQL) | `tests/architecture/` | `contracts` | `static` | implemented |
+| Architecture and import contracts (T-14, package layout, no `now()` in SQL) | `tests/architecture/` (3 files) | `contracts` | `static` | implemented |
 | Unit | `tests/unit/` (20 files) | `test-unit` | `static` | implemented |
-| Integration (DB-backed) | `tests/integration/` (17 files) | `test-integration` | `integration` | implemented |
-| LangGraph semantics contract (exact pins) | `tests/contract/langgraph/` | `test-contract` | `integration` | implemented |
-| Chaos and races | `tests/chaos/` (3 files, 18 tests) | `test-chaos` | `chaos` | implemented (hardening baseline) |
-| Compose smoke | `tests/integration/test_compose_smoke.py`; `scripts/smoke_submit.py` | `smoke` | manual | implemented |
-| Authorization matrix (T-24, route inventory) | `tests/authz/` | `test-authz` | — | **planned** (directory empty) |
-| Performance and load (P-01–P-03) | `tests/perf/` | `test-perf` | — | **planned** (directory empty) |
-| Provider contract, live (T-11 on OpenAI) | `tests/contract/providers/` | `test-live` | manual dispatch | **planned** |
-| GitHub sandbox integration (T-30) | `tests/integration/github/` or marker `credentialed` | `test-live` | manual dispatch | **planned** |
-| Production-build inspection (T-32) | `tests/unit/`, build step | `test-unit` / CI | — | **planned** |
+| Integration (DB-backed), including the compose/migration smoke test `test_compose_smoke.py` | `tests/integration/` (16 files) | `test-integration` | `integration` | implemented |
+| LangGraph semantics contract (exact pins) | `tests/contract/langgraph/` (4 files) | `test-contract` | `integration` | implemented |
+| Chaos and races | `tests/chaos/` (3 files, 18 test functions, parametrised and repeated) | `test-chaos` | `chaos` | implemented (hardening baseline) |
+| Compose stack build and health (manual demo path) | `deploy/compose/docker-compose.yml`; `scripts/smoke_submit.py` | `smoke` | manual | implemented |
+| Static checks bundle | — | `ci` (= `lint`, `typecheck`, `contracts`, `test-unit`) | mirrors `static` | implemented |
+| Authorization matrix (T-24, route inventory) | `tests/authz/` | `test-authz` | — | **planned** (directory empty; W4.4) |
+| Performance and load (P-01–P-03) | `tests/perf/` | `test-perf` | — | **planned** (directory empty; W10.3) |
+| Provider contract, live (T-11 on OpenAI) | `tests/contract/providers/` | `test-live` | manual dispatch | **planned** (W9.1) |
+| GitHub sandbox integration (T-30) | `tests/integration/github/` or marker `credentialed` | `test-live` | manual dispatch | **planned** (W9.2) |
+| Production-build inspection (T-32) | `tests/unit/`, build step | `test-unit` / CI | — | **planned** (W7.1, W7.2) |
 
-Only the tasks in the first column of "implemented" rows exist in `pyproject.toml`. The plan previously named `test-authz`, `test-perf`, `test-live`, `demo` and `ci`; they are intended, not present.
+Only the tasks in "implemented" rows exist in `pyproject.toml`. The plan previously also named `test-authz`, `test-perf`, `test-live` and `demo`; they are intended, not present. Markers registered: `live`, `chaos`, `perf`.
+
+CI (`.github/workflows/ci.yml`) runs on every push and pull request: `static` on Ubuntu and Windows (`lint`, `typecheck`, `contracts`, `test-unit`); `integration` on Ubuntu (`test-integration`, then `test-contract`) and `chaos` on Ubuntu (`test-chaos`), both against `deploy/compose/docker-compose.test.yml` with throwaway credentials generated in the runner.
 
 ## 2. How the database-backed suites run
 
 - A throwaway Postgres is started from `deploy/compose/docker-compose.test.yml` (tmpfs). Credentials come from `deploy/compose/.env`, generated per CI job; locally, create the file with the three passwords it names.
-- Each test gets its own database cloned from a migrated template (`CREATE DATABASE … TEMPLATE`), so tests are isolated and parallelisable.
+- Each test gets its own database cloned from a migrated template (`CREATE DATABASE … TEMPLATE`), so tests are isolated and parallelisable. The shared `seeded` fixture (`tests/integration/conftest.py`) creates **two workspaces** (`ws-a`, `ws-b`), each with an agent and a queued run, so cross-workspace cases run against real rows.
+- Per-session random audit and binding keys are set in `tests/conftest.py`; spans and metrics go to in-memory exporters through the global OpenTelemetry API, as in production.
 - Time comparisons use the database clock; tests wait on database state, never on sleeps.
 
 ## 3. The chaos harness (preserve and extend)
 
 `tests/chaos/harness.py` is the owner-approved replacement for the plan's `os._exit` fault points:
 
-- `Crash` is a `BaseException` raised at named points; "crash right after a critical transaction commits" is implemented by observing that transaction's audit event.
-- Fresh `WorkerRuntime` instances act as restarted or competing workers; lease expiry is forced; test tools can be gated (block until released) and counted.
-- `assert_reconstructable` is the T-12 v0 check (every ledger entry has its decision and authorization events, every dispatch has an outcome or `indeterminate`, `seq` contiguous, chain verifies, status matches the last status event); `assert_terminal_stable` checks terminal immutability.
+- `Crash` is a `BaseException` raised at named points; "crash right after a critical transaction commits" is implemented by observing that transaction's audit event (`crash_after_commit`).
+- Fresh `WorkerRuntime` instances act as restarted or competing workers; lease expiry is forced; test tools can be gated (block until released) and counted (`Target`: sends, keys, effects).
+- `assert_reconstructable` is the T-12 v0 check (chain valid, `seq` contiguous, every ledger entry has its decision and authorization events, dispatch and re-dispatch counts equal `attempts`, every settled entry has an outcome event, every reconciled entry its `RECONCILED`, terminal status equals the last status event, no `pending`/`dispatched` entry on a terminal run); `assert_terminal_stable` injects wake and deadline jobs, a cancel request and a direct status `UPDATE` as the app role, and checks nothing changed.
 - One real-process test starts `api`, `worker` and the demo target as subprocesses, hard-kills and restarts them.
 
-Coverage at baseline: C-01–C-07; TX4-vs-TX9 and stop-vs-TX5 races repeated 50×; three workers racing for one run 50×; four workers draining fifty runs; approve-vs-expiry 30×; lost-lock fencing; TX12 for both job kinds; indeterminate → reconciliation. New guarantees must add cases here rather than replace the harness.
+Coverage at baseline: C-01–C-07; a crash after each of the twelve critical commits; a crash during each of three model turns; idempotent write in flight before and after the target applied (five repeats each); non-idempotent write in flight; TX4-vs-TX9 and stop-vs-TX5 races repeated 50×; three workers racing for one run 50×; four workers draining fifty runs; stops with a write in flight (cancel/deadline × answered/dropped, ten repeats each); overlapping same-key sends (ten repeats); lease expiry on a non-idempotent write (five repeats); approve-vs-expiry 30×; lost-lock fencing (ten repeats); TX12 for both job kinds; indeterminate → reconciliation. New guarantees must add cases here rather than replace the harness.
 
-## 4. Guarantee-to-test matrix
+## 4. Evidence map (W2.1)
 
-`G-*` are proven guarantees and `P-*` planned ones from `docs/product/tether-v1-guarantees.md`; `T-*`, `C-*`, `P-0*` are PRD test IDs.
+`G-*` are the guarantee card's §1 entries and `P-*` its §2 planned items (`docs/product/tether-v1-guarantees.md`); `T-*`, `C-*`, `P-0*` are PRD test IDs. **Verdict** is the W2.1 classification under the accepted wording; P-16 and P-17 are *implemented but not yet proven* evidence gaps, not future capabilities. *Automated tests* lists the files and the decisive functions; the card entry lists every function with what it asserts. *Chaos/race* names `tests/chaos/` cases. *CI* names the workflow jobs that run the evidence on every push.
 
-| Guarantee | PRD tests | Existing tests | Missing tests |
-|---|---|---|---|
-| G-1 authorization and dispatch before any side effect | T-02, T-19, C-04, C-05 | `test_run_graph.py`, `test_slice_run_lifecycle.py`, `test_chaos_crashes.py` | T-19 policy-tightened variant on the real workload |
-| G-2 non-idempotent sent at most once | T-17, C-07 | `test_chaos_races.py::test_c07_f7b_*`, `test_chaos_crashes.py::test_c07_*`, `test_retries_dead_letter.py` | — |
-| G-3 same-key bounded stop-gated re-sends | T-03, T-20, C-05–C-07 | `test_retries_dead_letter.py`, `test_tool_retry_budget.py`, `test_chaos_races.py::test_c07_overlapping_*` | T-20 on `restart_service` end to end |
-| G-4 unknown never failure; human resolves | T-17, T-25 | `test_reconciliation.py`, `test_reconciliation_eligibility.py` | T-27 (ADR-0019 accepted; W5.1) |
-| G-5 no action after stop | T-25, T-26 | `test_cancellation_deadlines.py`, `test_chaos_races.py` (50× races) | — |
-| G-6 no recall; unknown never hidden | T-26 | `test_chaos_races.py::test_a_stop_while_a_write_is_in_flight_*` | — |
-| G-7 terminal immutability | T-26 | `test_schema.py`, `harness.assert_terminal_stable` | — |
-| G-8 single fenced driver | C-01–C-03 | `test_chaos_races.py::test_three_workers_*`, `::test_a_driver_that_lost_its_lock_*` | — |
-| G-9 crash safety | C-01–C-07 | `test_chaos_crashes.py`, `test_chaos_processes.py`, `tests/contract/langgraph/` | 20× flake gate in CI (plan) |
-| G-10 exhaustion yields a domain outcome | C-07 | `test_retries_dead_letter.py`, `test_chaos_crashes.py::test_tx12_*` | — |
-| G-11 `401` before state; `404` out of scope | T-18, T-19 | `test_authentication.py`, `test_permissions.py`, `test_identity.py`, `test_scope.py` | T-24 matrix with `fixture-b` (P-10) |
-| G-12 exact-call approval, current policy | T-05, T-07, T-08, T-15, T-19 | `test_hashing.py`, `test_canonical.py`, `test_run_graph.py`, `test_permissions.py`, `test_chaos_races.py::test_approve_vs_expiry_*` | T-28 list/detail (P-10); per-tool expiry (P-8) |
-| G-13 write-ahead per-run chain | T-12, T-13 | `test_audit_chain.py`, `test_schema.py`, `harness.assert_reconstructable` | timestamp tamper case (P-3); skip events (P-2); verify CLI (P-9) |
-| G-14 masking | T-16 | `test_masking.py`, `test_secrets.py`, `test_observability.py` | full sink scan across all audiences |
-| G-15 active policy version | T-19 | `test_run_graph.py::test_no_decision_is_made_under_a_stale_policy_version`, `test_bootstrap_apply.py` | API `503` case |
-| G-16 workspace scoping | T-24 | `test_scope.py`, `test_uow.py`, `test_schema.py` | second fixture workspace |
-| P-1 replay divergence | — | — (adoption test seeds `call_hash: None`) | divergence fails closed; hash-checked adoption |
-| P-4 verification | T-27 | — | gate matrix, evidence masking, late probe, human wins, no-mutation contract |
-| P-5 heartbeats | T-29, C-07 | — | long call with heartbeat; heartbeat loss |
-| P-7 repair/denial bound | T-22 | — | malformed/unknown/denied loop stops at the bound |
-| P-11 provider portability | T-10, T-11 | `test_scripted_provider.py` | adapter round-trips; OpenAI contract run |
-| P-12 GitHub sandbox | T-30 | — | credentialed suite |
-| P-13 second workload | T-31, T-14 | `test_T14_domain_independence.py` | end-to-end run of the change-control workload |
-| P-14 production fails closed | T-32 | — | startup refusal; image inspection |
-| P-15 measured limits | P-01–P-03 | — | benchmark and load suites |
+| Guarantee (verdict) | Invariant / behaviour | Implementation | Automated tests | Chaos / race coverage | CI | Remaining evidence gap |
+|---|---|---|---|---|---|---|
+| G-1 authorization and dispatch before any side effect (PROVEN WITH ASSUMPTIONS) | inv. 1, 2, 22; T-02, C-04, C-05: TX5 then TX6 committed before any send; payload hash checked at TX6 | `graph.py::_authorize`; `execute_tool.py::_prepare` | `test_run_graph.py` (allowed call → ledger + job before any send; denied/invalid never reach the ledger; tampered payload never dispatched); `test_lock_order.py` | `test_chaos_crashes.py::test_c01_c04_*` (DISPATCHED commit points); `test_chaos_races.py::test_s5_1_cancel_vs_authorization_*` | `integration`, `chaos` | TX5 negative re-checks and stale policy at TX5 (P-16); replay hash compare (P-1) |
+| G-2 non-idempotent sent at most once (PROVEN) | inv. 4; T-17, C-07: `dispatched` non-idempotent never re-sent; unknown → `indeterminate` | `execute_tool.py::_prepare`, `_send`, `dead_letter`; `sdk/tools.py` | `test_retries_dead_letter.py::test_t17_*`; `test_reconciliation.py::test_t17_a_redelivered_*`; `test_cancellation_deadlines.py::test_t26_a_cancel_before_dispatch_*`; `test_registry.py::test_write_tools_must_declare_*` | `test_chaos_races.py::test_c07_f7b_*` (late result cannot overwrite); `test_chaos_crashes.py::test_c07_*` | `integration`, `chaos` | — |
+| G-3 same-key bounded stop-gated re-sends (PROVEN WITH ASSUMPTIONS) | inv. 6, 35; T-03, T-20, C-05–C-07: one key per logical execution; budget spans retries and redeliveries; TX6r gate | `core/hashing.py::idempotency_key`; `graph.py::_authorize`; `execute_tool.py::_prepare`/`_send`; `queue/backoff.py` | `test_hashing.py`; `test_tool_retry_budget.py`; `test_retries_dead_letter.py` (t03, t20 ×2, same-key write, backoff delay, stop before retry); `test_cancellation_deadlines.py::test_t26_an_idempotent_write_is_not_re_sent_after_a_cancel` | `test_chaos_crashes.py::test_c05_c06_*`, `::test_a_send_budget_spent_*`; `test_chaos_races.py::test_c07_overlapping_*` | `static`, `integration`, `chaos` | — (target-side deduplication is an assumption, not Tether's proof) |
+| G-4 unknown never failure; human resolves (PROVEN WITH ASSUMPTIONS) | inv. 5; T-17, T-25; ADR-0007 baseline, ADR-0018 hold | `execute_tool.py::_unknown_state`; `ops.py::reconcile_entry` (TX8); `policy/engine.py::evaluate_reconciliation_eligibility`; `graph.py::await_tool` | `test_reconciliation.py` (all cases); `test_reconciliation_eligibility.py`; `test_authentication.py::test_t25_*`; `test_run_graph.py::test_a_tool_that_did_not_apply_*` | `test_chaos_crashes.py::test_a_send_budget_spent_*`, `::test_c07_*`; `test_chaos_races.py::test_a_stop_while_a_write_is_in_flight_*` (drop) | `static`, `integration`, `chaos` | T-27 once ADR-0019 is implemented (P-4); version-gone-after-dispatch (W5.2) |
+| G-5 no action after a stop (PROVEN) | inv. 9, 16, 28, 29, 35; T-25, T-26: stop predicate at G0, after the response, in TX2/TX3/TX5/TX6/TX6r | `graph.py` (`call_model`, `govern_call`, `request_approval`, `_authorize`, `stopped`); `execute_tool.py::_prepare`; `stop_requests.py`; `timers.py`; `repos/runs.py::_with_stop` | `test_cancellation_deadlines.py` (cancel before start; stop during a model call; final answer after a stop; stop while awaiting approval; cancel before dispatch; unknown write after a stop; requester-only cancel; deadline once) | `test_chaos_races.py::test_s5_1_approve_vs_cancel_*`, `::test_s5_1_cancel_vs_authorization_*`, `::test_a_stop_while_a_write_is_in_flight_*` | `integration`, `chaos` | — |
+| G-6 no recall; unknown never hidden (PROVEN WITH ASSUMPTIONS) | inv. 9, 22; T-26: dispatched write awaited; stopped run with unknown outcome → `awaiting_reconciliation`; summary names reconciled outcomes | `graph.py::await_tool`, `finalize`; `advance_run.py::start`, `_dead_letter_run` | `test_cancellation_deadlines.py::test_t26_a_dispatched_write_is_not_recalled_*`, `::test_t26_an_unknown_write_after_a_stop_*`; `test_retries_dead_letter.py::test_tx12_advance_run_with_a_write_in_flight_*`, `::test_tx12_with_an_indeterminate_entry_*` | `test_chaos_races.py::test_a_stop_while_a_write_is_in_flight_*`; `harness.assert_reconstructable` (terminal ⇒ no open entry) | `integration`, `chaos` | agent removed from bootstrap mid-run → `driver._fail` (no test; owner question) |
+| G-7 terminal immutability (PROVEN) | inv. 8; T-26: DB trigger `runs_status_terminal_guard`; app role cannot delete or disable it | `rev_0002_core_schema.py`; `repos/runs.py` conditional transitions | `test_schema.py::test_terminal_status_never_changes` et al.; `test_permissions.py::test_app_role_cannot_disable_the_terminal_status_guard`, `::test_app_role_cannot_delete_records`; `test_slice_run_lifecycle.py::test_a_terminal_run_is_not_restarted_*` | `harness.assert_terminal_stable` after every scenario | `integration`, `chaos` | — |
+| G-8 single fenced driver (PROVEN) | inv. 10, 30; C-01–C-03: advisory lock + `driver_generation`; contended → requeue with refund | `advance_run.py::run_lock`, `start`, `handle`; `repos/runs.py::guard`, `transition`; `graph.py` write nodes | `test_slice_run_lifecycle.py` (two workers lease once; contended requeue; stale token; expired lease reclaimed); `test_retries_dead_letter.py::test_advance_run_delivery_stops_*` (fresh token) | `test_chaos_races.py::test_three_workers_*`, `::test_c07_four_workers_*`, `::test_a_driver_that_lost_its_lock_*` | `integration`, `chaos` | ADR-0005 rule 6 checkpoint-fork window (P-1) |
+| G-9 crash safety (PROVEN WITH ASSUMPTIONS; reworded 2026-11-12) | C-01–C-07; ADR-0003 node discipline, `durability="sync"`, create-or-get events, lease redelivery | `graph.py`; `driver.py` (start/resume/recover); `repos/audit.py::append`; `queue/postgres.py` | `tests/contract/langgraph/*` (sync durability, crash resume, interrupt/resume); `test_schema.py::test_unique_constraints`; `test_run_graph.py::test_a_redelivered_dispatched_idempotent_call_*` | `test_chaos_crashes.py::test_c01_c04_*` (12 commit points), `::test_c02_*`, `::test_c05_c06_*`; `test_chaos_processes.py::test_c01_c03_*` (real hard kills) | `integration`, `chaos` | 20× flake gate not in CI; "any instruction" not provable (wording) |
+| G-10 exhaustion yields a domain outcome (PROVEN) | inv. 25, 33; C-07, ADR-0004 TX12: `dead` + kind-specific transition + wake in one transaction; stale lease rolls back | `queue/postgres.py::lease_one`; `worker/main.py::_dispatch`; `execute_tool.py::dead_letter`; `advance_run.py::dead_letter`; `timers.py::dead_letter`; `JobsRepository.mark_dead` | `test_retries_dead_letter.py` (advance_run TX12; execute_tool TX12 ×5 cases; hold until resolved; indeterminate hold; idempotent on redelivery ×2); `test_cancellation_deadlines.py::test_an_exhausted_timer_job_*` | `test_chaos_crashes.py::test_tx12_advance_run_*`, `::test_tx12_execute_tool_*` | `integration`, `chaos` | — |
+| G-11 `401` before state; `404` out of scope (PROVEN) | inv. 12, 13; T-18, T-19, T-24 core: route-bound audience; key → workspace and agents; no `403` in the code | `identity/jwt.py`; `identity/api_keys.py`; `authz/deps.py`; `api/dev_identity.py`; routers | `test_authentication.py` (invalid tokens ×7 and API keys ×6 write nothing; agent binding; body identity ignored; requester-only read/cancel; approver/reconciler/admin refusals; prod refuses the shortcut; credentials never logged); `test_identity.py` (18 invalid-token cases); `test_run_graph.py::test_ineligible_approvers_*`; `test_reconciliation.py::test_t25_ineligible_callers_*`; `test_slice_run_lifecycle.py::test_get_is_workspace_scoped` | — | `static`, `integration` | T-24 full matrix with the planned routes (P-10) |
+| G-12 exact-call approval, eligible decision (PROVEN; reworded 2026-11-12; TX5 re-check → P-16) | inv. 15, 26; T-05, T-07, T-08, T-15, T-19: keyed RFC 8785 hash; approval carries the decided hash; eligibility; decide once while live | `core/hashing.py`; `graph.py::govern_call`, `request_approval`, `_authorize`; `api/routers/approvals.py`; `repos/approvals.py::decide`; `policy/engine.py::evaluate_approval_eligibility`; `execute_tool.py::_prepare` | `test_hashing.py` (t08 any bound change; call ID/rationale excluded; KATs); `test_canonical.py`; `test_run_graph.py` (bound request; eligible approve executes; ineligible 404; reject never executes; decided once and only before expiry; tampered payload); `test_cancellation_deadlines.py::test_t15_*`; `test_authentication.py::test_t19_*` | `test_chaos_races.py::test_approve_vs_expiry_*`, `::test_s5_1_approve_vs_cancel_*` | `static`, `integration`, `chaos` | **No test for the TX5 branches** "call changed since its decision", "policy now: deny", "no matching approval", "approval lapsed" (P-16); per-tool expiry (P-8); T-28 (P-10) |
+| G-13 write-ahead per-run chain (PROVEN; reworded 2026-11-12) | inv. 7, 17, 27; T-12, T-13: event in the state-changing transaction; create-or-get decision events; HMAC chain with `prev_mac` and `seq` | `audit/chain.py`; `repos/audit.py::append`; every TX function; `rev_0002` grants; `tasks.py::get_run` (verify) | `test_audit_chain.py` (chain verifies; dedupe adopts; payload tamper detected; concurrent seq; rollback with the transaction); `test_slice_run_lifecycle.py::test_submit_writes_nothing_when_the_enqueue_fails`; `test_permissions.py::test_audit_and_access_events_are_append_only`; `audit_chain_valid` asserted in every integration suite | `harness.assert_reconstructable` after every scenario; `test_lock_order.py` | `integration`, `chaos` | reordering (seq swap) tamper test; timestamp tamper (P-3); skip events (P-2); verify CLI (P-9); waiting-status transitions are not audited (owner question) |
+| G-14 masking (PROVEN; reworded 2026-11-12; end-to-end persisted/shown → P-17) | inv. 14; T-16: `mask()` before TX7 and at TX3; log scrubber; no payload in logs, spans or labels | `registry/masking.py`; `execute_tool.py::_send`; `graph.py::request_approval`; `observability/logging.py`; `secrets/`; `tracing.py`; `tasks.py::get_run` | `test_masking.py` (recursive mask; pass-through); `test_secrets.py`; `test_observability.py` (unit: scrub, dropped keys, shapes, no locals, quiet httpx, DB password); `tests/integration/test_observability.py::test_credentials_and_payloads_never_reach_*`, `::test_no_metric_label_*`, `::test_the_important_spans_*`; `test_authentication.py::test_tokens_and_api_keys_are_never_logged` | — | `static`, `integration` | **No run-level test with a `Sensitive` field** checking ledger, approval, audit payload and inspection (P-17); reference workload declares no `Sensitive` field |
+| G-15 active policy version (PROVEN) | inv. 11, 31; T-19: version asserted in the decision transaction (`FOR SHARE`); stale worker requeues with refund; stale API → `503` | `graph.py::_assert_current_policy`; `approvals.py`, `ops.py` (503); `repos/runs.py::PolicyVersionsRepository.active_version`; `policy/config.py`; `cli/bootstrap.py`; `rev_0002` | `test_run_graph.py::test_no_decision_is_made_under_a_stale_policy_version`; `test_reconciliation.py::test_t25_no_reconciliation_is_decided_under_a_stale_*` (503); `test_bootstrap_apply.py`; `test_policy_config.py`; `test_schema.py::test_one_active_policy_version_per_workspace`; `test_permissions.py` (policy fields read-only; share lock allowed) | — | `static`, `integration` | approval route `503`; `PolicyStaleError` at TX5 |
+| G-16 workspace scoping after authentication (PROVEN; title reworded 2026-11-12) | inv. 13; T-24: repositories need a scope; reads filtered, writes stamped and refused; composite FKs | `storage/scope.py`; `repos/base.py`; `storage/uow.py`; `rev_0002` composite FKs; `authz/deps.py` | `test_scope.py`; `test_uow.py` (cross-workspace not found; add stamps/refuses; no repo without scope); `test_schema.py` (children cannot reference a run in another workspace ×6; agent in run's workspace; api_key_agents within one workspace); `test_slice_run_lifecycle.py::test_get_is_workspace_scoped`; `test_run_graph.py::test_a_governed_run_can_be_inspected_end_to_end` (other workspace 404) | — | `static`, `integration` | T-24 matrix and route-inventory guard (P-10) |
+| P-1 replay divergence (PLANNED) | inv. 3; ADR-0003 rule 4, ADR-0005 rule 6 | — (adoption test seeds `call_hash: None`) | `test_run_graph.py::test_a_persisted_decision_is_adopted_not_re_decided` (adoption only) | — | — | divergence fails closed (negative); hash-checked adoption; W2.2 |
+| P-2 skip events (PLANNED) | ADR-0012 rule 4 | — | `test_reconciliation.py::test_t25_a_reconciled_not_applied_call_skips_the_rest_of_the_turn` (history only) | — | — | fenced `skipped` audit events; reconstruction; W2.3 |
+| P-3 MAC covers `created_at` (PLANNED) | ADR-0015 rule 1 | — | — | — | — | timestamp tamper case; mixed-version chain verifies; W2.4 |
+| P-4 verification (PLANNED) | inv. 36, 37; ADR-0019 | — | — | — | — | T-27 gate matrix, evidence masking, late probe, human wins, no-mutation contract; W5.1 |
+| P-5 heartbeats (PLANNED) | TDR-010; ADR-0004 rule 2 | — | — | — | — | T-29: long call with heartbeat; heartbeat loss = worker death; W6.1 |
+| P-6 policy inputs (PLANNED) | TDR-008 | `policy/engine.py` (tool + roles only) | `test_policy_config.py`, `test_reconciliation_eligibility.py` (current inputs) | — | `static` | T-06 extended; W3.1 |
+| P-7 repair/denial bound (PLANNED) | D-11 | `max_model_turns` only | `test_run_graph.py::test_invalid_proposals_are_recorded_and_not_executed` (typed result only) | — | `integration` | T-22: loop stops at the bound; W3.4 |
+| P-8 per-tool expiry (PLANNED) | D-8 | global `approval_ttl_seconds` | `test_cancellation_deadlines.py::test_t15_*` (global expiry) | `test_approve_vs_expiry_*` | `integration`, `chaos` | T-15 per-tool default and maximum; W4.2 |
+| P-9 `tether audit verify` (PLANNED) | D-10 | `verify_run` via inspection only | `audit_chain_valid` in inspection | — | `integration` | T-13 CLI exit codes; W4.3 |
+| P-10 T-24 matrix (PLANNED) | D-10; ADR-0013 | existing routes only | `test_authentication.py` (core cases, two workspaces) | — | `integration` | `tests/authz/` data-driven matrix; route inventory guard; W4.1, W4.3, W4.4 |
+| P-11 provider portability (PLANNED) | TDR-003/004; ADR-0016 | `providers/protocol.py`, `history.py`; scripted only | `test_scripted_provider.py` | — | `static` | adapter round-trips; OpenAI contract run (manual dispatch); W3.3, W9.1 |
+| P-12 GitHub sandbox (PLANNED) | U-001; OD-9 | — | — | — | — | T-30 credentialed suite; W9.2 |
+| P-13 second workload (PLANNED) | U-002; ADR-0002 | T-14 contracts | `tests/architecture/test_T14_domain_independence.py` | — | `static` | T-31 end-to-end run of the change-control workload; W9.2 |
+| P-14 production fails closed (PLANNED) | D-12 | `settings.py` default `dev`; scripted provider refuses `prod` | `test_scripted_provider.py::test_the_scripted_provider_is_refused_in_prod`; prod refuses the dev shortcut (`test_authentication.py`) | — | `static`, `integration` | T-32 startup refusal without `TETHER_ENV`; image inspection; W7.1, W7.2 |
+| P-15 measured limits (PLANNED) | U-006 | — | — | — | — | P-01–P-03 benchmark and load suites; W10.3 |
+| P-16 TX5 re-check (IMPLEMENTED, NOT YET PROVEN) | inv. 26; T-19 policy-tightened variant | `graph.py::_authorize` (implemented) | — | — | — | negative tests per branch; stale policy at TX5; not eligible for the card until they exist |
+| P-17 end-to-end `Sensitive` masking (IMPLEMENTED, NOT YET PROVEN) | inv. 14; T-16 run-level | `masking.py` applied in `execute_tool.py` and `graph.py` (implemented) | — | — | — | run with a `Sensitive` output/argument; assert ledger, approval, audit payload, inspection; not eligible for the card until it exists |
+
+### 4.1 Missing automated evidence (W2.1 findings)
+
+Behaviour that exists in the code but has no test asserting it. Each item needs a test before the matching wording can be claimed in the guarantee card. Retained by the owner on 2026-11-12 as the open evidence gaps of the baseline.
+
+1. **TX5 refusals** (`graph.py::_authorize`): "call changed since its decision", "policy now: deny", "no matching approval", "approval lapsed"; and `PolicyStaleError` raised at TX5. (G-1, G-12; P-16.)
+2. **End-to-end `Sensitive` masking**: a run whose tool output and arguments carry a `Sensitive` field, asserting `ledger_entries.outcome_payload_masked`, `approvals.arguments_masked`, the `APPROVAL_REQUESTED` payload and the inspection response. (G-14; P-17.)
+3. **Audit chain reordering**: swap two events' `seq` as the superuser and assert `verify_run` is false. (G-13.)
+4. **Approval route stale policy**: `POST /v1/approvals/{id}/{action}` returns `503` and changes nothing when the active version differs. (G-15.)
+5. **Agent or configuration unavailable mid-run**: today `driver._fail` marks the run `failed` even with an unresolved ledger entry. Owner disposition (2026-11-12): a correctness gap, scheduled in W5.2 with the required semantics recorded in the scope delta (I-4) and the card §3; regression tests must cover the hold with an unresolved effect, the typed configuration-unavailable failure without one, and the audit/inspection visibility of the unresolved or reconciled action. (G-6.)
+6. **Version or payload invalid after dispatch**: a `dispatched` entry whose tool version is unresolvable is left without an outcome or a wake (ADR-0011; W5.2). (G-4.)
+7. **Release flake gate**: the chaos suite repeated 20× before a release claim (plan), not on every push. (G-9.)
+
+### 4.2 Evidence citations corrected in W2.1
+
+- `tests/integration/test_permissions.py` is the database-privilege matrix for `tether_app` (grants, append-only events, trigger protection), not an API authorization test. It now backs G-7, G-13 and G-15, and no longer G-11.
+- `tests/integration/test_run_graph.py` was cited for a "call changed since its decision" case that does not exist; its hash test is the worker's TX6 payload check (`test_a_tampered_job_payload_is_never_dispatched`).
+- The "one real workspace" limitation on G-11 and G-16 was wrong: `seeded` creates two workspaces and `test_authentication.py` configures two with their own issuers and API keys.
+- G-9's failure behaviour said both model-call attempts are recorded after a crash; `test_c02_*` asserts the interrupted attempt leaves no `model_calls` row.
+- Planned items P-1 to P-3 referenced plan steps `W2-K1..K3`; the plan's identifiers are W2.2 to W2.4.
 
 ## 5. Credentialed and long-running suites (planned)
 
@@ -84,4 +116,5 @@ Coverage at baseline: C-01–C-07; TX4-vs-TX9 and stop-vs-TX5 races repeated 50�
 - Tests are written before the implementation and must fail for the right reason first; negative self-tests must genuinely fail when the violation is introduced.
 - No assertion is weakened, skipped or special-cased to get green; no lint, type or import-contract exception is added.
 - Test names embed PRD IDs (`test_T24_…`, `test_c07_…`).
-- A change to a guarantee changes its tests in the same step and updates the guarantee card.
+- A change to a guarantee changes its tests in the same step and updates the guarantee card; a new or changed test updates §4 of this document.
+- Evidence is cited by function, and a citation is checked against the function's assertions, not its name.

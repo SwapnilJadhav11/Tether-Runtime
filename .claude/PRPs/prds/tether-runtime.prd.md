@@ -150,7 +150,7 @@ Test IDs refer to the [reference-workload test matrix](#automated-test-matrix).
 
 **Still open** — each is a decision gate marked `TBD (owner)` where it applies; none is an assumed requirement
 - [ ] **ADR-0019 defaults** (U-009): the four defaults recorded at acceptance (verification deny as observation; `applied` with evidence marker; 3 attempts, 30 s cap; writes only) may be revised by the owner before W5.1.
-- [ ] **Guarantee wording** (U-004): final text and evidence links in the guarantee card.
+- [x] **Guarantee wording** (U-004) → accepted 2026-11-12 in W2.1: final text and evidence links in the guarantee card; P-16 and P-17 recorded as implemented-but-unproven evidence gaps. See Decisions Log.
 - [ ] **Measured V1 limits** (U-006): concurrency, throughput/latency, tool duration, lease/heartbeat, database assumptions. *P-01–P-03 remain targets until measured.*
 - [ ] **PostgreSQL recovery objectives** (U-007): deployment posture, RPO/RTO, restore validation.
 - [ ] **Policy and tool-contract schema** (U-008): exact interface, trusted-input construction, versioning.
@@ -764,6 +764,7 @@ The rows above are the 2026-10-06 baseline and are preserved unchanged. The entr
 | Scale (TDR-018) | Correctness at measured, modest scale; P-01–P-03 are targets until measured | "Overhead target" (unchanged number, now a target) | Honest limits |
 | Operations (TDR-021, TDR-022) | PostgreSQL recovery documentation required; key-lifecycle automation post-V1 | "Secrets" (unchanged), plan S8.1 | Authoritative state needs an operations story |
 | Comparison (TDR-016) | LangGraph/Temporal/custom-glue comparison as a learning exercise | — | Validate differentiation honestly |
+| Guarantee card accepted (U-004, 2026-11-12, W2.1) | G-1–G-16 wording accepted against the evidence; G-9, G-12, G-13, G-14 and G-16 narrowed to what tests prove; P-16 (TX5 refusal branches) and P-17 (end-to-end `Sensitive` masking) are implemented-but-unproven evidence gaps; the agent-unavailable-mid-run case is a correctness gap scheduled in W5.2 with owner semantics (scope delta I-4) | Open question "Guarantee wording" | Only tested behaviour is claimed |
 
 ---
 

@@ -19,9 +19,11 @@ The [guarantee card](docs/product/tether-v1-guarantees.md) is the authoritative 
 - idempotent writes are re-sent only with the same deterministic key, within a bound, and never after a cancellation or deadline (G-3);
 - after a stop, no model call starts and no proposal is governed; a dispatched write is never recalled and an unknown outcome is never hidden behind a clean terminal status (G-5, G-6);
 - terminal run statuses never change (database-enforced), and at most one fenced run driver changes a run at a time (G-7, G-8);
-- killing the API or a worker at any instruction loses no run and duplicates no supported write (G-9);
-- invalid credentials fail before any state change; out-of-scope resources return `404`; approvals bind the exact call through a keyed canonical hash and current policy is re-evaluated before execution (G-11, G-12);
-- critical audit events are written inside the state-changing transaction and chained per run with HMAC; sensitive fields are masked before anything is persisted or logged (G-13, G-14).
+- a crash of the API or a worker right after any critical transaction commits, during a model call or with an idempotent write in flight loses no run and duplicates no idempotent write against a key-honouring target; hard-killing the real processes mid-run has the same result (G-9);
+- invalid credentials fail before any state change; out-of-scope resources return `404`; an approval binds the exact call through a keyed canonical hash, can be decided only by an eligible approver who is not the requester, once, while unexpired, and the worker dispatches only arguments whose hash equals the ledger's (G-11, G-12);
+- critical audit events (decisions, approvals, dispatches, outcomes, reconciliations, stops, dead-letters and terminal status changes) are written inside the state-changing transaction and chained per run with HMAC; tool output and approval arguments pass through one masking function before they are persisted or audited, and secrets, payloads and arguments never reach logs, spans or metric labels (G-13, G-14).
+
+Two further behaviours exist in the code but are not yet claimed, because no automated test proves them end to end: the TX5 re-check that refuses a changed call, a policy that now denies, or a lapsed approval before dispatch (P-16), and `Sensitive`-field masking through the ledger, approvals, audit and inspection (P-17).
 
 Known limits of the baseline (see guarantee card §3): no lease heartbeat, no production model provider, approval decision endpoint only, audit timestamps outside the MAC, `TETHER_ENV` defaults to `dev`, operating limits not yet measured.
 
