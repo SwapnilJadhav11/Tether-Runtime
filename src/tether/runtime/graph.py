@@ -51,6 +51,8 @@ from tether.storage.uow import UnitOfWork
 _log = get_logger(__name__)
 # The metric label for a proposed tool that is not registered: model text never becomes a label.
 _UNREGISTERED = "unregistered"
+# The typed terminal reason of a run that failed closed on a replay divergence (ADR-0003 rule 4).
+REPLAY_DIVERGENCE_REASON = "replay_divergence"
 
 
 class RunState(TypedDict, total=False):
@@ -61,6 +63,8 @@ class RunState(TypedDict, total=False):
     ledger_id: str | None
     approval_id: str | None
     result: dict[str, Any] | None
+    # A replay divergence found by the node that set it (ADR-0003 rule 4); routes to TX-RD.
+    divergence: dict[str, Any] | None
     next_step_ordinal: int
     turns: int
     final_text: str | None
@@ -96,6 +100,7 @@ def initial_state(system_prompt: str, task_input: dict[str, Any]) -> RunState:
         "ledger_id": None,
         "approval_id": None,
         "result": None,
+        "divergence": None,
         "next_step_ordinal": 0,
         "turns": 0,
         "final_text": None,
@@ -132,6 +137,44 @@ def call_hash_for(
     )
     key = keys.key(KeyFamily.BINDING, run["binding_key_id"]).secret.reveal()
     return call_hash(envelope, key=key, write=descriptor.effect == "write")
+
+
+def _resolve(ctx: RunContext, call: dict[str, Any]) -> tuple[ToolDescriptor, BaseModel] | None:
+    """The offered descriptor and validated arguments of ``call``, or ``None`` if invalid."""
+    descriptor = ctx.registry.offered(call["tool"])
+    if descriptor is None:
+        return None
+    args = _validate(descriptor, call["arguments"])
+    return None if isinstance(args, list) else (descriptor, args)
+
+
+def _current_hash(ctx: RunContext, run: Any, call: dict[str, Any]) -> str | None:
+    """The call hash of the current call under the run's binding key; ``None`` if it is invalid."""
+    resolved = _resolve(ctx, call)
+    return None if resolved is None else call_hash_for(ctx.keys, run, *resolved)
+
+
+def _hashes_match(stored: object, recomputed: str | None) -> bool:
+    """Hash-checked create-or-get (ADR-0003 rule 4): a persisted row or decision may be adopted
+    only for the call it was recorded for. Two invalid calls (no hash) are consistent."""
+    if stored is None and recomputed is None:
+        return True
+    return call_hashes_equal(stored, recomputed)
+
+
+def _divergence(
+    call: dict[str, Any], *, path: str, stored: object, recomputed: str | None
+) -> RunState:
+    """The state update that routes a node to TX-RD. Hashes only: no arguments, no payloads."""
+    return {
+        "divergence": {
+            "step_ordinal": call["step_ordinal"],
+            "tool": call["tool"],
+            "path": path,
+            "stored_call_hash": stored if isinstance(stored, str) else None,
+            "recomputed_call_hash": recomputed,
+        }
+    }
 
 
 async def _assert_current_policy(uow: UnitOfWork, ctx: RunContext) -> None:
@@ -200,6 +243,12 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             if run["stopped"]:
                 return await stopped(uow, run)
+            # A recorded divergence is authoritative: no further model call, whatever the
+            # checkpoint lineage says (ADR-0005 rule 6). The run drains and fails closed.
+            if await uow.repository(AuditRepository, ctx.scope).has_event(
+                ctx.run_id, "REPLAY_DIVERGENCE"
+            ):
+                return {"divergence": {"path": "model_gate", "recorded": True}}
         if state["turns"] >= ctx.max_turns:
             return {"end_status": RunStatus.FAILED, "final_text": "model turn budget exhausted"}
         history = [NeutralMessage.model_validate(m) for m in state["history"]]
@@ -268,6 +317,8 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         }
 
     def after_model(state: RunState) -> str:
+        if state.get("divergence"):
+            return "drain_divergence"
         if state.get("end_status") or not state["pending"]:
             return "finalize"
         return "next_call"
@@ -283,6 +334,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             "ledger_id": None,
             "approval_id": None,
             "result": None,
+            "divergence": None,
         }
 
     def after_next(state: RunState) -> str:
@@ -304,6 +356,15 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 audit = uow.repository(AuditRepository, ctx.scope)
                 adopted = await audit.find(ctx.run_id, dedupe)
                 if adopted is not None:
+                    # Hash-checked adoption (ADR-0003 rule 4): the recorded decision is for
+                    # this exact call, or this replay has diverged from what was persisted.
+                    stored = adopted.payload.get("call_hash")
+                    recomputed = _current_hash(ctx, run, call)
+                    if adopted.tool != call["tool"] or not _hashes_match(stored, recomputed):
+                        tracing.annotate(current, **{"tether.replay.divergence": True})
+                        return _divergence(
+                            call, path="decision", stored=stored, recomputed=recomputed
+                        )
                     tracing.annotate(
                         current,
                         **{
@@ -363,6 +424,8 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 return {"decision": payload}
 
     def after_govern(state: RunState) -> str:
+        if state.get("divergence"):
+            return "record_divergence"
         if state.get("end_status"):
             return "finalize"
         decision = state["decision"]
@@ -380,10 +443,16 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         ordinal = call["step_ordinal"]
         async with UnitOfWork(ctx.engine) as uow:
             approvals = uow.repository(ApprovalsRepository, ctx.scope)
+            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             existing = await approvals.by_ordinal(ctx.run_id, ordinal)
             if existing is not None:
+                # Hash-checked get (ADR-0003 rule 4): the request must be for this exact call.
+                recomputed = _current_hash(ctx, run, call)
+                if not _hashes_match(existing["call_hash"], recomputed):
+                    return _divergence(
+                        call, path="approval", stored=existing["call_hash"], recomputed=recomputed
+                    )
                 return {"approval_id": str(existing["id"])}
-            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             if run["stopped"]:
                 return await stopped(uow, run)
             descriptor = _required(ctx.registry.offered(call["tool"]), "offered tool")
@@ -432,15 +501,27 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         return {"approval_id": str(approval_id)}
 
     def after_request(state: RunState) -> str:
+        if state.get("divergence"):
+            return "record_divergence"
         return "finalize" if state.get("end_status") else "await_approval"
 
     async def await_approval(state: RunState) -> RunState:
         """Wait node: re-read the approval; interrupt while it is pending."""
+        call = _required(state["current"], "current call")
         approval_id = uuid.UUID(_required(state["approval_id"], "approval id"))
         while True:
             async with UnitOfWork(ctx.engine) as uow:
                 row = await uow.repository(ApprovalsRepository, ctx.scope).get(approval_id)
+                run = await uow.repository(RunsRepository, ctx.scope).get(ctx.run_id)
             approval = _required(row, "approval")
+            # The row this lineage waits on must be the request for this exact call.
+            recomputed = _current_hash(ctx, _required(run, "run"), call)
+            if approval["step_ordinal"] != call["step_ordinal"] or not _hashes_match(
+                approval["call_hash"], recomputed
+            ):
+                return _divergence(
+                    call, path="approval_wait", stored=approval["call_hash"], recomputed=recomputed
+                )
             if approval["status"] == "approved":
                 return {}
             if approval["status"] == "rejected":
@@ -450,6 +531,8 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             interrupt("awaiting_approval")
 
     def after_await_approval(state: RunState) -> str:
+        if state.get("divergence"):
+            return "record_divergence"
         return "append_result" if state.get("result") else "authorize_call"
 
     async def authorize_call(state: RunState) -> RunState:
@@ -464,6 +547,8 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             if result is not None:
                 outcome = str(result["outcome"])
                 _log.info("call not authorized", outcome=outcome, step=call["step_ordinal"])
+            elif update.get("divergence"):
+                outcome = "replay_divergence"
             else:
                 outcome = "stopped" if update.get("end_status") else "authorized"
             tracing.annotate(current, **{"tether.authorization": outcome})
@@ -477,10 +562,17 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         ordinal = call["step_ordinal"]
         async with UnitOfWork(ctx.engine) as uow:
             ledger = uow.repository(LedgerRepository, ctx.scope)
+            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             existing = await ledger.by_ordinal(ctx.run_id, ordinal)
             if existing is not None:
+                # Ledger-first, hash-checked (ADR-0003 rules 4 and 6): the row is adopted only
+                # for the exact call it authorized; otherwise this replay has diverged.
+                recomputed = _current_hash(ctx, run, call)
+                if not _hashes_match(existing["call_hash"], recomputed):
+                    return _divergence(
+                        call, path="ledger", stored=existing["call_hash"], recomputed=recomputed
+                    )
                 return {"ledger_id": str(existing["id"])}
-            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             if run["stopped"]:
                 return await stopped(uow, run)
             descriptor = ctx.registry.offered(call["tool"])
@@ -548,18 +640,31 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         return {"ledger_id": str(entry_id)}
 
     def after_authorize(state: RunState) -> str:
+        if state.get("divergence"):
+            return "record_divergence"
         if state.get("end_status"):
             return "finalize"
         return "append_result" if state.get("result") else "await_tool"
 
     async def await_tool(state: RunState) -> RunState:
         """Wait node: re-read the ledger entry; interrupt until it is terminal."""
+        call = _required(state["current"], "current call")
         ledger_id = state["ledger_id"]
         ledger_id = _required(ledger_id, "ledger entry id")
         while True:
             async with UnitOfWork(ctx.engine) as uow:
                 entry = await uow.repository(LedgerRepository, ctx.scope).get(uuid.UUID(ledger_id))
+                run = await uow.repository(RunsRepository, ctx.scope).get(ctx.run_id)
             entry = _required(entry, "ledger entry")
+            # The outcome this lineage waits on must belong to this exact call: a divergent
+            # replay can never attach one call's outcome to another call (AD-10).
+            recomputed = _current_hash(ctx, _required(run, "run"), call)
+            if entry["step_ordinal"] != call["step_ordinal"] or not _hashes_match(
+                entry["call_hash"], recomputed
+            ):
+                return _divergence(
+                    call, path="ledger_wait", stored=entry["call_hash"], recomputed=recomputed
+                )
             resolution = entry["resolution"]
             if entry["state"] == "completed":
                 if resolution == LedgerResolution.RECONCILED_APPLIED:
@@ -580,7 +685,71 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             interrupt("awaiting_reconciliation" if waiting else "awaiting_tool")
 
     def after_await_tool(state: RunState) -> str:
+        if state.get("divergence"):
+            return "record_divergence"
         return "finalize" if state.get("end_status") else "append_result"
+
+    async def record_divergence(state: RunState) -> RunState:
+        """TX-RD: the replay divergence as a fenced, create-or-get decision-class audit event.
+
+        Nothing else is written: no decision, approval or ledger row is created, changed or
+        removed, and nothing is authorized or sent. The run then drains (``drain_divergence``)
+        and ends ``failed`` with the typed reason ``replay_divergence`` (TX11).
+        """
+        found = _required(state.get("divergence"), "divergence")
+        ordinal = int(found["step_ordinal"])
+        payload = {
+            key: found.get(key)
+            for key in ("step_ordinal", "tool", "path", "stored_call_hash", "recomputed_call_hash")
+        }
+        with tracing.span(
+            "replay.divergence",
+            attributes={
+                "tether.tool": str(found["tool"]),
+                "tether.step": ordinal,
+                "tether.replay.path": str(found["path"]),
+            },
+        ):
+            async with UnitOfWork(ctx.engine) as uow:
+                await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
+                await uow.repository(AuditRepository, ctx.scope).append(
+                    ctx.keys,
+                    run_id=ctx.run_id,
+                    dedupe_key=f"replay_divergence:{ordinal}",
+                    event_type="REPLAY_DIVERGENCE",
+                    payload=payload,
+                    tool=str(found["tool"]),
+                )
+                uow.on_commit(
+                    lambda: _log.error(
+                        "replay divergence", step=ordinal, path=found["path"], tool=found["tool"]
+                    )
+                )
+        return {"divergence": {**found, "recorded": True}}
+
+    async def drain_divergence(state: RunState) -> RunState:
+        """Wait node: a diverged run holds while any ledger entry is unresolved, then ends.
+
+        An in-flight or ``indeterminate`` entry is real-world truth that a terminal status must
+        not hide (ADR-0018): its outcome or reconciliation wakes the run, which then ends. The
+        integrity failure never overrides a stop (ADR-0006): a run whose stop predicate is true
+        ends ``cancelled``/``timed_out`` through the usual stop path, otherwise ``failed``; the
+        summary names ``replay_divergence`` either way, and the audit event stays.
+        """
+        while True:
+            async with UnitOfWork(ctx.engine) as uow:
+                held = await uow.repository(LedgerRepository, ctx.scope).unresolved(ctx.run_id)
+                if not held:
+                    run = await uow.repository(RunsRepository, ctx.scope).share_lock(ctx.run_id)
+                    if run["stopped"]:
+                        ended = await stopped(uow, run)
+                        summary = f"{ended['final_text']}; {REPLAY_DIVERGENCE_REASON}"
+                        return {**ended, "final_text": summary}
+                    return {
+                        "end_status": RunStatus.FAILED,
+                        "final_text": REPLAY_DIVERGENCE_REASON,
+                    }
+            interrupt("awaiting_reconciliation")
 
     async def append_result(state: RunState) -> RunState:
         call = state["current"]
@@ -648,23 +817,37 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     graph.add_node("authorize_call", authorize_call)
     graph.add_node("await_tool", await_tool)
     graph.add_node("append_result", append_result)
+    graph.add_node("record_divergence", record_divergence)
+    graph.add_node("drain_divergence", drain_divergence)
     graph.add_node("finalize", finalize)
     graph.add_edge(START, "call_model")
-    graph.add_conditional_edges("call_model", after_model, ["finalize", "next_call"])
+    graph.add_conditional_edges(
+        "call_model", after_model, ["finalize", "next_call", "drain_divergence"]
+    )
     graph.add_conditional_edges("next_call", after_next, ["govern_call", "call_model"])
     graph.add_conditional_edges(
         "govern_call",
         after_govern,
-        ["finalize", "authorize_call", "request_approval", "append_result"],
-    )
-    graph.add_conditional_edges("request_approval", after_request, ["finalize", "await_approval"])
-    graph.add_conditional_edges(
-        "await_approval", after_await_approval, ["append_result", "authorize_call"]
+        ["finalize", "authorize_call", "request_approval", "append_result", "record_divergence"],
     )
     graph.add_conditional_edges(
-        "authorize_call", after_authorize, ["finalize", "append_result", "await_tool"]
+        "request_approval", after_request, ["finalize", "await_approval", "record_divergence"]
     )
-    graph.add_conditional_edges("await_tool", after_await_tool, ["finalize", "append_result"])
+    graph.add_conditional_edges(
+        "await_approval",
+        after_await_approval,
+        ["append_result", "authorize_call", "record_divergence"],
+    )
+    graph.add_conditional_edges(
+        "authorize_call",
+        after_authorize,
+        ["finalize", "append_result", "await_tool", "record_divergence"],
+    )
+    graph.add_conditional_edges(
+        "await_tool", after_await_tool, ["finalize", "append_result", "record_divergence"]
+    )
     graph.add_edge("append_result", "next_call")
+    graph.add_edge("record_divergence", "drain_divergence")
+    graph.add_edge("drain_divergence", "finalize")
     graph.add_edge("finalize", END)
     return graph

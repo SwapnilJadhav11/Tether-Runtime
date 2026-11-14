@@ -66,6 +66,15 @@ class AuditRepository(ScopedRepository):
         row = (await self._connection.execute(statement)).mappings().first()
         return None if row is None else AuditRecord.from_row(row)
 
+    async def has_event(self, run_id: uuid.UUID, event_type: str) -> bool:
+        """Whether the run has at least one event of ``event_type`` (a plain read, no lock)."""
+        statement = self.scoped(
+            select(self.table.c.seq)
+            .where(self.table.c.run_id == run_id, self.table.c.event_type == event_type)
+            .limit(1)
+        )
+        return (await self._connection.execute(statement)).first() is not None
+
     async def events(self, run_id: uuid.UUID) -> list[AuditRecord]:
         statement = self.scoped(
             select(self.table).where(self.table.c.run_id == run_id).order_by(self.table.c.seq)

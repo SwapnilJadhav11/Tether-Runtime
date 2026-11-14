@@ -141,9 +141,18 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
                 )
             return None
         attempt = entry["attempts"] + 1
+        # A recorded replay divergence (ADR-0003 rule 4) gates sends like a stop: nothing new
+        # leaves Tether for a run whose persisted state and replay disagree.
+        diverged = await uow.repository(AuditRepository, scope).has_event(
+            entry["run_id"], "REPLAY_DIVERGENCE"
+        )
         if state == "pending":
-            if run["stopped"]:
-                reason = "not applied: run stopped before dispatch"
+            if run["stopped"] or diverged:
+                reason = (
+                    "not applied: run stopped before dispatch"
+                    if run["stopped"]
+                    else "not applied: replay divergence"
+                )
                 await _record(
                     uow, runtime, scope, entry, expected=state, new="failed", reason=reason
                 )
@@ -154,6 +163,8 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
             refusal: str | None = None
             if run["stopped"] or not _resendable(entry):
                 refusal = "outcome unknown after redelivery; not re-sent"
+            elif diverged:
+                refusal = "outcome unknown; replay divergence; not re-sent"
             elif entry["attempts"] >= descriptor.max_attempts:
                 refusal = f"outcome unknown after {entry['attempts']} attempts; not re-sent"
             if refusal is not None:

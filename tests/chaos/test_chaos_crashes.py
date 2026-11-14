@@ -230,6 +230,53 @@ async def test_tx12_execute_tool_crashing_before_dispatch_is_definitely_not_appl
         await worker.close()
 
 
+@pytest.mark.parametrize(
+    ("event", "table"),
+    [("EXECUTION_AUTHORIZED", "ledger_entries"), ("APPROVAL_REQUESTED", "approvals")],
+    ids=["ledger-after-tx5", "approval-after-tx3"],
+)
+@pytest.mark.asyncio
+async def test_a_diverged_replay_after_a_crash_fails_closed_without_sending(
+    env: Env, monkeypatch: pytest.MonkeyPatch, event: str, table: str
+) -> None:
+    """W2.2 (ADR-0003 rule 4, ADR-0005 rule 6): the worker dies after the commit and before the
+    checkpoint; the persisted row is then for another call. The replay must not adopt it."""
+    crash_after_commit(monkeypatch, event)
+    scenario = "write" if table == "ledger_entries" else "remediate"
+    run_id = await env.submit(scenario)
+    worker = await env.worker()
+    try:
+        await env.drain(worker)
+    except BaseException as error:
+        if not is_crash(error):
+            raise
+    else:
+        raise AssertionError("the injected crash did not fire")
+    await worker.close()
+    env.expire_leases()
+    env.sql(
+        f"UPDATE tether.{table} SET call_hash = %s WHERE run_id = %s RETURNING id",  # noqa: S608
+        "e" * 64,
+        run_id,
+    )
+    worker = await env.worker()
+    try:
+        await env.drain(worker)
+        assert env.status(run_id) == "failed"
+        assert env.events(run_id).count("REPLAY_DIVERGENCE") == 1
+        assert TARGET.sends == 0
+        assert await restarts() == 0
+        [(rows_now,)] = env.sql(
+            f"SELECT count(*) FROM tether.{table} WHERE run_id = %s",  # noqa: S608
+            run_id,
+        )
+        assert rows_now == 1  # nothing replaced or duplicated
+        await env.assert_reconstructable(run_id)
+        await env.assert_terminal_stable(run_id, worker)
+    finally:
+        await worker.close()
+
+
 @pytest.mark.asyncio
 async def test_a_send_budget_spent_by_crashes_is_indeterminate_then_reconciled(env: Env) -> None:
     # Three crashes with the write in flight spend the PD-14 send budget (3): the next delivery
