@@ -18,7 +18,7 @@
 - **Implementation baseline:** commit `ec352540a8fd9f70309b12af53f013b87c2258e4` (`hardening/v1-baseline`, CI green). It is the starting point for the revised V1, **not** a completed or frozen V1.
 - **Authority:** the revised PRD defines requirements; the scope delta records dispositions and owner decisions D-1–D-12, U-001, U-002; accepted ADRs are unchanged except ADR-0007, superseded by ADR-0019 (accepted 2026-11-09); ADR-0019 is required design, implemented in W5.1.
 - **Categories used below:** *baseline* = done at `ec35254` with automated evidence; *partial*; *not started*; *revised* = scope changed by the direction; *deferred*; *removed*.
-- **Active step rule:** exactly one step is active at a time, named by the owner and recorded in `CLAUDE.md`. W1.1 was accepted and committed on 2026-11-09 (`8714715`); W1.2 is done (ADR-0019 accepted). W2.1 was accepted by the owner on 2026-11-12 (U-004 closed, `212f2cc`). **Active step now: W2.2 (hash-checked create-or-get and `REPLAY_DIVERGENCE`), named by the owner on 2026-11-12, not yet started.**
+- **Active step rule:** exactly one step is active at a time, named by the owner and recorded in `CLAUDE.md`. W1.1 was accepted and committed on 2026-11-09 (`8714715`); W1.2 is done (ADR-0019 accepted). W2.1 was accepted by the owner on 2026-11-12 (U-004 closed, `212f2cc`). W2.2 was approved and committed on 2026-11-14 (`78db2c8`). **Active step now: W2.3 (audited `skipped` calls), named by the owner on 2026-11-14, not yet started.**
 
 ### 0.2 Original steps mapped to the baseline
 
