@@ -172,6 +172,8 @@ class Rows:
                 "payload_masked": Jsonb({}),
                 "mac": "b" * 64,
                 "key_id": "K1",
+                # W2.4: every write states its MAC version (no database default).
+                "mac_version": 2,
             },
             "jobs": {
                 "id": uuid.uuid4(),

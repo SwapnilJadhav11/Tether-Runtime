@@ -23,7 +23,7 @@ from tether.settings import Settings
 if TYPE_CHECKING:
     from conftest import TestDatabase
 
-HEAD_REVISION = "0002"
+HEAD_REVISION = "0003"
 
 
 def _run_migrate(test_db: TestDatabase) -> subprocess.CompletedProcess[str]:

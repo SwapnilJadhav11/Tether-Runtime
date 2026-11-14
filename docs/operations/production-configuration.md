@@ -1,7 +1,7 @@
 # Production configuration and dev/test separation
 
 > **Status:** required V1 documentation (direction record TDR-020; owner decision D-12)
-> **Baseline:** commit `ec35254`. Several controls described here are **required, not yet implemented**; §4 lists the gap for each.
+> **Baseline:** commit `ec35254`. Several controls described here are **required, not yet implemented**; §4 lists the gap for each. §6 (migration rollout and downgrade rules) was added with W2.4 on 2026-11-14.
 
 ## 1. Principle
 
@@ -57,3 +57,33 @@ Settings that must **not** be set or must have no effect in production: `TETHER_
 - [ ] No `TETHER_SCENARIOS_DIR`, no demo target in the stack
 - [ ] `/readyz` ready; worker heartbeat fresh
 - [ ] Backup and restore procedure in place (`postgres-recovery.md`)
+- [ ] Application and schema versions match; no process older than the schema is running (§6)
+
+## 6. Schema migrations, rollout and rollback (owner-approved constraints, 2026-11-14)
+
+The application and the `tether` schema are deployed as a **compatible pair**. Some migrations are deliberately not compatible with writers from older application versions; for those, a mixed old-writer/new-schema rolling deployment is **not a supported deployment mode**.
+
+### 6.1 Migration `0003` (audit `mac_version`, W2.4)
+
+`0003` adds a required `audit_events.mac_version` with **no persistent database default**: every audit append must state how its MAC is computed. Application processes from before W2.4 do not, so **old processes and schema `0003` are intentionally not writer-compatible**.
+
+Required sequence:
+
+1. Drain and stop every old `api` and `worker` process.
+2. Apply the migration (`tether migrate`, migrator role).
+3. Start the new `api` and `worker` version.
+
+Do not run old and new writers across this migration at the same time. If an old writer does run against `0003`, its audit append fails and its whole transaction aborts, so the state change it was making does not happen (fail closed). That is a consequence of an incompatible rollout sequence, not a supported mode of operation. W2.4 is not redesigned to let old and new writers coexist.
+
+### 6.2 Downgrade posture
+
+- **Once any version-2 audit event has been written, downgrading to a schema or application version that does not understand `mac_version` is unsupported.** Version-2 events can be verified only by code that knows version 2; dropping the column discards the interpretation needed to verify them.
+- `alembic downgrade 0002` (the `0003` downgrade) exists for development and test databases only. **It is not a production rollback procedure** once v2 data exists.
+- Production rollback or recovery must always end in a compatible application + schema pair: roll the application forward to a version that understands the schema, or restore a database backup together with the application version that matches it (`postgres-recovery.md` §4). Never pair a database that holds v2 events with an application that predates W2.4.
+
+### 6.3 What `0003` does not change
+
+- Events written before `0003` are version 1: valid as written, never re-MACed, and **their timestamps remain cryptographically uncovered**. W2.4 makes no retroactive protection claim.
+- Deletion or truncation of a chain's tail, or of a whole run, remains outside the HMAC guarantee (ADR-0015 rule 8).
+- `tether audit verify` is still planned (P-9); chain validity is exposed through run inspection until then.
+- TX5 refusals still write no audit event of their own (P-16).

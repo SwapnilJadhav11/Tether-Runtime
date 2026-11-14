@@ -21,11 +21,12 @@ The [guarantee card](docs/product/tether-v1-guarantees.md) is the authoritative 
 - terminal run statuses never change (database-enforced), and at most one fenced run driver changes a run at a time (G-7, G-8);
 - a crash of the API or a worker right after any critical transaction commits, during a model call or with an idempotent write in flight loses no run and duplicates no idempotent write against a key-honouring target; hard-killing the real processes mid-run has the same result (G-9);
 - invalid credentials fail before any state change; out-of-scope resources return `404`; an approval binds the exact call through a keyed canonical hash, can be decided only by an eligible approver who is not the requester, once, while unexpired, and the worker dispatches only arguments whose hash equals the ledger's (G-11, G-12);
-- critical audit events (decisions, approvals, dispatches, outcomes, reconciliations, stops, dead-letters and terminal status changes) are written inside the state-changing transaction and chained per run with HMAC; tool output and approval arguments pass through one masking function before they are persisted or audited, and secrets, payloads and arguments never reach logs, spans or metric labels (G-13, G-14).
+- a replay never adopts a persisted decision, approval or ledger row recorded for a different call: the mismatch is audited as `REPLAY_DIVERGENCE` and the run fails closed after unresolved work drains (G-1, G-8);
+- critical audit events (decisions, skipped calls, approvals, dispatches, outcomes, reconciliations, stops, replay divergences, dead-letters and terminal status changes) are written inside the state-changing transaction and chained per run with HMAC, and every event written since migration `0003` also covers its timestamp; tool output and approval arguments pass through one masking function before they are persisted or audited, and secrets, payloads and arguments never reach logs, spans or metric labels (G-13, G-14).
 
 Two further behaviours exist in the code but are not yet claimed, because no automated test proves them end to end: the TX5 re-check that refuses a changed call, a policy that now denies, or a lapsed approval before dispatch (P-16), and `Sensitive`-field masking through the ledger, approvals, audit and inspection (P-17).
 
-Known limits of the baseline (see guarantee card §3): no lease heartbeat, no production model provider, approval decision endpoint only, audit timestamps outside the MAC, `TETHER_ENV` defaults to `dev`, operating limits not yet measured.
+Known limits of the baseline (see guarantee card §3): no lease heartbeat, no production model provider, approval decision endpoint only, audit events written before migration `0003` keep timestamps outside their MAC, `TETHER_ENV` defaults to `dev`, operating limits not yet measured. Migration `0003` must not be rolled out alongside older writers, and downgrading below it is unsupported once newer audit events exist ([production configuration](docs/operations/production-configuration.md) §6).
 
 ## What V1 requires (not yet implemented)
 
@@ -34,7 +35,6 @@ Known limits of the baseline (see guarantee card §3): no lease heartbeat, no pr
 - **Lease heartbeats** so healthy long-running tool calls are neither redelivered nor marked `indeterminate`.
 - A real hosted provider (**OpenAI**, user-supplied key) behind the provider boundary; provider choice by configuration.
 - A **second, unrelated workload** (repository change control) against a **real external API** (a dedicated GitHub sandbox repository).
-- Kernel conformance fixes: hash-checked replay with `REPLAY_DIVERGENCE`, audited skipped calls, a versioned audit MAC covering timestamps.
 - Governance-aware tool contracts and a stable policy interface; a small explicit repair/denial bound; per-tool approval expiry with a maximum.
 - Fail-closed production configuration: explicit `TETHER_ENV`, dev/test-only components excluded from production.
 - Measured operating limits, PostgreSQL recovery guidance, and a LangGraph/Temporal/custom-glue comparison.

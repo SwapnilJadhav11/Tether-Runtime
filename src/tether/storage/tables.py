@@ -23,6 +23,7 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     PrimaryKeyConstraint,
+    SmallInteger,
     Table,
     Text,
     UniqueConstraint,
@@ -250,6 +251,8 @@ audit_events = Table(
     Column("prev_mac", Text),
     Column("mac", Text, nullable=False),
     Column("key_id", Text, nullable=False),
+    # How this event's MAC is computed (W2.4); no default: every write states it.
+    Column("mac_version", SmallInteger, nullable=False),
     PrimaryKeyConstraint("run_id", "seq", name="pk_audit_events"),
     UniqueConstraint("run_id", "dedupe_key", name="uq_audit_events_run_id_dedupe_key"),
     _run_fk("audit_events"),

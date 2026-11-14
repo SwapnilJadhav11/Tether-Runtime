@@ -1,21 +1,24 @@
 """Audit events, appended inside the caller's transaction (ADR-0015).
 
 ``append`` is get-or-create by ``(run_id, dedupe_key)``: a decision event that already exists is
-returned unchanged, so a replayed node adopts the persisted decision instead of re-deciding.
-The run's ``audit_heads`` row is locked ``FOR UPDATE`` to serialize appends per run.
+returned unchanged, so a replayed node adopts the persisted decision instead of re-deciding (an
+existing event keeps the MAC version it was written with). The run's ``audit_heads`` row is
+locked ``FOR UPDATE`` to serialize appends per run. A new event is MAC version 2: its time is read
+from the database clock under that lock, stored explicitly and covered by the MAC (W2.4).
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import RowMapping
 
-from tether.audit.chain import compute_mac, mac_record
+from tether.audit.chain import MAC_VERSION, compute_mac, mac_record_v2
 from tether.observability import tracing
 from tether.secrets.keyring import KeyFamily, KeyRing
 from tether.storage import tables
@@ -36,6 +39,9 @@ class AuditRecord:
     prev_mac: str | None
     mac: str
     key_id: str
+    # How this event's MAC is computed, and the stored time (covered by the MAC from v2 on).
+    mac_version: int
+    created_at: datetime
     created: bool = False
 
     @classmethod
@@ -51,6 +57,8 @@ class AuditRecord:
             prev_mac=row["prev_mac"],
             mac=row["mac"],
             key_id=row["key_id"],
+            mac_version=row["mac_version"],
+            created_at=row["created_at"],
         )
 
 
@@ -114,6 +122,9 @@ class AuditRepository(ScopedRepository):
         existing = await self.find(run_id, dedupe_key)
         if existing is not None:
             return existing
+        # The authoritative event time: the database clock, read in this transaction under the
+        # head lock. This exact value is stored and MACed (v2); nothing re-derives it later.
+        created_at = (await self._connection.execute(select(func.clock_timestamp()))).scalar_one()
         record = AuditRecord(
             seq=head["seq"] + 1,
             dedupe_key=dedupe_key,
@@ -125,12 +136,14 @@ class AuditRepository(ScopedRepository):
             prev_mac=head["last_mac"],
             mac="",
             key_id=head["key_id"],
+            mac_version=MAC_VERSION,
+            created_at=created_at,
             created=True,
         )
         key = keys.key(KeyFamily.AUDIT, record.key_id).secret.reveal()
         mac = compute_mac(
             key,
-            mac_record(
+            mac_record_v2(
                 workspace_id=workspace_id,
                 run_id=run_id,
                 seq=record.seq,
@@ -141,6 +154,7 @@ class AuditRepository(ScopedRepository):
                 payload=payload,
                 policy_version=policy_version,
                 prev_mac=record.prev_mac,
+                created_at=created_at,
             ),
         )
         await self._connection.execute(
@@ -159,6 +173,8 @@ class AuditRepository(ScopedRepository):
                 prev_mac=record.prev_mac,
                 mac=mac,
                 key_id=record.key_id,
+                created_at=created_at,
+                mac_version=MAC_VERSION,
             )
         )
         await self._connection.execute(

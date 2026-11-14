@@ -68,10 +68,10 @@ def test_core_schema_tables_exist(fresh_db: Any) -> None:
     assert {row[0] for row in found} - {"alembic_version"} == EXPECTED_TABLES
 
 
-def test_migration_head_is_0002(fresh_db: Any) -> None:
+def test_migration_head_is_0003(fresh_db: Any) -> None:
     with owner(fresh_db) as conn:
         versions = conn.execute("SELECT version_num FROM tether.alembic_version").fetchall()
-    assert versions == [("0002",)]
+    assert versions == [("0003",)]
 
 
 def test_database_time_defaults_use_clock_timestamp(fresh_db: Any) -> None:
