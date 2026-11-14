@@ -751,20 +751,88 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     }
             interrupt("awaiting_reconciliation")
 
+    async def record_skips(
+        call: dict[str, Any], outcome: CallOutcome, remaining: list[dict[str, Any]]
+    ) -> RunState | None:
+        """The skip events of ADR-0012 rule 4, fenced, in one transaction; ``None`` once done.
+
+        One decision-class ``CALL_SKIPPED`` per remaining call, create-or-get by ordinal. A
+        skipped call is never validated, governed, approved, ledgered or sent: the event holds
+        identifiers and the cause only, never arguments. On replay, an existing event is adopted
+        only if it records the same tool and the same cause; anything else is a replay
+        divergence (W2.2) and nothing is written. If the stop predicate is already true, the
+        remaining calls are not marked skipped and the run ends (ADR-0012 rule 6).
+        """
+        async with UnitOfWork(ctx.engine) as uow:
+            run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
+            if run["stopped"]:
+                return await stopped(uow, run)
+            audit = uow.repository(AuditRepository, ctx.scope)
+            missing = []
+            for skipped in remaining:
+                payload = {
+                    "step_ordinal": skipped["step_ordinal"],
+                    "call_id": skipped["call_id"],
+                    "reason": "earlier_call_not_applied",
+                    "trigger_step_ordinal": call["step_ordinal"],
+                    "trigger_call_id": call["call_id"],
+                    "trigger_outcome": outcome.value,
+                }
+                existing = await audit.find(ctx.run_id, f"skipped:{skipped['step_ordinal']}")
+                if existing is None:
+                    missing.append((skipped, payload))
+                    continue
+                stored = existing.payload
+                if (
+                    existing.event_type != "CALL_SKIPPED"
+                    or existing.tool != skipped["tool"]
+                    or stored.get("trigger_step_ordinal") != payload["trigger_step_ordinal"]
+                    or stored.get("trigger_outcome") != payload["trigger_outcome"]
+                ):
+                    return _divergence(skipped, path="skip", stored=None, recomputed=None)
+            for skipped, payload in missing:
+                await audit.append(
+                    ctx.keys,
+                    run_id=ctx.run_id,
+                    dedupe_key=f"skipped:{skipped['step_ordinal']}",
+                    event_type="CALL_SKIPPED",
+                    payload=payload,
+                    tool=skipped["tool"],
+                )
+            if missing:
+                skipped_count = len(missing)
+                uow.on_commit(
+                    lambda: _log.info(
+                        "calls skipped",
+                        count=skipped_count,
+                        step=call["step_ordinal"],
+                        outcome=outcome.value,
+                    )
+                )
+        return None
+
     async def append_result(state: RunState) -> RunState:
         call = state["current"]
         call = _required(call, "current call")
         result = state.get("result") or _result_from_decision(state["decision"])
+        if result["outcome"] != CallOutcome.APPLIED and state["pending"]:
+            ended = await record_skips(call, CallOutcome(result["outcome"]), state["pending"])
+            if ended is not None:
+                return ended
         history = [
             *state["history"],
             _tool_message(call["call_id"], result["outcome"], result["content"]),
         ]
         pending = state["pending"]
         if result["outcome"] != CallOutcome.APPLIED:
-            # ADR-0012: after a call that did not apply, the rest of the turn is skipped.
-            history += [
-                _tool_message(p["call_id"], CallOutcome.SKIPPED, "skipped") for p in pending
-            ]
+            # ADR-0012 rule 4: after a call that did not apply, the rest of the turn is skipped,
+            # and each skipped result references that call's ID and outcome (identifiers only).
+            skipped = {
+                "reason": "earlier_call_not_applied",
+                "trigger_call_id": call["call_id"],
+                "trigger_outcome": CallOutcome(result["outcome"]).value,
+            }
+            history += [_tool_message(p["call_id"], CallOutcome.SKIPPED, skipped) for p in pending]
             pending = []
         return {
             "history": history,
@@ -775,6 +843,11 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             "approval_id": None,
             "result": None,
         }
+
+    def after_append(state: RunState) -> str:
+        if state.get("divergence"):
+            return "record_divergence"
+        return "finalize" if state.get("end_status") else "next_call"
 
     async def finalize(state: RunState) -> RunState:
         """TX11: the terminal status and its audit event, fenced."""
@@ -846,7 +919,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     graph.add_conditional_edges(
         "await_tool", after_await_tool, ["finalize", "append_result", "record_divergence"]
     )
-    graph.add_edge("append_result", "next_call")
+    graph.add_conditional_edges(
+        "append_result", after_append, ["next_call", "finalize", "record_divergence"]
+    )
     graph.add_edge("record_divergence", "drain_divergence")
     graph.add_edge("drain_divergence", "finalize")
     graph.add_edge("finalize", END)

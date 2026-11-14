@@ -442,6 +442,29 @@ class Env:
                 assert keys[f"outcome:{entry_id}"][0] == "TOOL_OUTCOME"
             if resolution is not None:
                 assert keys[f"reconciled:{entry_id}"][0] == "RECONCILED"
+        # ADR-0012 rule 4 (W2.3): a skipped call is a decision-class event for its own ordinal,
+        # caused by an earlier call of the same turn that did not apply. It was never governed,
+        # approved or ledgered.
+        governed = {ordinal for _, ordinal, *_ in entries}
+        approved = {
+            ordinal
+            for (ordinal,) in self.sql(
+                "SELECT step_ordinal FROM tether.approvals WHERE run_id = %s", run_id
+            )
+        }
+        for dedupe, (event, payload) in keys.items():
+            if event != "CALL_SKIPPED":
+                continue
+            ordinal, trigger = payload["step_ordinal"], payload["trigger_step_ordinal"]
+            assert dedupe == f"skipped:{ordinal}"
+            assert f"decision:{ordinal}" not in keys
+            assert ordinal not in governed
+            assert ordinal not in approved
+            assert trigger < ordinal
+            assert f"decision:{trigger}" in keys
+            assert payload["trigger_outcome"] != "applied"
+            trigger_seq = next(seq for seq, d, *_ in audit if d == f"decision:{trigger}")
+            assert trigger_seq < next(seq for seq, d, *_ in audit if d == dedupe)
         status = self.status(run_id)
         if status in TERMINAL:
             assert keys["run_finished"][1]["status"] == status
