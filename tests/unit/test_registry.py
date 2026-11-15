@@ -79,10 +79,11 @@ def test_manifest_offers_the_agent_tools_with_input_schemas() -> None:
         assert entry["input_schema"]["type"] == "object"
 
 
-def test_resolve_returns_the_descriptor_or_none() -> None:
+def test_resolve_returns_the_pinned_descriptor_or_none() -> None:
     registry = ToolRegistry(Workload(name="w", tools=(_tool(),), agent=AgentDefinition("p", ())))
-    assert registry.resolve("probe_tool") is not None
-    assert registry.resolve("missing") is None
+    assert registry.resolve("probe_tool", "1.0.0") is not None
+    assert registry.resolve("probe_tool", "2.0.0") is None
+    assert registry.resolve("missing", "1.0.0") is None
 
 
 def test_write_tools_must_declare_idempotency_support() -> None:

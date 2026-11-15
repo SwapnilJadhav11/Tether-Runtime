@@ -599,7 +599,9 @@ async def test_tx12_an_exhausted_execute_tool_job_resolves_its_ledger_entry(
         assert run_status(seeded, run_id)[0] == "awaiting_reconciliation"
     else:
         [(outcome, _)] = tool_results(runtime)
-        assert outcome == "failed"
+        # ADR-0021 rules 10-11: nothing was sent before the dead-letter, which is positive
+        # evidence (`not_applied`); a dispatched read's exhaustion is `unknown` (`failed`).
+        assert outcome == ("failed" if in_flight else "not_applied")
         assert run_status(seeded, run_id)[0] == run
     assert TARGET.sends == 0
     assert await chain_valid(seeded, tmp_path, run_id)

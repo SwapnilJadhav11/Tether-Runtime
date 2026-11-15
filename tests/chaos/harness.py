@@ -34,7 +34,7 @@ from tether.policy.config import BootstrapFile
 from tether.providers.history import ModelTurn, NeutralMessage
 from tether.registry.registry import ToolRegistry
 from tether.runtime.driver import WorkerRuntime
-from tether.sdk import AgentDefinition, ToolContext, ToolDescriptor, Workload
+from tether.sdk import AgentDefinition, ToolContext, ToolDescriptor, ToolNotApplied, Workload
 from tether.settings import Settings
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.uow import UnitOfWork
@@ -43,7 +43,7 @@ from tether.worker.main import process_next_job
 
 WS, AGENT = "ws-a", "agent-1"
 # Every permission the harness's tools require (reference workload tools and the probes).
-PERMISSIONS = ("service:read", "service:restart", "probe:write")
+PERMISSIONS = ("service:read", "service:restart", "probe:read", "probe:write")
 TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "abandoned"}
 
 BOOT = BootstrapFile.model_validate(
@@ -62,6 +62,8 @@ BOOT = BootstrapFile.model_validate(
                         },
                         {"tool": "probe_write", "decision": "allow"},
                         {"tool": "probe_nonidem", "decision": "allow"},
+                        {"tool": "probe_read_strict", "decision": "allow"},
+                        {"tool": "probe_cas", "decision": "allow"},
                     ],
                     "reconciliation": {"reconciler_roles": ["reconciler"]},
                     # ADR-0020: requester permissions (by role) ∩ agent permissions.
@@ -88,6 +90,19 @@ SCENARIOS = {
         "name: nonidem\nturns:\n"
         "  - tool_calls: [{tool: probe_nonidem, arguments: {target: a}}]\n"
         "  - final: written\n"
+    ),
+    # W3.2: a read configured to fail the run, followed by a write in the same turn.
+    "strict_read": (
+        "name: strict_read\nturns:\n"
+        "  - tool_calls: [{tool: probe_read_strict, arguments: {target: a}},"
+        " {tool: probe_write, arguments: {target: a}}]\n"
+        "  - final: read\n"
+    ),
+    # W3.2: a compare-and-swap write whose expected version is stale (T-21).
+    "cas_stale": (
+        "name: cas_stale\nturns:\n"
+        "  - tool_calls: [{tool: probe_cas, arguments: {target: a, expected_version: 6}}]\n"
+        "  - final: checked\n"
     ),
 }
 
@@ -116,6 +131,11 @@ class ProbeOut(BaseModel):
     target: str
 
 
+class CasIn(BaseModel):
+    target: str
+    expected_version: int
+
+
 @dataclass
 class Target:
     """Counts sends and applied effects. ``script`` decides each send: ``ok``; ``timeout`` (not
@@ -129,6 +149,7 @@ class Target:
     nonidem_effects: int = 0
     in_flight: int = 0
     gate: asyncio.Event | None = None
+    cas_version: int = 7  # the compare-and-swap probe's current version
 
     async def _send(self, ctx: ToolContext) -> str:
         self.sends += 1
@@ -163,6 +184,18 @@ class Target:
             raise httpx.RemoteProtocolError("connection dropped after the request was applied")
         return ProbeOut(target=args.target)
 
+    async def read_strict(self, args: ProbeIn, ctx: ToolContext) -> ProbeOut:
+        await self._send(ctx)
+        raise httpx.ReadTimeout("no response")  # every attempt: the read exhausts its budget
+
+    async def cas(self, args: CasIn, ctx: ToolContext) -> ProbeOut:
+        await self._send(ctx)
+        if args.expected_version != self.cas_version:  # checked atomically with the change
+            raise ToolNotApplied(f"precondition failed: version is {self.cas_version}")
+        self.cas_version += 1
+        self.effects.add(ctx.idempotency_key)
+        return ProbeOut(target=args.target)
+
 
 TARGET = Target()
 
@@ -190,9 +223,42 @@ def _probe(name: str, idempotency: Any, handler: Any) -> ToolDescriptor:
     )
 
 
+async def _read_strict(args: ProbeIn, ctx: ToolContext) -> ProbeOut:
+    return await TARGET.read_strict(args, ctx)
+
+
+async def _cas(args: CasIn, ctx: ToolContext) -> ProbeOut:
+    return await TARGET.cas(args, ctx)
+
+
 PROBES = (
     _probe("probe_write", "supported", _idem),
     _probe("probe_nonidem", "unsupported", _nonidem),
+    ToolDescriptor(
+        name="probe_read_strict",
+        version="1.0.0",
+        description="Chaos test read that fails the run when exhausted.",
+        input_model=ProbeIn,
+        output_model=ProbeOut,
+        effect="read",
+        handler=_read_strict,
+        risk="low",
+        required_permissions=("probe:read",),
+        on_exhausted="fail_run",
+    ),
+    ToolDescriptor(
+        name="probe_cas",
+        version="1.0.0",
+        description="Chaos test compare-and-swap write.",
+        input_model=CasIn,
+        output_model=ProbeOut,
+        effect="write",
+        idempotency="supported",
+        handler=_cas,
+        risk="low",
+        required_permissions=("probe:write",),
+        preconditions=("expected_version",),
+    ),
 )
 TEST_WORKLOAD = Workload(
     name=WORKLOAD.name,
@@ -513,6 +579,7 @@ def reset_target(gate: asyncio.Event | None = None) -> Target:
     TARGET.effects.clear()
     TARGET.sends = TARGET.nonidem_effects = TARGET.in_flight = 0
     TARGET.gate = gate
+    TARGET.cas_version = 7
     return TARGET
 
 

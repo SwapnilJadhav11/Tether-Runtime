@@ -39,6 +39,15 @@ class LedgerState(StrEnum):
     ABANDONED = "abandoned"
 
 
+class OutcomeClass(StrEnum):
+    """Tether's own classification of an execution (ADR-0021 rule 10, migration 0004)."""
+
+    APPLIED = "applied"  # definitive successful completion
+    NOT_APPLIED = "not_applied"  # definitive evidence the action did not apply
+    UNKNOWN = "unknown"  # the external outcome cannot be determined safely
+    FAILED = "failed"  # definitive ordinary failure, asserting nothing about an effect
+
+
 class LedgerResolution(StrEnum):
     AUTOMATIC = "automatic"
     RECONCILED_APPLIED = "reconciled_applied"

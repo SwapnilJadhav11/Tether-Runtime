@@ -10,10 +10,15 @@ delivery re-sends with the same key, but only after committing the stop-gated TX
 tool's send budget (PD-14) is shared by retries and redeliveries; when it is spent, the unknown
 outcome is final: ``indeterminate`` for a write, a typed failure for a read. A non-idempotent
 write is never re-sent. ``dead_letter`` is TX12 for a job delivered past ``max_attempts``.
+
+ADR-0021: the worker resolves exactly the entry's pinned ``(tool, version)``; each send is bounded
+by the tool's ``timeout_seconds`` and a timeout is an unknown outcome; every outcome write states
+its ``outcome_class`` (``applied``, ``not_applied``, ``unknown`` or ``failed``).
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -21,7 +26,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.engine import RowMapping
 
 from tether.core.hashing import call_hashes_equal
-from tether.core.statuses import JobKind
+from tether.core.statuses import JobKind, OutcomeClass
 from tether.observability import metrics, tracing
 from tether.observability.logging import bound, get_logger
 from tether.queue import backoff
@@ -64,10 +69,8 @@ def _descriptor(
     agent = workspace.agent(run["agent_id"]) if workspace else None
     if agent is None:
         return None
-    descriptor = runtime.registries[agent.workload].resolve(entry["tool"])
-    if descriptor is None or descriptor.version != entry["tool_version"]:
-        return None  # the pinned version is not resolvable (ADR-0011)
-    return descriptor
+    # Exactly the pinned version, never another one (ADR-0011 rule 1, ADR-0021 rule 14).
+    return runtime.registries[agent.workload].resolve(entry["tool"], entry["tool_version"])
 
 
 async def _record(
@@ -78,6 +81,7 @@ async def _record(
     *,
     expected: str,
     new: str,
+    outcome_class: OutcomeClass,
     output: dict[str, Any] | None = None,
     reason: str | None = None,
 ) -> None:
@@ -88,6 +92,7 @@ async def _record(
         new=new,
         outcome_payload_masked=output,
         outcome_reason=reason,
+        outcome_class=outcome_class.value,
     )
     if not changed:
         return
@@ -96,7 +101,12 @@ async def _record(
         run_id=entry["run_id"],
         dedupe_key=f"outcome:{entry['id']}",
         event_type="TOOL_OUTCOME",
-        payload={"ledger_id": str(entry["id"]), "state": new, "reason": reason},
+        payload={
+            "ledger_id": str(entry["id"]),
+            "state": new,
+            "outcome_class": outcome_class.value,
+            "reason": reason,
+        },
         tool=entry["tool"],
     )
     await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, entry["run_id"])
@@ -123,12 +133,20 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
             return None
         run = await uow.repository(RunsRepository, scope).share_lock(entry["run_id"])
         state = entry["state"]
+        not_applied = OutcomeClass.NOT_APPLIED
         descriptor = _descriptor(runtime, scope, run, entry)
         if descriptor is None:
             reason = "not applied: tool version not resolvable"
             if state == "pending":
                 await _record(
-                    uow, runtime, scope, entry, expected=state, new="failed", reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new="failed",
+                    outcome_class=not_applied,
+                    reason=reason,
                 )
             return None
         args = descriptor.input_model.model_validate(job.payload.get("arguments", {}))
@@ -137,7 +155,14 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
             reason = "call hash mismatch: not dispatched"
             if state == "pending":
                 await _record(
-                    uow, runtime, scope, entry, expected=state, new="failed", reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new="failed",
+                    outcome_class=not_applied,
+                    reason=reason,
                 )
             return None
         attempt = entry["attempts"] + 1
@@ -154,7 +179,14 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
                     else "not applied: replay divergence"
                 )
                 await _record(
-                    uow, runtime, scope, entry, expected=state, new="failed", reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new="failed",
+                    outcome_class=not_applied,
+                    reason=reason,
                 )
                 return None
             event = "DISPATCHED"
@@ -175,6 +207,7 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
                     entry,
                     expected=state,
                     new=_unknown_state(entry),
+                    outcome_class=OutcomeClass.UNKNOWN,
                     reason=refusal,
                 )
                 return None
@@ -230,21 +263,23 @@ async def _send(
         started = time.monotonic()
         retry_in: float | None = None
         try:
-            result = await descriptor.handler(args, context)
+            # One send attempt is bounded by the tool's timeout; it is never clipped to the run
+            # deadline, and a timeout is an unknown outcome (ADR-0021 rule 6).
+            async with asyncio.timeout(descriptor.timeout_seconds):
+                result = await descriptor.handler(args, context)
             output = mask(descriptor.output_model.model_validate(result.model_dump()))
             new = outcome = "completed"
+            outcome_class = OutcomeClass.APPLIED
         except ToolNotApplied as not_applied:
             new, reason, outcome = "failed", f"not applied: {not_applied.reason}", "not_applied"
+            outcome_class = OutcomeClass.NOT_APPLIED
         except Exception as error:
             outcome = "unknown"
             tracing.mark_error(current, type(error).__name__)
+            invalid = isinstance(error, ValidationError)
             # Unknown outcome. Re-send with the same key while the budget lasts, but only when
             # that cannot duplicate an effect. Invalid output is never retried (PD-33).
-            retry = (
-                _resendable(entry)
-                and attempt < descriptor.max_attempts
-                and not isinstance(error, ValidationError)
-            )
+            retry = _resendable(entry) and attempt < descriptor.max_attempts and not invalid
             if retry:
                 retry_in = backoff.tool_backoff_seconds(attempt)
                 metrics.tool_retry(descriptor.name)
@@ -255,8 +290,16 @@ async def _send(
                     error=type(error).__name__,
                     delay_s=round(retry_in, 3),
                 )
-            # ADR-0007: a write whose result is unknown is indeterminate, never failed.
-            new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
+            if invalid and entry["effect"] == "read":
+                # A read answered with output that violates its schema: a definitive ordinary
+                # failure. Nothing can have changed at the target.
+                new, reason = "failed", "failed: output invalid"
+                outcome_class = OutcomeClass.FAILED
+            else:
+                # ADR-0007: a write whose result is unknown is indeterminate, never failed. A
+                # write with invalid output stays unknown until PD-33 (W5.2).
+                new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
+                outcome_class = OutcomeClass.UNKNOWN
         metrics.tool_executed(descriptor.name, outcome, time.monotonic() - started)
         tracing.annotate(current, **{"tether.tool.outcome": outcome})
     if retry_in is not None:
@@ -267,7 +310,15 @@ async def _send(
         # with a stop (TX9/TX10/TX-EA) holding the run row and waiting for that head.
         await uow.repository(RunsRepository, scope).share_lock(entry["run_id"])
         await _record(
-            uow, runtime, scope, entry, expected="dispatched", new=new, output=output, reason=reason
+            uow,
+            runtime,
+            scope,
+            entry,
+            expected="dispatched",
+            new=new,
+            outcome_class=outcome_class,
+            output=output,
+            reason=reason,
         )
     return None
 
@@ -289,7 +340,14 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
                 # No call is reachable without TX6: this one never left Tether.
                 reason = "not applied: delivery exhausted before dispatch"
                 await _record(
-                    uow, runtime, scope, entry, expected="pending", new="failed", reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected="pending",
+                    new="failed",
+                    outcome_class=OutcomeClass.NOT_APPLIED,
+                    reason=reason,
                 )
             elif entry is not None and entry["state"] == "dispatched":
                 reason = "outcome unknown: delivery exhausted"
@@ -300,6 +358,7 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
                     entry,
                     expected="dispatched",
                     new=_unknown_state(entry),
+                    outcome_class=OutcomeClass.UNKNOWN,
                     reason=reason,
                 )
             if not await uow.repository(JobsRepository, scope).mark_dead(job.id, job.lease_token):

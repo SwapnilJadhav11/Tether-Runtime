@@ -13,7 +13,7 @@ from psycopg import errors
 def test_clone_is_fully_migrated(fresh_db: Any) -> None:
     with psycopg.connect(fresh_db.migrator_dsn) as conn:
         assert conn.execute("SELECT version_num FROM tether.alembic_version").fetchall() == [
-            ("0003",)
+            ("0004",)
         ]
         saver = conn.execute(
             "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'langgraph'"

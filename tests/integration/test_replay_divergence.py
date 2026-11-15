@@ -143,7 +143,7 @@ def expected_hash(
     [(workspace_id, agent_id, binding_key_id)] = env.sql(
         "SELECT workspace_id, agent_id, binding_key_id FROM tether.runs WHERE id = %s", run_id
     )
-    descriptor = worker.registries[WORKLOAD.name].resolve(tool)
+    descriptor = worker.registries[WORKLOAD.name].offered(tool)
     assert descriptor is not None
     run = {
         "workspace_id": workspace_id,
@@ -208,6 +208,8 @@ async def test_a_persisted_decision_with_a_different_hash_is_not_adopted(
         reasons=["recorded earlier"],
         call_hash=stored,
         tool="probe_write",
+        # A governed decision pins its tool version (ADR-0011 rule 1); an invalid call has none.
+        **({"tool_version": "1.0.0"} if stored is not None else {}),
     )
     await env.drain(worker)
     # Fail closed: no authorization, no ledger row, nothing sent, the stored event untouched.
@@ -249,6 +251,7 @@ async def test_d_a_persisted_decision_with_the_matching_hash_is_adopted(
         reasons=["recorded earlier"],
         call_hash=matching,
         tool="probe_write",
+        tool_version="1.0.0",  # every governed decision pins its version (ADR-0011 rule 1)
     )
     await env.drain(worker)
     # Adopted, not re-decided: the earlier deny stands and the write is never authorized.

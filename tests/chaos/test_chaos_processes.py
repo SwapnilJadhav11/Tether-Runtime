@@ -46,7 +46,26 @@ API = _PRELUDE + (
     "    uvicorn.run(create_app(settings), host=settings.api_host, port=settings.api_port,\n"
     "                log_config=None, loop='none')\n"
 )
-WORKER = _PRELUDE + "from tether.worker.main import main\nmain()\n"
+# Test-fixture override (this test only): the worker's tools get a 1 s send timeout so the 2 s
+# chaos lease stays valid. Until lease heartbeats exist (W6.1) the worker refuses any tool whose
+# timeout is not below the lease (ADR-0021 rule 6); the production default stays 10 s.
+WORKER = _PRELUDE + (
+    "import dataclasses\n"
+    "from tether.runtime import driver\n"
+    "_load = driver.load_workload\n"
+    "def _fast(tool):\n"
+    "    return dataclasses.replace(tool, timeout_seconds=1.0)\n"
+    "def _load_with_short_timeouts(name):\n"
+    "    workload = _load(name)\n"
+    "    return dataclasses.replace(\n"
+    "        workload,\n"
+    "        tools=tuple(map(_fast, workload.tools)),\n"
+    "        retained_tools=tuple(map(_fast, workload.retained_tools)),\n"
+    "    )\n"
+    "driver.load_workload = _load_with_short_timeouts\n"
+    "from tether.worker.main import main\n"
+    "main()\n"
+)
 DEMO = (
     "import sys, uvicorn\n"
     "from services.demo_target_service.app import app\n"
@@ -114,6 +133,7 @@ def stack(seeded: Any, tmp_path: Path) -> Iterator[Stack]:
         "TETHER_API_HOST": "127.0.0.1",
         "TETHER_API_PORT": str(api_port),
         # A short lease, so a killed worker's job is taken over quickly (PD-11 chaos override).
+        # The worker's tools run with a 1 s timeout below it (see ``WORKER``).
         "TETHER_WORKER_LEASE_SECONDS": "2",
         "TETHER_WORKER_POLL_INTERVAL_SECONDS": "0.1",
         "TETHER_WORKER_HEARTBEAT_FILE": str(tmp_path / "worker.heartbeat"),

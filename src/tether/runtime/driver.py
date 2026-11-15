@@ -25,9 +25,10 @@ from tether.policy.engine import (
     check_tools_against_policy,
 )
 from tether.providers.protocol import ModelProvider
-from tether.registry.registry import ToolRegistry, load_workload
+from tether.registry.registry import ToolRegistry, WorkloadLoadError, load_workload
 from tether.runtime.checkpointer import SaverPool, create_checkpointer, create_saver_pool
 from tether.runtime.graph import RunContext, build_graph, initial_state
+from tether.sdk import Workload
 from tether.secrets.env_provider import EnvSecretsProvider
 from tether.secrets.keyring import KeyRing
 from tether.settings import Settings
@@ -47,6 +48,16 @@ _WAIT_STATUS = {
     "awaiting_approval": RunStatus.AWAITING_APPROVAL,
     "awaiting_reconciliation": RunStatus.AWAITING_RECONCILIATION,
 }
+
+
+def check_tool_timeouts(workload: Workload, lease_seconds: float) -> None:
+    """Refuse a tool, offered or retained, whose send timeout is not below the job lease."""
+    for tool in (*workload.tools, *workload.retained_tools):
+        if tool.timeout_seconds >= lease_seconds:
+            raise WorkloadLoadError(
+                f"tool {tool.name} {tool.version}: timeout_seconds {tool.timeout_seconds:g} must"
+                f" be below the worker lease ({lease_seconds:g} s) until lease heartbeats exist"
+            )
 
 
 @dataclass
@@ -80,6 +91,10 @@ class WorkerRuntime:
             for ws in bootstrap.workspaces
             for agent in ws.agents
         }
+        # Until lease heartbeats exist (W6.1), a send must end before its job's lease does,
+        # for every version that can still execute (ADR-0021 rule 6).
+        for registry in registries.values():
+            check_tool_timeouts(registry.workload, settings.worker_lease_seconds)
         # Fail closed at startup if a policy allows a high-risk tool (ADR-0020 rule 4).
         for ws in bootstrap.workspaces:
             tools = {

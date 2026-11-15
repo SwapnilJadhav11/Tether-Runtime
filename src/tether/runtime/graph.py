@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tether.core.hashing import CallEnvelope, call_hash, call_hashes_equal, idempotency_key
 from tether.core.ids import AgentId, RunId, WorkspaceId
 from tether.core.results import CallOutcome
-from tether.core.statuses import JobKind, LedgerResolution, RunStatus
+from tether.core.statuses import JobKind, LedgerResolution, OutcomeClass, RunStatus
 from tether.observability import metrics, tracing
 from tether.observability.logging import get_logger
 from tether.policy.config import WorkspaceConfig
@@ -61,6 +61,11 @@ _log = get_logger(__name__)
 _UNREGISTERED = "unregistered"
 # The typed terminal reason of a run that failed closed on a replay divergence (ADR-0003 rule 4).
 REPLAY_DIVERGENCE_REASON = "replay_divergence"
+# The typed not_applied content when a call's pinned version is gone before its ledger row
+# exists (ADR-0011 rule 3, ADR-0021 rule 15).
+TOOL_VERSION_UNAVAILABLE = "tool version unavailable"
+# The typed terminal reason of a run ended by a read configured with fail_run (ADR-0021 rule 9).
+TOOL_EXHAUSTED_PREFIX = "tool_exhausted:"
 
 
 class RunState(TypedDict, total=False):
@@ -73,6 +78,8 @@ class RunState(TypedDict, total=False):
     result: dict[str, Any] | None
     # A replay divergence found by the node that set it (ADR-0003 rule 4); routes to TX-RD.
     divergence: dict[str, Any] | None
+    # A terminating result's typed reason (ADR-0012 rule 6), e.g. ``tool_exhausted:<tool>``.
+    terminating: str | None
     next_step_ordinal: int
     turns: int
     final_text: str | None
@@ -135,15 +142,20 @@ def call_hash_for(
     descriptor: ToolDescriptor,
     args: BaseModel,
 ) -> str:
-    """The keyed call hash (ADR-0010) under the run's pinned binding key. ``run`` is its row."""
+    """The keyed call hash (ADR-0010) under the run's pinned binding key. ``run`` is its row.
+
+    The envelope's ``preconditions`` holds each declared precondition name with its argument
+    value (ADR-0021 rule 5); it is empty, as before W3.2, for a tool that declares none.
+    """
+    arguments = args.model_dump(mode="json")
     envelope = CallEnvelope(
         workspace_id=WorkspaceId(run["workspace_id"]),
         run_id=RunId(str(run["id"])),
         agent_id=AgentId(run["agent_id"]),
         tool=descriptor.name,
         tool_version=descriptor.version,
-        arguments=args.model_dump(mode="json"),
-        preconditions={},
+        arguments=arguments,
+        preconditions={name: arguments[name] for name in descriptor.preconditions},
     )
     key = keys.key(KeyFamily.BINDING, run["binding_key_id"]).secret.reveal()
     return call_hash(envelope, key=key, write=descriptor.effect == "write")
@@ -158,10 +170,25 @@ def _resolve(ctx: RunContext, call: dict[str, Any]) -> tuple[ToolDescriptor, Bas
     return None if isinstance(args, list) else (descriptor, args)
 
 
-def _current_hash(ctx: RunContext, run: Any, call: dict[str, Any]) -> str | None:
-    """The call hash of the current call under the run's binding key; ``None`` if it is invalid."""
+def _offered_hash(ctx: RunContext, run: Any, call: dict[str, Any]) -> str | None:
+    """The call's hash under the currently offered version; ``None`` if it is invalid. Used only
+    to re-check a call recorded as invalid at TX2, which pinned no version."""
     resolved = _resolve(ctx, call)
     return None if resolved is None else call_hash_for(ctx.keys, run, *resolved)
+
+
+def _pinned_hash(
+    ctx: RunContext, run: Any, call: dict[str, Any], descriptor: ToolDescriptor
+) -> str | None:
+    """The call's hash under its pinned descriptor; ``None`` if the arguments do not validate."""
+    args = _validate(descriptor, call["arguments"])
+    return None if isinstance(args, list) else call_hash_for(ctx.keys, run, descriptor, args)
+
+
+def _masked_preconditions(descriptor: ToolDescriptor, args: BaseModel) -> dict[str, Any]:
+    """The declared precondition values, masked like every argument (ADR-0017, ADR-0021)."""
+    masked = mask(args)
+    return {name: masked[name] for name in descriptor.preconditions}
 
 
 def _hashes_match(stored: object, recomputed: str | None) -> bool:
@@ -247,6 +274,15 @@ def _record_decision(uow: UnitOfWork, current: Any, decision: str, tool: str, st
 
 
 def build_graph(ctx: RunContext) -> StateGraph[RunState]:
+    async def reconciled(uow: UnitOfWork) -> list[str]:
+        """Every reconciled outcome of the run, for its terminal summary."""
+        entries = await uow.repository(LedgerRepository, ctx.scope).for_run(ctx.run_id)
+        return [
+            f"{entry['tool']} {entry['resolution']}"
+            for entry in entries
+            if str(entry["resolution"] or "").startswith("reconciled_")
+        ]
+
     async def stopped(uow: UnitOfWork, run: Any) -> RunState:
         """A stopped run ends ``cancelled`` or ``timed_out`` (ADR-0006). The summary names every
         reconciled outcome, so a reconciled stop is never reported as clean."""
@@ -256,13 +292,39 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             if status == RunStatus.CANCELLED
             else "deadline passed"
         )
-        entries = await uow.repository(LedgerRepository, ctx.scope).for_run(ctx.run_id)
-        reconciled = [
-            f"{entry['tool']} {entry['resolution']}"
-            for entry in entries
-            if str(entry["resolution"] or "").startswith("reconciled_")
-        ]
-        return {"end_status": status, "final_text": "; ".join([reason, *reconciled])}
+        return {"end_status": status, "final_text": "; ".join([reason, *await reconciled(uow)])}
+
+    async def check_pinned(
+        uow: UnitOfWork,
+        run: Any,
+        call: dict[str, Any],
+        *,
+        tool: object,
+        version: object,
+        stored: object,
+        path: str,
+    ) -> RunState | None:
+        """Hash-checked adoption under the call's pinned version (ADR-0003 rule 4, ADR-0011,
+        ADR-0021 rule 14). ``None``: the persisted row is for this exact call.
+
+        The pinned ``(tool, version)`` comes from the persisted row, never from what is offered
+        now. If that version no longer resolves and no ledger row exists for the call, the call
+        gets a typed ``not_applied`` and nothing is sent (ADR-0011 rule 3); it is not a
+        divergence. Once a ledger row exists, a missing version keeps the fail-closed divergence
+        path until W5.2. Any other mismatch is a divergence.
+        """
+        if tool != call["tool"] or not isinstance(version, str):
+            return _divergence(call, path=path, stored=stored, recomputed=None)
+        descriptor = ctx.registry.resolve(call["tool"], version)
+        if descriptor is None:
+            ledger = uow.repository(LedgerRepository, ctx.scope)
+            if await ledger.by_ordinal(ctx.run_id, call["step_ordinal"]) is None:
+                return {"result": _result(CallOutcome.NOT_APPLIED, TOOL_VERSION_UNAVAILABLE)}
+            return _divergence(call, path=path, stored=stored, recomputed=None)
+        recomputed = _pinned_hash(ctx, run, call, descriptor)
+        if _hashes_match(stored, recomputed):
+            return None
+        return _divergence(call, path=path, stored=stored, recomputed=recomputed)
 
     async def call_model(state: RunState) -> RunState:
         # G0: the stop predicate before every provider attempt (§9.2).
@@ -386,12 +448,28 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     # Hash-checked adoption (ADR-0003 rule 4): the recorded decision is for
                     # this exact call, or this replay has diverged from what was persisted.
                     stored = adopted.payload.get("call_hash")
-                    recomputed = _current_hash(ctx, run, call)
-                    if adopted.tool != call["tool"] or not _hashes_match(stored, recomputed):
-                        tracing.annotate(current, **{"tether.replay.divergence": True})
-                        return _divergence(
-                            call, path="decision", stored=stored, recomputed=recomputed
+                    if stored is None:
+                        # Recorded as invalid: no version was pinned (ADR-0021 rule 14).
+                        recomputed = _offered_hash(ctx, run, call)
+                        if adopted.tool != call["tool"] or not _hashes_match(stored, recomputed):
+                            tracing.annotate(current, **{"tether.replay.divergence": True})
+                            return _divergence(
+                                call, path="decision", stored=stored, recomputed=recomputed
+                            )
+                    else:
+                        found = await check_pinned(
+                            uow,
+                            run,
+                            call,
+                            tool=adopted.tool,
+                            version=adopted.payload.get("tool_version"),
+                            stored=stored,
+                            path="decision",
                         )
+                        if found is not None:
+                            if found.get("divergence"):
+                                tracing.annotate(current, **{"tether.replay.divergence": True})
+                            return {"decision": adopted.payload, **found}
                     tracing.annotate(
                         current,
                         **{
@@ -456,6 +534,8 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             return "record_divergence"
         if state.get("end_status"):
             return "finalize"
+        if state.get("result"):
+            return "append_result"  # the pinned version is gone (ADR-0021 rule 15)
         decision = state["decision"]
         decision = _required(decision, "decision")
         if decision["decision"] == "allow":
@@ -474,21 +554,30 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             existing = await approvals.by_ordinal(ctx.run_id, ordinal)
             if existing is not None:
-                # Hash-checked get (ADR-0003 rule 4): the request must be for this exact call.
-                recomputed = _current_hash(ctx, run, call)
-                if not _hashes_match(existing["call_hash"], recomputed):
-                    return _divergence(
-                        call, path="approval", stored=existing["call_hash"], recomputed=recomputed
-                    )
-                return {"approval_id": str(existing["id"])}
+                # Hash-checked get (ADR-0003 rule 4): the request must be for this exact call,
+                # under the version it pinned.
+                found = await check_pinned(
+                    uow,
+                    run,
+                    call,
+                    tool=existing["tool"],
+                    version=existing["tool_version"],
+                    stored=existing["call_hash"],
+                    path="approval",
+                )
+                return found if found is not None else {"approval_id": str(existing["id"])}
             if run["stopped"]:
                 return await stopped(uow, run)
-            descriptor = _required(ctx.registry.offered(call["tool"]), "offered tool")
+            # The version the decision pinned, never the one offered now (ADR-0021 rule 14).
+            descriptor = ctx.registry.resolve(call["tool"], decided["tool_version"])
+            if descriptor is None:
+                return {"result": _result(CallOutcome.NOT_APPLIED, TOOL_VERSION_UNAVAILABLE)}
             args = _validate(descriptor, call["arguments"])
             if isinstance(args, list):
                 raise RuntimeError("a decided call no longer validates")
             approval_id = uuid.uuid4()
             masked = mask(args)
+            preconditions = _masked_preconditions(descriptor, args)
             expiry = func.clock_timestamp() + func.make_interval(
                 0, 0, 0, 0, 0, 0, ctx.approval_ttl_seconds
             )
@@ -501,20 +590,23 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "tool": descriptor.name,
                     "tool_version": descriptor.version,
                     "arguments_masked": masked,
-                    "preconditions_masked": {},
+                    "preconditions_masked": preconditions,
                     "expires_at": expiry,
                 }
             )
+            requested: dict[str, Any] = {
+                "approval_id": str(approval_id),
+                "call_hash": decided["call_hash"],
+                "arguments": masked,
+            }
+            if preconditions:
+                requested["preconditions"] = preconditions
             await uow.repository(AuditRepository, ctx.scope).append(
                 ctx.keys,
                 run_id=ctx.run_id,
                 dedupe_key=f"approval_requested:{ordinal}",
                 event_type="APPROVAL_REQUESTED",
-                payload={
-                    "approval_id": str(approval_id),
-                    "call_hash": decided["call_hash"],
-                    "arguments": masked,
-                },
+                payload=requested,
                 tool=descriptor.name,
             )
             # TX3's timer (TX-EA). The same expression, evaluated after the insert, makes it due
@@ -531,7 +623,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     def after_request(state: RunState) -> str:
         if state.get("divergence"):
             return "record_divergence"
-        return "finalize" if state.get("end_status") else "await_approval"
+        if state.get("end_status"):
+            return "finalize"
+        return "append_result" if state.get("result") else "await_approval"
 
     async def await_approval(state: RunState) -> RunState:
         """Wait node: re-read the approval; interrupt while it is pending."""
@@ -541,15 +635,24 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             async with UnitOfWork(ctx.engine) as uow:
                 row = await uow.repository(ApprovalsRepository, ctx.scope).get(approval_id)
                 run = await uow.repository(RunsRepository, ctx.scope).get(ctx.run_id)
-            approval = _required(row, "approval")
-            # The row this lineage waits on must be the request for this exact call.
-            recomputed = _current_hash(ctx, _required(run, "run"), call)
-            if approval["step_ordinal"] != call["step_ordinal"] or not _hashes_match(
-                approval["call_hash"], recomputed
-            ):
-                return _divergence(
-                    call, path="approval_wait", stored=approval["call_hash"], recomputed=recomputed
+                approval = _required(row, "approval")
+                # The row this lineage waits on must be the request for this exact call, under
+                # the version it pinned (ADR-0021 rule 14).
+                if approval["step_ordinal"] != call["step_ordinal"]:
+                    return _divergence(
+                        call, path="approval_wait", stored=approval["call_hash"], recomputed=None
+                    )
+                found = await check_pinned(
+                    uow,
+                    _required(run, "run"),
+                    call,
+                    tool=approval["tool"],
+                    version=approval["tool_version"],
+                    stored=approval["call_hash"],
+                    path="approval_wait",
                 )
+            if found is not None:
+                return found
             if approval["status"] == "approved":
                 return {}
             if approval["status"] == "rejected":
@@ -594,22 +697,32 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             existing = await ledger.by_ordinal(ctx.run_id, ordinal)
             if existing is not None:
                 # Ledger-first, hash-checked (ADR-0003 rules 4 and 6): the row is adopted only
-                # for the exact call it authorized; otherwise this replay has diverged.
-                recomputed = _current_hash(ctx, run, call)
-                if not _hashes_match(existing["call_hash"], recomputed):
-                    return _divergence(
-                        call, path="ledger", stored=existing["call_hash"], recomputed=recomputed
-                    )
-                return {"ledger_id": str(existing["id"])}
+                # for the exact call it authorized, under its pinned version; otherwise this
+                # replay has diverged.
+                found = await check_pinned(
+                    uow,
+                    run,
+                    call,
+                    tool=existing["tool"],
+                    version=existing["tool_version"],
+                    stored=existing["call_hash"],
+                    path="ledger",
+                )
+                return found if found is not None else {"ledger_id": str(existing["id"])}
             if run["stopped"]:
                 return await stopped(uow, run)
-            descriptor = ctx.registry.offered(call["tool"])
-            args = _validate(descriptor, call["arguments"]) if descriptor else []
-            if descriptor is None or isinstance(args, list):
+            # Exactly the version the decision pinned; never a newer one (ADR-0011 rule 3).
+            descriptor = ctx.registry.resolve(call["tool"], decided["tool_version"])
+            if descriptor is None:
+                return {"result": _result(CallOutcome.NOT_APPLIED, TOOL_VERSION_UNAVAILABLE)}
+            args = _validate(descriptor, call["arguments"])
+            if isinstance(args, list):
                 return {"result": _result(CallOutcome.NOT_APPLIED, "tool no longer resolvable")}
             await _assert_current_policy(uow, ctx)
             hashed = call_hash_for(ctx.keys, run, descriptor, args)
             # TX5: the same trusted inputs, re-read under the current policy (ADR-0009 rule 3).
+            # The descriptor is the pinned one: its risk and permissions are version-bound, and
+            # revocation of a pinned action goes through the current policy (ADR-0021 rule 14).
             decision = ctx.policy.evaluate_action(
                 _action_request(ctx, run, descriptor, ordinal, hashed)
             )
@@ -649,12 +762,19 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "idempotency_key": key,
                 }
             )
+            authorized: dict[str, Any] = {
+                "ledger_id": str(entry_id),
+                "call_hash": hashed,
+                "idempotency_key": key,
+            }
+            if descriptor.preconditions:
+                authorized["preconditions"] = _masked_preconditions(descriptor, args)
             await uow.repository(AuditRepository, ctx.scope).append(
                 ctx.keys,
                 run_id=ctx.run_id,
                 dedupe_key=f"authorized:{ordinal}",
                 event_type="EXECUTION_AUTHORIZED",
-                payload={"ledger_id": str(entry_id), "call_hash": hashed, "idempotency_key": key},
+                payload=authorized,
                 tool=descriptor.name,
                 policy_version=decision.policy_version,
             )
@@ -684,16 +804,25 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             async with UnitOfWork(ctx.engine) as uow:
                 entry = await uow.repository(LedgerRepository, ctx.scope).get(uuid.UUID(ledger_id))
                 run = await uow.repository(RunsRepository, ctx.scope).get(ctx.run_id)
-            entry = _required(entry, "ledger entry")
-            # The outcome this lineage waits on must belong to this exact call: a divergent
-            # replay can never attach one call's outcome to another call (AD-10).
-            recomputed = _current_hash(ctx, _required(run, "run"), call)
-            if entry["step_ordinal"] != call["step_ordinal"] or not _hashes_match(
-                entry["call_hash"], recomputed
-            ):
-                return _divergence(
-                    call, path="ledger_wait", stored=entry["call_hash"], recomputed=recomputed
+                entry = _required(entry, "ledger entry")
+                # The outcome this lineage waits on must belong to this exact call, under its
+                # pinned version: a divergent replay can never attach one call's outcome to
+                # another call (AD-10).
+                if entry["step_ordinal"] != call["step_ordinal"]:
+                    return _divergence(
+                        call, path="ledger_wait", stored=entry["call_hash"], recomputed=None
+                    )
+                found = await check_pinned(
+                    uow,
+                    _required(run, "run"),
+                    call,
+                    tool=entry["tool"],
+                    version=entry["tool_version"],
+                    stored=entry["call_hash"],
+                    path="ledger_wait",
                 )
+            if found is not None:
+                return found
             resolution = entry["resolution"]
             if entry["state"] == "completed":
                 if resolution == LedgerResolution.RECONCILED_APPLIED:
@@ -703,6 +832,20 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             if entry["state"] == "failed":
                 if resolution == LedgerResolution.RECONCILED_NOT_APPLIED:
                     return {"result": _result(CallOutcome.NOT_APPLIED, {"resolution": resolution})}
+                outcome_class = entry["outcome_class"]
+                if outcome_class == OutcomeClass.NOT_APPLIED:
+                    # Positive evidence the action did not apply (ADR-0021 rule 11).
+                    return {"result": _result(CallOutcome.NOT_APPLIED, entry["outcome_reason"])}
+                pinned = ctx.registry.resolve(entry["tool"], entry["tool_version"])
+                if (
+                    outcome_class == OutcomeClass.UNKNOWN
+                    and pinned is not None
+                    and pinned.on_exhausted == "fail_run"
+                ):
+                    # A terminating result (ADR-0012 rule 6, ADR-0021 rules 8-9): no history,
+                    # no skip events, no further model call.
+                    return {"terminating": f"{TOOL_EXHAUSTED_PREFIX}{entry['tool']}"}
+                # ``unknown`` and ``failed``, and unclassified historical rows (before 0004).
                 return {"result": _result(CallOutcome.FAILED, entry["outcome_reason"])}
             if entry["state"] == "abandoned":
                 # ADR-0007: abandon terminates the run; no further model call (TX11).
@@ -716,7 +859,30 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     def after_await_tool(state: RunState) -> str:
         if state.get("divergence"):
             return "record_divergence"
+        if state.get("terminating"):
+            return "drain_terminating"
         return "finalize" if state.get("end_status") else "append_result"
+
+    async def drain_terminating(state: RunState) -> RunState:
+        """Wait node for a terminating result (ADR-0012 rule 6, ADR-0021 rule 9).
+
+        External truth first: while any ledger entry of the run is unresolved, the run is held
+        for reconciliation (ADR-0018) and nothing is terminalized. Then the established rules
+        decide: an active stop ends it ``cancelled``/``timed_out`` (ADR-0006), with the reason in
+        the summary; otherwise it ends ``failed`` with the reason and any reconciled outcome.
+        """
+        reason = _required(state.get("terminating"), "terminating reason")
+        while True:
+            async with UnitOfWork(ctx.engine) as uow:
+                held = await uow.repository(LedgerRepository, ctx.scope).unresolved(ctx.run_id)
+                if not held:
+                    run = await uow.repository(RunsRepository, ctx.scope).share_lock(ctx.run_id)
+                    if run["stopped"]:
+                        ended = await stopped(uow, run)
+                        return {**ended, "final_text": f"{ended['final_text']}; {reason}"}
+                    summary = "; ".join([reason, *await reconciled(uow)])
+                    return {"end_status": RunStatus.FAILED, "final_text": summary}
+            interrupt("awaiting_reconciliation")
 
     async def record_divergence(state: RunState) -> RunState:
         """TX-RD: the replay divergence as a fenced, create-or-get decision-class audit event.
@@ -921,6 +1087,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     graph.add_node("append_result", append_result)
     graph.add_node("record_divergence", record_divergence)
     graph.add_node("drain_divergence", drain_divergence)
+    graph.add_node("drain_terminating", drain_terminating)
     graph.add_node("finalize", finalize)
     graph.add_edge(START, "call_model")
     graph.add_conditional_edges(
@@ -933,7 +1100,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         ["finalize", "authorize_call", "request_approval", "append_result", "record_divergence"],
     )
     graph.add_conditional_edges(
-        "request_approval", after_request, ["finalize", "await_approval", "record_divergence"]
+        "request_approval",
+        after_request,
+        ["finalize", "await_approval", "append_result", "record_divergence"],
     )
     graph.add_conditional_edges(
         "await_approval",
@@ -946,12 +1115,15 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         ["finalize", "append_result", "await_tool", "record_divergence"],
     )
     graph.add_conditional_edges(
-        "await_tool", after_await_tool, ["finalize", "append_result", "record_divergence"]
+        "await_tool",
+        after_await_tool,
+        ["finalize", "append_result", "record_divergence", "drain_terminating"],
     )
     graph.add_conditional_edges(
         "append_result", after_append, ["next_call", "finalize", "record_divergence"]
     )
     graph.add_edge("record_divergence", "drain_divergence")
     graph.add_edge("drain_divergence", "finalize")
+    graph.add_edge("drain_terminating", "finalize")
     graph.add_edge("finalize", END)
     return graph

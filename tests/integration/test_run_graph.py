@@ -248,7 +248,7 @@ async def test_a_persisted_decision_is_adopted_not_re_decided(
         "SELECT workspace_id, agent_id, binding_key_id FROM tether.runs WHERE id = %s",
         run_id,
     )
-    descriptor = runtime.registries["incident_remediation"].resolve("get_service_health")
+    descriptor = runtime.registries["incident_remediation"].offered("get_service_health")
     assert descriptor is not None
     decided_hash = call_hash_for(
         runtime.keys,
@@ -271,6 +271,8 @@ async def test_a_persisted_decision_is_adopted_not_re_decided(
                 "decision": "deny",
                 "reasons": ["recorded earlier"],
                 "call_hash": decided_hash,
+                # Every recorded decision pins the version it governed (ADR-0011 rule 1).
+                "tool_version": descriptor.version,
             },
             tool="get_service_health",
         )

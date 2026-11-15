@@ -108,7 +108,7 @@ Cross-workspace tool sharing; inline human override / mid-run instruction inject
 | U-004 | **Resolved 2026-11-12 (W2.1):** final guarantee wording and evidence links accepted; G-9, G-12, G-13, G-14 and G-16 reworded to the evidence; P-16 and P-17 recorded as implemented-but-unproven evidence gaps | `tether-v1-guarantees.md` (accepted), `docs/testing/strategy.md` §4 |
 | U-006 | Measured V1 limits (concurrency, latency, tool duration, lease, database) | PRD success metrics, `docs/testing/strategy.md` |
 | U-007 | PostgreSQL RPO/RTO, deployment posture, restore validation | `docs/operations/postgres-recovery.md` |
-| U-008 | Exact policy and tool-contract schema | Architecture §6–§7 (gate), plan workstream 3 |
+| U-008 | Exact policy and tool-contract schema | Architecture §6–§7 (gate), plan workstream 3. **Resolved by the owner on 2026-11-15:** policy half in [ADR-0020](../adr/0020-v1-policy-engine-contract.md) (W3.1), tool-contract half in [ADR-0021](../adr/0021-v1-tool-contract.md) (W3.2). Left open by ADR-0021 rule 18: the verify-operation policy mapping (W5.1). |
 | U-009 | Verification semantics detail beyond ADR-0019's rules | ADR-0019 "Questions for acceptance" |
 | U-010 | Approval operational semantics (race, revalidation, masking detail) | Plan workstream 4, PRD approvals |
 | U-011 | Comparison protocol | Plan workstream 11 |

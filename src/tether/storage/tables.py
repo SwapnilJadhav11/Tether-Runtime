@@ -212,6 +212,9 @@ ledger_entries = Table(
     Column("attempts", Integer, nullable=False, server_default=text("0")),
     Column("outcome_payload_masked", JSONB),
     Column("outcome_reason", Text),
+    # ADR-0021 rule 10 (migration 0004): applied / not_applied / unknown / failed; NULL for
+    # entries recorded before 0004.
+    Column("outcome_class", Text),
     Column("resolution", Text),
     Column("resolved_by", Text),
     Column("justification", Text),
