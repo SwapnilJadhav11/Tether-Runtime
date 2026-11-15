@@ -85,5 +85,5 @@ Do not run old and new writers across this migration at the same time. If an old
 
 - Events written before `0003` are version 1: valid as written, never re-MACed, and **their timestamps remain cryptographically uncovered**. W2.4 makes no retroactive protection claim.
 - Deletion or truncation of a chain's tail, or of a whole run, remains outside the HMAC guarantee (ADR-0015 rule 8).
-- `tether audit verify` is still planned (P-9); chain validity is exposed through run inspection until then.
+- `tether audit verify --workspace <ws> --run <run-id>` recomputes one run's chain from the database (needs `TETHER_DATABASE_URL` and the audit keys in the environment; read-only). Exit codes: `0` VALID, `1` INVALID (stable reason code and first failing `seq`), `2` usage or configuration, `3` operational (database or audit key unavailable; never reported as INVALID), `4` NOT_FOUND (an unknown run and a run in another workspace look identical). It also checks that the persisted head names an existing event with the same MAC, which exposes deleting events while leaving the head alone. It does **not** detect deleting events *and* rewriting the head, or deleting the whole run (ADR-0015 rule 8). Chain validity is also exposed through run inspection.
 - TX5 refusals still write no audit event of their own (P-16).

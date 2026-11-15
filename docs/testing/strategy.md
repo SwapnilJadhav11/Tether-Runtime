@@ -74,7 +74,7 @@ Coverage at baseline: C-01–C-07; a crash after each of the twelve critical com
 | P-6 policy inputs (PLANNED) | TDR-008 | `policy/engine.py` (tool + roles only) | `test_policy_config.py`, `test_reconciliation_eligibility.py` (current inputs) | — | `static` | T-06 extended; W3.1 |
 | P-7 repair/denial bound (PLANNED) | D-11 | `max_model_turns` only | `test_run_graph.py::test_invalid_proposals_are_recorded_and_not_executed` (typed result only) | — | `integration` | T-22: loop stops at the bound; W3.4 |
 | P-8 per-tool expiry (PLANNED) | D-8 | global `approval_ttl_seconds` | `test_cancellation_deadlines.py::test_t15_*` (global expiry) | `test_approve_vs_expiry_*` | `integration`, `chaos` | T-15 per-tool default and maximum; W4.2 |
-| P-9 `tether audit verify` (PLANNED) | D-10 | `verify_run` via inspection only | `audit_chain_valid` in inspection | — | `integration` | T-13 CLI exit codes; W4.3 |
+| P-9 `tether audit verify` *(closed)* | D-10 | `tests/integration/test_audit_verify_cli.py` (real Postgres chains, reordering, head check, exit codes) | `tests/unit/test_cli_audit_verify.py` | — | `integration` | none for P-9 |
 | P-10 T-24 matrix (PLANNED) | D-10; ADR-0013 | existing routes only | `test_authentication.py` (core cases, two workspaces) | — | `integration` | `tests/authz/` data-driven matrix; route inventory guard; W4.1, W4.3, W4.4 |
 | P-11 provider portability (PLANNED) | TDR-003/004; ADR-0016 | `providers/protocol.py`, `history.py`; scripted only | `test_scripted_provider.py` | — | `static` | adapter round-trips; OpenAI contract run (manual dispatch); W3.3, W9.1 |
 | P-12 GitHub sandbox (PLANNED) | U-001; OD-9 | — | — | — | — | T-30 credentialed suite; W9.2 |
@@ -90,7 +90,6 @@ Behaviour that exists in the code but has no test asserting it. Each item needs 
 
 1. **TX5 refusals** (`graph.py::_authorize`): "call changed since its decision", "policy now: deny", "no matching approval", "approval lapsed"; and `PolicyStaleError` raised at TX5. (G-1, G-12; P-16.)
 2. **End-to-end `Sensitive` masking**: a run whose tool output and arguments carry a `Sensitive` field, asserting `ledger_entries.outcome_payload_masked`, `approvals.arguments_masked`, the `APPROVAL_REQUESTED` payload and the inspection response. (G-14; P-17.)
-3. **Audit chain reordering**: swap two events' `seq` as the superuser and assert `verify_run` is false. (G-13.)
 4. **Approval route stale policy**: `POST /v1/approvals/{id}/{action}` returns `503` and changes nothing when the active version differs. (G-15.)
 5. **Agent or configuration unavailable mid-run**: today `driver._fail` marks the run `failed` even with an unresolved ledger entry. Owner disposition (2026-11-12): a correctness gap, scheduled in W5.2 with the required semantics recorded in the scope delta (I-4) and the card §3; regression tests must cover the hold with an unresolved effect, the typed configuration-unavailable failure without one, and the audit/inspection visibility of the unresolved or reconciled action. (G-6.)
 6. **Version or payload invalid after dispatch**: a `dispatched` entry whose tool version is unresolvable is left without an outcome or a wake (ADR-0011; W5.2). (G-4.)
