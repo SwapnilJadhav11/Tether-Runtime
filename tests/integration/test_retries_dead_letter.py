@@ -43,10 +43,12 @@ from tether.worker.main import process_next_job
 WS = "ws-q"
 POLICY = {
     "rules": [
-        {"tool": name, "decision": "allow", "requester_roles": ["operator"]}
+        {"tool": name, "decision": "allow"}
         for name in ("probe_read", "probe_idem", "probe_nonidem")
     ],
     "reconciliation": {"reconciler_roles": ["reconciler"]},
+    "role_permissions": {"operator": ["probe:read", "probe:write"]},
+    "agent_permissions": {"agent-q": ["probe:read", "probe:write"]},
 }
 BOOT = BootstrapFile.model_validate(
     {
@@ -139,6 +141,8 @@ def _tool(name: str, effect: Any, idempotency: Any, handler: Any) -> ToolDescrip
         effect=effect,
         idempotency=idempotency,
         handler=handler,
+        risk="low",
+        required_permissions=("probe:read",) if effect == "read" else ("probe:write",),
     )
 
 

@@ -46,6 +46,8 @@ get_service_health = ToolDescriptor(
     output_model=ServiceHealth,
     effect="read",
     handler=_get_service_health,
+    risk="low",
+    required_permissions=("service:read",),
 )
 
 restart_service = ToolDescriptor(
@@ -57,4 +59,6 @@ restart_service = ToolDescriptor(
     effect="write",
     idempotency="supported",
     handler=_restart_service,
+    risk="high",
+    required_permissions=("service:restart",),
 )

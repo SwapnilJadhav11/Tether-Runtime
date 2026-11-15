@@ -42,6 +42,8 @@ from tether.testing.scripted import ScriptedProvider
 from tether.worker.main import process_next_job
 
 WS, AGENT = "ws-a", "agent-1"
+# Every permission the harness's tools require (reference workload tools and the probes).
+PERMISSIONS = ("service:read", "service:restart", "probe:write")
 TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "abandoned"}
 
 BOOT = BootstrapFile.model_validate(
@@ -62,6 +64,9 @@ BOOT = BootstrapFile.model_validate(
                         {"tool": "probe_nonidem", "decision": "allow"},
                     ],
                     "reconciliation": {"reconciler_roles": ["reconciler"]},
+                    # ADR-0020: requester permissions (by role) ∩ agent permissions.
+                    "role_permissions": {"operator": list(PERMISSIONS)},
+                    "agent_permissions": {AGENT: list(PERMISSIONS)},
                 },
             }
         ]
@@ -180,6 +185,8 @@ def _probe(name: str, idempotency: Any, handler: Any) -> ToolDescriptor:
         effect="write",
         idempotency=idempotency,
         handler=handler,
+        risk="low",
+        required_permissions=("probe:write",),
     )
 
 

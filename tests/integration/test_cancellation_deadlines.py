@@ -41,17 +41,18 @@ WS = "ws-c"
 OTHER_WS = "ws-c2"
 POLICY = {
     "rules": [
-        {"tool": "get_service_health", "decision": "allow", "requester_roles": ["operator"]},
+        {"tool": "get_service_health", "decision": "allow"},
         {
             "tool": "restart_service",
             "decision": "require_approval",
-            "requester_roles": ["operator"],
             "approver_roles": ["oncall"],
         },
-        {"tool": "probe_idem", "decision": "allow", "requester_roles": ["operator"]},
-        {"tool": "probe_nonidem", "decision": "allow", "requester_roles": ["operator"]},
+        {"tool": "probe_idem", "decision": "allow"},
+        {"tool": "probe_nonidem", "decision": "allow"},
     ],
     "reconciliation": {"reconciler_roles": ["reconciler"]},
+    "role_permissions": {"operator": ["service:read", "service:restart", "probe:write"]},
+    "agent_permissions": {"agent-c": ["service:read", "service:restart", "probe:write"]},
 }
 BOOT = BootstrapFile.model_validate(
     {
@@ -130,6 +131,8 @@ def _probe(name: str, idempotency: Any) -> ToolDescriptor:
         effect="write",
         idempotency=idempotency,
         handler=TARGET.send,
+        risk="low",
+        required_permissions=("probe:write",),
     )
 
 

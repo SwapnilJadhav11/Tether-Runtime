@@ -1,9 +1,14 @@
 """Bootstrap configuration file: workspaces, agents, identity and declarative policy.
 
-ADR-0014, ADR-0009, ADR-0013. Policy comes only from this file (invariant 11). Each workspace's
-policy has a content hash, ``policy_version`` = SHA-256 of the RFC 8785 canonical JSON of its
-``policy`` section. ``tether bootstrap apply`` records and activates that version; api and worker
-processes load the same file and only decide under the version that is active in the database.
+ADR-0014, ADR-0009, ADR-0013, ADR-0020. Policy comes only from this file (invariant 11). Each
+workspace's ``policy_version`` is the SHA-256 of the RFC 8785 canonical JSON of its ``policy``
+section together with ``EVALUATOR_VERSION`` (ADR-0009 rule 4), so a change to either is a new
+version. ``tether bootstrap apply`` records and activates that version; api and worker processes
+load the same file and only decide under the version that is active in the database.
+
+The V1 policy (ADR-0020) is declarative: one rule per tool, ``role_permissions`` (what each
+requester role grants) and ``agent_permissions`` (what each agent may do). Permissions are
+``resource:action`` strings, matched exactly.
 
 Identity config holds no secrets: issuers carry public verification keys only (private key
 material is rejected), and API keys carry only a salt and a SHA-256 hash (PD-20).
@@ -14,17 +19,29 @@ from __future__ import annotations
 import hashlib
 from functools import cached_property
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from tether.core.canonical import canonicalize
+from tether.sdk.tools import PERMISSION
 
 NonEmpty = Field(min_length=1)
+# The built-in evaluator's semantics version; part of every policy version (ADR-0009 rule 4).
+EVALUATOR_VERSION = "builtin-1"
+Permission = Annotated[str, StringConstraints(pattern=f"^{PERMISSION.pattern}$")]
+Name = Annotated[str, StringConstraints(min_length=1)]
 
 
 class BootstrapConfigError(ValueError):
@@ -36,14 +53,20 @@ class _Strict(BaseModel):
 
 
 class PolicyRule(_Strict):
-    """Matches one tool. Rules are checked in order; no matching rule means deny."""
+    """The rule for one tool (at most one per tool). No rule for a tool means deny."""
 
     tool: str = NonEmpty
     decision: Literal["allow", "require_approval", "deny"]
-    # If set, the rule matches only requesters holding one of these roles.
-    requester_roles: tuple[str, ...] | None = None
-    # For require_approval: an approver needs one of these roles (and must not be the requester).
-    approver_roles: tuple[str, ...] = ()
+    # Exactly for require_approval: an approver needs one of these roles (never the requester).
+    approver_roles: tuple[Name, ...] = ()
+
+    @model_validator(mode="after")
+    def _approver_roles_only_where_needed(self) -> PolicyRule:
+        if self.decision == "require_approval" and not self.approver_roles:
+            raise ValueError(f"rule for {self.tool}: require_approval needs approver_roles")
+        if self.decision != "require_approval" and self.approver_roles:
+            raise ValueError(f"rule for {self.tool}: approver_roles only on require_approval")
+        return self
 
 
 class ReconciliationPolicy(_Strict):
@@ -56,6 +79,21 @@ class ReconciliationPolicy(_Strict):
 class PolicyConfig(_Strict):
     rules: tuple[PolicyRule, ...] = ()
     reconciliation: ReconciliationPolicy = ReconciliationPolicy()
+    # Requester permissions are the union over the requester's roles (ADR-0020).
+    role_permissions: dict[Name, tuple[Permission, ...]] = Field(default_factory=dict)
+    # Agent permissions; an agent without an entry has none, which is a deny.
+    agent_permissions: dict[Name, tuple[Permission, ...]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _one_rule_per_tool(self) -> PolicyConfig:
+        tools = [rule.tool for rule in self.rules]
+        duplicates = sorted({tool for tool in tools if tools.count(tool) > 1})
+        if duplicates:
+            raise ValueError(f"more than one policy rule for {duplicates}")
+        return self
+
+    def rule_for(self, tool: str) -> PolicyRule | None:
+        return next((rule for rule in self.rules if rule.tool == tool), None)
 
 
 class AgentConfig(_Strict):
@@ -119,6 +157,9 @@ class WorkspaceConfig(_Strict):
             unknown = set(key.agents) - agent_ids
             if unknown:
                 raise ValueError(f"api key {key.key_id}: unknown agent(s) {sorted(unknown)}")
+        unknown_agents = set(self.policy.agent_permissions) - agent_ids
+        if unknown_agents:
+            raise ValueError(f"agent_permissions: unknown agent(s) {sorted(unknown_agents)}")
         for values, what in (
             ([issuer.id for issuer in self.issuers], "issuer id"),
             ([issuer.iss for issuer in self.issuers], "issuer iss"),
@@ -130,7 +171,8 @@ class WorkspaceConfig(_Strict):
 
     @cached_property
     def policy_version(self) -> str:
-        canonical = canonicalize(self.policy.model_dump(mode="json"), allow_floats=False)
+        document = {"evaluator": EVALUATOR_VERSION, "policy": self.policy.model_dump(mode="json")}
+        canonical = canonicalize(document, allow_floats=False)
         return hashlib.sha256(canonical).hexdigest()
 
     def agent(self, agent_id: str) -> AgentConfig | None:

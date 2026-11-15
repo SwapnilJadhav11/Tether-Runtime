@@ -43,17 +43,17 @@ BOOT = BootstrapFile.model_validate(
                 "agents": [{"id": "agent-g", "workload": "incident_remediation"}],
                 "policy": {
                     "rules": [
-                        {
-                            "tool": "get_service_health",
-                            "decision": "allow",
-                            "requester_roles": ["operator"],
-                        },
+                        {"tool": "get_service_health", "decision": "allow"},
                         {
                             "tool": "restart_service",
                             "decision": "require_approval",
                             "approver_roles": ["oncall"],
                         },
-                    ]
+                    ],
+                    # ADR-0020: only the operator role grants these; a requester without it is
+                    # denied (deny by default).
+                    "role_permissions": {"operator": ["service:read", "service:restart"]},
+                    "agent_permissions": {"agent-g": ["service:read", "service:restart"]},
                 },
             }
         ]

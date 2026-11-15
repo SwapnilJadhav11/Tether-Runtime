@@ -28,6 +28,7 @@ Architecture Decision Records (ADRs) for Tether V1. Each ADR records one signifi
 | [0017](0017-sensitive-data-masking-choke-point.md) | Sensitive-data masking at a single choke point | accepted | 2026-10-06 |
 | [0018](0018-awaiting-reconciliation-hold.md) | Clarification of ADR-0006: a run awaiting reconciliation is held until its ledger entries are resolved | accepted | 2026-11-08 |
 | [0019](0019-automatic-verification-of-unknown-outcomes.md) | Execution ledger, honest outcomes, bounded automatic verification of unknown outcomes, human reconciliation as the fallback (complete restatement superseding ADR-0007) | accepted | 2026-11-09 |
+| [0020](0020-v1-policy-engine-contract.md) | Clarification of ADR-0009: the V1 policy engine contract, mandatory separation of duties and trusted policy inputs (amends ADR-0009 rule 1 on separation of duties and SDK rule code) | accepted | 2026-11-15 |
 
 ADR-0019 was accepted on 2026-11-09 and supersedes ADR-0007 (rules 1–6 carried over; rules 7–8 replaced). Its design is **required, not yet implemented** (plan W5.1); the baseline behaviour is still human-only reconciliation.
 

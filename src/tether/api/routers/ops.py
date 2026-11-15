@@ -32,7 +32,11 @@ from tether.core.statuses import (
 from tether.identity.principal import Principal
 from tether.observability import metrics, tracing
 from tether.observability.logging import get_logger
-from tether.policy.engine import evaluate_reconciliation_eligibility
+from tether.policy.engine import (
+    BuiltinPolicyEngine,
+    ReconciliationEligibilityRequest,
+    TrustedRequester,
+)
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.ledger import LedgerRepository
 from tether.storage.repos.runs import JobsRepository, PolicyVersionsRepository, RunsRepository
@@ -76,7 +80,8 @@ async def reconcile_entry(
     workspace = request.app.state.bootstrap.workspace(principal.workspace_id)
     if workspace is None or not principal.has_role(RECONCILER_ROLE):
         raise not_found
-    reconciler = principal.requester  # ``{sub, roles}`` of the reconciling person
+    reconciler = TrustedRequester.from_snapshot(principal.requester)  # the reconciling person
+    policy = BuiltinPolicyEngine(workspace)
     new_state, resolution = _RESOLUTIONS[outcome]
     resolved = Reconciled(ledger_id=ledger_id, state=new_state, resolution=resolution)
     async with UnitOfWork(request.app.state.db_engine) as uow:
@@ -90,11 +95,18 @@ async def reconcile_entry(
         if entry is None:
             raise not_found
         active = await uow.repository(PolicyVersionsRepository, scope).active_version()
-        if active != workspace.policy_version:
+        if active != policy.policy_version:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "policy is reloading")
-        if not evaluate_reconciliation_eligibility(
-            workspace, reconciler=reconciler, requester=run["requester_snapshot"]
-        ):
+        # Eligibility (ADR-0020): a configured reconciler role, and never the run's requester.
+        eligibility = policy.evaluate_reconciliation_eligibility(
+            ReconciliationEligibilityRequest(
+                workspace_id=scope.workspace_id,
+                reconciler=reconciler,
+                requester=TrustedRequester.from_snapshot(run["requester_snapshot"]),
+                tool_name=entry["tool"],
+            )
+        )
+        if not eligibility.eligible:
             raise not_found
         if entry["state"] != LedgerState.INDETERMINATE:
             if entry["resolution"] == resolution:
@@ -135,7 +147,7 @@ async def reconcile_entry(
                 },
                 actor=principal.subject,
                 tool=entry["tool"],
-                policy_version=workspace.policy_version,
+                policy_version=eligibility.policy_version,
             )
             await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run["id"])
         uow.on_commit(lambda: metrics.reconciled(outcome))

@@ -28,7 +28,15 @@ from tether.core.statuses import JobKind, LedgerResolution, RunStatus
 from tether.observability import metrics, tracing
 from tether.observability.logging import get_logger
 from tether.policy.config import WorkspaceConfig
-from tether.policy.engine import PolicyStaleError, evaluate_action
+from tether.policy.engine import (
+    ActionContext,
+    ActionRequest,
+    PolicyEngine,
+    PolicyStaleError,
+    ToolPolicyMetadata,
+    TrustedAgent,
+    TrustedRequester,
+)
 from tether.providers.history import ModelTurn, NeutralMessage
 from tether.providers.protocol import ModelProvider, ProviderError
 from tether.registry.masking import mask
@@ -84,6 +92,8 @@ class RunContext:
     generation: int
     max_turns: int
     approval_ttl_seconds: int
+    # The workspace's policy engine (ADR-0020), built from the same loaded configuration.
+    policy: PolicyEngine
 
 
 def initial_state(system_prompt: str, task_input: dict[str, Any]) -> RunState:
@@ -177,9 +187,26 @@ def _divergence(
     }
 
 
+def _action_request(
+    ctx: RunContext, run: Any, descriptor: ToolDescriptor, ordinal: int, call_hash_hex: str
+) -> ActionRequest:
+    """The trusted policy input for one call (ADR-0020): the run's requester snapshot, agent and
+    workspace, the registry descriptor and runtime metadata. Never the model's arguments or
+    text; ``trusted_attributes`` stays empty in V1."""
+    return ActionRequest(
+        workspace_id=ctx.scope.workspace_id,
+        requester=TrustedRequester.from_snapshot(run["requester_snapshot"]),
+        agent=TrustedAgent(str(run["agent_id"])),
+        tool=ToolPolicyMetadata.from_descriptor(descriptor),
+        context=ActionContext(
+            run_id=str(ctx.run_id), step_ordinal=ordinal, call_hash=call_hash_hex
+        ),
+    )
+
+
 async def _assert_current_policy(uow: UnitOfWork, ctx: RunContext) -> None:
     active = await uow.repository(PolicyVersionsRepository, ctx.scope).active_version()
-    if active != ctx.workspace.policy_version:
+    if active != ctx.policy.policy_version:
         raise PolicyStaleError(f"workspace {ctx.scope.workspace_id} policy is {active}")
 
 
@@ -399,13 +426,14 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     _record_decision(uow, current, "invalid", label, call["step_ordinal"])
                     return {"decision": payload}
                 await _assert_current_policy(uow, ctx)
-                decision = evaluate_action(
-                    ctx.workspace, tool=descriptor.name, requester=run["requester_snapshot"]
+                decided_hash = call_hash_for(ctx.keys, run, descriptor, args)
+                decision = ctx.policy.evaluate_action(
+                    _action_request(ctx, run, descriptor, call["step_ordinal"], decided_hash)
                 )
                 payload = {
                     "decision": decision.outcome,
                     "reasons": list(decision.reasons),
-                    "call_hash": call_hash_for(ctx.keys, run, descriptor, args),
+                    "call_hash": decided_hash,
                     "tool_version": descriptor.version,
                     "approver_roles": list(decision.approver_roles),
                 }
@@ -580,10 +608,11 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             if descriptor is None or isinstance(args, list):
                 return {"result": _result(CallOutcome.NOT_APPLIED, "tool no longer resolvable")}
             await _assert_current_policy(uow, ctx)
-            decision = evaluate_action(
-                ctx.workspace, tool=descriptor.name, requester=run["requester_snapshot"]
-            )
             hashed = call_hash_for(ctx.keys, run, descriptor, args)
+            # TX5: the same trusted inputs, re-read under the current policy (ADR-0009 rule 3).
+            decision = ctx.policy.evaluate_action(
+                _action_request(ctx, run, descriptor, ordinal, hashed)
+            )
             if not call_hashes_equal(hashed, decided["call_hash"]):
                 return {"result": _result(CallOutcome.DENIED, "call changed since its decision")}
             if decision.outcome == "deny":

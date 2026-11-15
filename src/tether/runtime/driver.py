@@ -19,6 +19,11 @@ from tether.core.statuses import RunStatus
 from tether.observability import metrics, tracing
 from tether.observability.logging import get_logger
 from tether.policy.config import BootstrapFile, load_bootstrap
+from tether.policy.engine import (
+    BuiltinPolicyEngine,
+    ToolPolicyMetadata,
+    check_tools_against_policy,
+)
 from tether.providers.protocol import ModelProvider
 from tether.registry.registry import ToolRegistry, load_workload
 from tether.runtime.checkpointer import SaverPool, create_checkpointer, create_saver_pool
@@ -75,6 +80,14 @@ class WorkerRuntime:
             for ws in bootstrap.workspaces
             for agent in ws.agents
         }
+        # Fail closed at startup if a policy allows a high-risk tool (ADR-0020 rule 4).
+        for ws in bootstrap.workspaces:
+            tools = {
+                tool.name: ToolPolicyMetadata.from_descriptor(tool)
+                for agent in ws.agents
+                for tool in registries[agent.workload].workload.tools
+            }
+            check_tools_against_policy(ws, tools)
         dsn = settings.database_url.get_secret_value()
         pool = create_saver_pool(dsn, name="tether-worker-langgraph")
         await pool.open(wait=False)
@@ -140,6 +153,7 @@ async def drive(
         generation=generation,
         max_turns=runtime.settings.max_model_turns,
         approval_ttl_seconds=runtime.settings.approval_ttl_seconds,
+        policy=BuiltinPolicyEngine(workspace),
     )
     graph = build_graph(ctx).compile(checkpointer=runtime.checkpointer)
     config: Any = {"configurable": {"thread_id": str(run_id)}}

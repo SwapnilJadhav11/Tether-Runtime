@@ -249,6 +249,7 @@ flowchart TD
 ### AD-05 — `PolicyEngine` protocol with three decision points and versioned policy
 
 - **Problem:** One engine must decide tool actions, approval eligibility, and reconciliation eligibility; built-in now, Cedar/OPA later; decisions must be attributable to a policy version.
+- **V1 contract (W3.1, [ADR-0020](../adr/0020-v1-policy-engine-contract.md), implemented 2026-11-15):** `PolicyEngine` with `evaluate_action(ActionRequest) → PolicyDecision`, `evaluate_approval_eligibility(ApprovalEligibilityRequest) → Eligibility` and `evaluate_reconciliation_eligibility(ReconciliationEligibilityRequest) → Eligibility`; trusted inputs only (requester snapshot, agent, workspace, registry risk and required permissions, runtime metadata, and an empty runtime-attested `trusted_attributes`); permissions from versioned `role_permissions` ∩ `agent_permissions`; risk `low`/`high`, a high-risk tool is never allowed (refused at worker startup, `deny` at runtime); one rule per tool; separation of duties built in; no SDK rule code in V1. The paragraph below is the original design.
 - **How:** Protocol methods:
   - `evaluate_action(input) → Decision{allow|deny|require_approval, reasons, policy_version}` — input: requester snapshot, agent identity, workspace, `ToolDescriptor` (risk, effect, required permissions — **from the registry only**), canonical call hash, run metadata.
   - `evaluate_approval_eligibility(approver, requester, approval) → bool`

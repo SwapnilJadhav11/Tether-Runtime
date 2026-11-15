@@ -21,7 +21,11 @@ from tether.core.statuses import TERMINAL_RUN_STATUSES, JobKind
 from tether.identity.principal import Principal
 from tether.observability import metrics, tracing
 from tether.observability.logging import get_logger
-from tether.policy.engine import evaluate_action, evaluate_approval_eligibility
+from tether.policy.engine import (
+    ApprovalEligibilityRequest,
+    BuiltinPolicyEngine,
+    TrustedRequester,
+)
 from tether.storage.repos.approvals import ApprovalsRepository
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.runs import JobsRepository, PolicyVersionsRepository, RunsRepository
@@ -54,7 +58,8 @@ async def decide_approval(
     workspace = request.app.state.bootstrap.workspace(principal.workspace_id)
     if workspace is None or not principal.has_role(APPROVER_ROLE):
         raise not_found
-    approver = principal.requester  # ``{sub, roles}`` of the deciding person
+    approver = TrustedRequester.from_snapshot(principal.requester)  # the deciding person
+    policy = BuiltinPolicyEngine(workspace)
     new_status = _DECISIONS[action]
     async with UnitOfWork(request.app.state.db_engine) as uow:
         approvals = uow.repository(ApprovalsRepository, scope)
@@ -67,14 +72,19 @@ async def decide_approval(
         if approval is None:
             raise not_found
         active = await uow.repository(PolicyVersionsRepository, scope).active_version()
-        if active != workspace.policy_version:
+        if active != policy.policy_version:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "policy is reloading")
-        decision = evaluate_action(
-            workspace, tool=approval["tool"], requester=run["requester_snapshot"]
+        # Eligibility (ADR-0020): a role named by the tool's require_approval rule, and never
+        # the run's requester.
+        eligibility = policy.evaluate_approval_eligibility(
+            ApprovalEligibilityRequest(
+                workspace_id=scope.workspace_id,
+                approver=approver,
+                requester=TrustedRequester.from_snapshot(run["requester_snapshot"]),
+                tool_name=approval["tool"],
+            )
         )
-        if not evaluate_approval_eligibility(
-            decision, approver=approver, requester=run["requester_snapshot"]
-        ):
+        if not eligibility.eligible:
             raise not_found
         if (
             approval["status"] != "pending"
@@ -99,7 +109,7 @@ async def decide_approval(
                 status=new_status,
                 decided_by=principal.subject,
                 reason=reason,
-                policy_version=decision.policy_version,
+                policy_version=eligibility.policy_version,
             )
             if not decided:
                 raise conflict
@@ -111,7 +121,7 @@ async def decide_approval(
                 payload={"approval_id": str(approval_id), "status": new_status, "reason": reason},
                 actor=principal.subject,
                 tool=approval["tool"],
-                policy_version=decision.policy_version,
+                policy_version=eligibility.policy_version,
             )
             await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, run["id"])
         waited = (datetime.now(UTC) - approval["created_at"]).total_seconds()

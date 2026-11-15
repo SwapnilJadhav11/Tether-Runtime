@@ -51,3 +51,9 @@ workspaces:
       # Who may resolve an indeterminate write (ADR-0007); never the run's requester.
       reconciliation:
         reconciler_roles: [reconciler]
+      # ADR-0020: requester permissions (by role) ∩ agent permissions must cover a tool's
+      # required permissions; approver and reconciler roles grant no tool permissions.
+      role_permissions:
+        operator: [service:read, service:restart]
+      agent_permissions:
+        incident-remediator: [service:read, service:restart]

@@ -41,6 +41,7 @@ from tether.testing.scripted import ScriptedProvider
 from tether.worker.main import process_next_job
 
 WS, OTHER_WS = "ws-a", "ws-b"
+PERMISSIONS = ("service:read", "service:restart", "probe:write")
 TASKS, APPROVALS, OPS = "tether-tasks", "tether-approvals", "tether-ops"
 
 
@@ -102,6 +103,8 @@ def _workspace(
                 {"tool": "probe_nonidem", "decision": "allow"},
             ],
             "reconciliation": {"reconciler_roles": ["sre"]},
+            "role_permissions": {"operator": list(PERMISSIONS)},
+            "agent_permissions": {agent: list(PERMISSIONS) for agent in agents},
         },
     }
 
@@ -157,6 +160,8 @@ PROBE = ToolDescriptor(
     effect="write",
     idempotency="unsupported",
     handler=_drop,
+    risk="low",
+    required_permissions=("probe:write",),
 )
 TEST_WORKLOAD = Workload(
     name=WORKLOAD.name,

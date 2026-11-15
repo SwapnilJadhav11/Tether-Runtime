@@ -11,8 +11,12 @@ from pydantic import BaseModel
 
 Effect = Literal["read", "write"]
 IdempotencySupport = Literal["supported", "unsupported"]
+# Fixed tool metadata for policy (ADR-0020): a high-risk tool is never allowed automatically.
+Risk = Literal["low", "high"]
 
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# A permission is ``resource:action``, lowercase, matched exactly (no wildcards, ADR-0020).
+PERMISSION = re.compile(r"[a-z0-9][a-z0-9_.-]*:[a-z0-9][a-z0-9_.-]*")
 
 
 class Sensitive:
@@ -49,6 +53,10 @@ class ToolDescriptor:
     output_model: type[BaseModel]
     effect: Effect
     handler: ToolHandler
+    # Policy metadata (ADR-0020): ``low`` or ``high``, and the permissions every caller (the
+    # requester and the agent) must hold. Both are required; risk is never derived from a call.
+    risk: Risk
+    required_permissions: tuple[str, ...]
     # Required for writes: whether the target honours the forwarded idempotency key.
     idempotency: IdempotencySupport | None = None
     # Send attempts per call (PD-14), shared by retries and redeliveries. Only reads and
@@ -66,6 +74,15 @@ class ToolDescriptor:
             raise ValueError(f"tool {self.name}: effect must be read or write")
         if self.effect == "write" and self.idempotency is None:
             raise ValueError(f"write tool {self.name} must declare its idempotency support")
+        if self.risk not in ("low", "high"):
+            raise ValueError(f"tool {self.name}: risk must be low or high")
+        if not isinstance(self.required_permissions, tuple) or not self.required_permissions:
+            raise ValueError(f"tool {self.name}: at least one required permission is needed")
+        for permission in self.required_permissions:
+            if not isinstance(permission, str) or not PERMISSION.fullmatch(permission):
+                raise ValueError(
+                    f"tool {self.name}: permission {permission!r} is not resource:action"
+                )
 
 
 @dataclass(frozen=True)
