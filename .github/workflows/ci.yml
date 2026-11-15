@@ -46,6 +46,11 @@ jobs:
       - name: Unit tests
         run: uv run poe test-unit
 
+      # Both providers over a mocked transport: no network, no database, no credential. The
+      # live OpenAI proof (marker `live`) is manual dispatch only and never runs here.
+      - name: Provider contract tests (T-11, deterministic)
+        run: uv run poe test-provider-contract
+
   # The database-backed suites run on Linux against deploy/compose/docker-compose.test.yml (a
   # tmpfs Postgres started fresh per job), with throwaway credentials generated in the runner.
   integration:

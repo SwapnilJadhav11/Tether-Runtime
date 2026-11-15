@@ -10,6 +10,9 @@ dependencies = [
     # Exact pins (PD-22): bump only with the S1.3 LangGraph contract suite green.
     "langgraph==1.2.14",
     "langgraph-checkpoint-postgres==3.1.2",
+    # The first hosted model provider (TDR-004). Imported only by providers/openai_provider.py;
+    # the SDK sits on `httpx2`, and its automatic retries are switched off there.
+    "openai>=3.51.0",
     "opentelemetry-exporter-otlp-proto-http>=1.29",
     "opentelemetry-sdk>=1.29",
     "psycopg-pool>=3.2",
@@ -40,6 +43,8 @@ incident_remediation = "workloads.incident_remediation:WORKLOAD"
 [dependency-groups]
 dev = [
     "httpx>=0.28",
+    # The OpenAI SDK's transport: the provider tests mock it, so they import it directly.
+    "httpx2>=2.13",
     "hypothesis>=6.100",
     "import-linter>=2.1",
     "mypy>=1.13",
@@ -49,7 +54,8 @@ dev = [
     "ruff>=0.8",
     "types-pyyaml>=6.0",
 ]
-# Live model-provider tests (PRD T-11). Populated when the provider adapters are implemented.
+# Live model-provider tests (PRD T-11) need nothing beyond the runtime dependencies: the OpenAI
+# SDK ships with the package.
 live = []
 
 [build-system]
@@ -203,6 +209,14 @@ sequence = [
 default_item_type = "cmd"
 envfile = "deploy/compose/.env"
 
+[tool.poe.tasks.test-provider-contract]
+help = "Provider contract suite on the scripted provider and the OpenAI adapter (no network, no database)"
+cmd = "pytest tests/contract/providers -m 'not live'"
+
+[tool.poe.tasks.test-live]
+help = "Live provider proof against the real OpenAI API (T-11). Needs TETHER_MODEL_PROVIDER=openai, TETHER_OPENAI_API_KEY and TETHER_OPENAI_MODEL; skips without them. Never run in ordinary CI."
+cmd = "pytest tests/contract/providers -m live"
+
 [tool.poe.tasks.test-contract]
 help = "LangGraph semantics contract suite on the pinned versions (required on every LangGraph bump)"
 sequence = [
@@ -230,5 +244,5 @@ sequence = [
 default_item_type = "cmd"
 
 [tool.poe.tasks.ci]
-help = "Static checks run by CI: lint, typecheck, contracts, unit tests"
-sequence = ["lint", "typecheck", "contracts", "test-unit"]
+help = "Static checks run by CI: lint, typecheck, contracts, unit and provider-contract tests"
+sequence = ["lint", "typecheck", "contracts", "test-unit", "test-provider-contract"]

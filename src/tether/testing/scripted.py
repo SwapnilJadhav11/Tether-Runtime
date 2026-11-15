@@ -16,7 +16,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tether.providers.history import ModelTurn, NeutralMessage, ToolCallProposal
-from tether.providers.protocol import ProviderError
+from tether.providers.protocol import ProviderCapabilities, ProviderError
 
 _MARKER = re.compile(r"#scenario=([A-Za-z0-9_-]+)")
 
@@ -51,6 +51,15 @@ class ScriptedProvider:
         if env == "prod":
             raise ScenarioError("the scripted provider is for dev and test only")
         self._dir = scenarios_dir
+
+    def capabilities(self) -> ProviderCapabilities:
+        # A scenario can script several calls in one turn, but there is no control to switch
+        # that off, and there is no context window to report: both are declared honestly.
+        return ProviderCapabilities(
+            tool_calling=True,
+            parallel_tool_calls_controllable=False,
+            context_window_tokens=None,
+        )
 
     def _scenario(self, history: Sequence[NeutralMessage]) -> _Scenario:
         first_user = next((m for m in history if m.role == "user"), None)

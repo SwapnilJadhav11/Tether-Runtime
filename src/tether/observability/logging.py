@@ -55,8 +55,9 @@ _PATTERNS = (
 # Secret values (not names) to scrub; filled at startup from settings and the key ring.
 _SECRETS: set[str] = set()
 _MIN_SECRET_LENGTH = 8
-# Libraries whose INFO lines carry request URLs, which can contain tool arguments.
-_QUIET = ("httpx", "httpcore")
+# Libraries whose INFO lines carry request URLs, which can contain tool arguments. `httpx2` and
+# `httpcore2` are the successors a model provider SDK sits on; they log the same way.
+_QUIET = ("httpx", "httpcore", "httpx2", "httpcore2")
 
 
 def register_secret(value: str | None) -> None:

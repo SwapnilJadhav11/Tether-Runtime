@@ -281,6 +281,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         history = [NeutralMessage.model_validate(m) for m in state["history"]]
         turn: ModelTurn | None = None
         failure = ""
+        # The provider's normalised, label-safe code, never its own error prose, which can quote
+        # the request. Recorded on the attempt row below (ADR-0016 rule 5).
+        error_code: str | None = None
         with tracing.span(
             "model.call",
             attributes={
@@ -294,6 +297,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 turn = await ctx.provider.complete(history, ctx.registry.manifest())
             except ProviderError as error:
                 failure = f"model call failed: {error}"
+                error_code = error.code
                 tracing.mark_error(current, type(error).__name__)
             outcome = "failed" if turn is None else "succeeded"
             metrics.model_call(ctx.provider.name, outcome, time.monotonic() - started)
@@ -307,6 +311,10 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         if turn is None:
             _log.warning("model call failed", provider=ctx.provider.name, turn=state["turns"])
         async with UnitOfWork(ctx.engine) as uow:
+            # Usage as the provider reported it, or nothing: it is never estimated, and a field
+            # the provider omitted stays null. Dollar cost is deferred (D-7), so `cost_usd` is
+            # left unwritten rather than derived from a price table.
+            usage = turn.usage if turn is not None else None
             await uow.repository(ModelCallsRepository, ctx.scope).add(
                 {
                     "id": uuid.uuid4(),
@@ -318,6 +326,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "attempt": 1,
                     "occurrence_id": uuid.uuid4(),
                     "status": "failed" if turn is None else "succeeded",
+                    "input_tokens": usage.input_tokens if usage is not None else None,
+                    "output_tokens": usage.output_tokens if usage is not None else None,
+                    "error_code": error_code,
                     "started_at": func.clock_timestamp(),
                     "finished_at": func.clock_timestamp(),
                 }
