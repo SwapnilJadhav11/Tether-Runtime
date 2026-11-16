@@ -25,6 +25,7 @@ import psycopg
 import pytest
 import yaml
 from pydantic import BaseModel, SecretStr
+from tests.support.db_connect import connect_with_retry
 from workloads.incident_remediation import WORKLOAD
 from workloads.incident_remediation import client as demo_client
 
@@ -346,6 +347,7 @@ class Env:
     tmp_path: Path
     # Extra worker settings (e.g. a short lease and heartbeat interval); empty = the defaults.
     overrides: dict[str, Any] = field(default_factory=dict)
+    _conn: psycopg.Connection[Any] | None = field(default=None, init=False, repr=False)
 
     def settings(self) -> Settings:
         bootstrap_file = self.tmp_path / "bootstrap.yaml"
@@ -459,8 +461,22 @@ class Env:
     # -- database --
 
     def sql(self, statement: str, *params: Any) -> list[tuple[Any, ...]]:
-        with psycopg.connect(self.db.migrator_dsn) as conn:
-            return conn.execute(statement, params).fetchall()
+        """One statement as the schema owner, in its own transaction (autocommit).
+
+        Tests poll through this helper, so it reuses one connection per ``Env`` instead of
+        opening one per call (ephemeral-port churn on the Windows host); ``close()`` ends it.
+        """
+        if self._conn is None or self._conn.closed or self._conn.broken:
+            self.close()
+            self._conn = connect_with_retry(self.db.migrator_dsn, autocommit=True)
+        return self._conn.execute(statement, params).fetchall()
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
 
     def status(self, run_id: uuid.UUID) -> str:
         return str(self.sql("SELECT status FROM tether.runs WHERE id = %s", run_id)[0][0])
