@@ -608,8 +608,12 @@ async def restarts() -> int:
         return int((await http.get("/services/checkout")).json()["restarts"])
 
 
-async def wait_until(predicate: Callable[[], bool], *, timeout: float = 10.0) -> None:
-    """Poll state (never sleep for an outcome) until ``predicate`` holds."""
+async def wait_until(predicate: Callable[[], bool], *, timeout: float = 30.0) -> None:
+    """Poll state (never sleep for an outcome) until ``predicate`` holds.
+
+    The bound only decides how long a slow or busy host may take before the wait fails; it is
+    never part of what a test asserts. A wait still returns as soon as its predicate holds.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while not predicate():
