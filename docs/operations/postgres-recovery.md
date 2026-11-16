@@ -31,7 +31,7 @@ The demo target's `demo_target` database is demo data; it is not Tether state an
 ## 2. Behaviour during database unavailability
 
 - `api`: requests fail (readiness `/readyz` reports not ready); clients retry. No intent is lost because every submission, decision, reconciliation and cancellation is a single transaction that either committed or did not.
-- `worker`: leasing, heartbeating (once implemented) and every transaction fail; nothing progresses. Jobs whose leases expire during the outage are redelivered afterwards under the per-kind rules of ADR-0004.
+- `worker`: leasing, lease heartbeats (W6.1; a handler whose heartbeat finds no database for a full lease is aborted as worker death) and every transaction fail; nothing progresses. Jobs whose leases expire during the outage are redelivered afterwards under the per-kind rules of ADR-0004.
 - Side effects: a tool call that was in flight when the database went down cannot record its outcome; when the database returns, its ledger entry is still `dispatched`. Idempotent writes are re-sent with the same key within their budget; non-idempotent writes and exhausted budgets become `indeterminate` and wait for verification (ADR-0019, once implemented) or human reconciliation. No write is lost or silently duplicated.
 - Timers (approval expiry, run deadline) fire late but are also enforced at decision time against the database clock, so no decision is made on an expired approval or past a deadline.
 
@@ -63,7 +63,7 @@ Do not back up only the `tether` schema or only the `langgraph` schema.
 After a restore, before declaring recovery complete:
 
 - `/readyz` on `api` returns ready; the worker heartbeat file is fresh.
-- Run inspection on a sample of runs from before the restore point returns a timeline whose chain-valid flag is true. *(`tether audit verify --workspace <ws>` is the planned command, D-10; until it exists, inspection's chain flag is the check.)*
+- Run inspection on a sample of runs from before the restore point returns a timeline whose chain-valid flag is true. `tether audit verify --workspace <ws> --run <run-id>` recomputes a run's chain and also checks the persisted head (`production-configuration.md` §6.3).
 - Count runs in `awaiting_reconciliation` and ledger entries in `indeterminate`; each must be visible in inspection and resolvable (§6.3).
 - Count jobs in `leased` with `lease_expires_at` in the past: they must be re-leased within one poll interval.
 - Confirm `policy_versions` has exactly one active row per workspace and that `api`/`worker` started (they refuse to start on a version mismatch, ADR-0009).

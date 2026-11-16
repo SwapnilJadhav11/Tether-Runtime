@@ -46,7 +46,7 @@ Tether uses four key families. Key IDs exist for all of them, so rotation by ove
 
 - `tether keys check-retirement` and any automated retirement guard.
 - Automated rotation schedules or reminders.
-- Verification tooling for chains under retired keys beyond `tether audit verify` (itself planned for V1, D-10).
+- Verification tooling for chains under retired keys beyond `tether audit verify` (implemented, P-9).
 - HKDF-derived key families from a master secret (PD-21 fallback design); V1 uses independent random keys.
 - Vault or cloud secret-manager integration (`SecretsProvider` seam exists).
 

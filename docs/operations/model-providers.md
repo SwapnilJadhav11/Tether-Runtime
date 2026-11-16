@@ -1,7 +1,7 @@
 # Model providers: configuration and credentials
 
-> **Status:** written for the parallel provider slice (plan W9.1, with the configuration-selection
-> part of W3.3). It documents only what is implemented on this branch. It is not a guarantee
+> **Status:** written for the provider work (plan W9.1, with the configuration-selection part of
+> W3.3), now merged. It documents only what is implemented. It is not a guarantee
 > statement: `docs/product/tether-v1-guarantees.md` remains the authority on what is proven.
 
 Tether chooses its model provider from configuration alone (ADR-0016 rule 6). The run graph,
@@ -20,7 +20,14 @@ a vendor, so switching provider changes no code.
 | `TETHER_PROVIDER_MAX_ATTEMPTS` | `3` | Provider attempts per model turn, retries included (W3.3). Must be positive. |
 | `TETHER_MAX_REPAIRS`, `TETHER_MAX_DENIALS` | `3`, `3` | The repair/denial bound per run (W3.4, PD-15). Must be positive. |
 
-`TETHER_ENV` still governs the scripted provider: it refuses to load when `TETHER_ENV=prod`.
+`TETHER_ENV` still governs the scripted provider: since W7.1 it loads only when `TETHER_ENV` is
+`dev` or `test` (an allow-list; `prod`, unset and misspelt values are refused), and `TETHER_ENV`
+itself has no default.
+
+**Not yet run against the real API (2026-11-16).** The adapter is proven against a mocked
+transport and a local stub only. The live tests (`uv run poe test-live`) skip without credentials
+and have never been run; paid calls wait for the owner's confirmation of the model and a spend
+limit.
 
 The compose stack (`deploy/compose/docker-compose.yml`) passes `TETHER_MODEL_PROVIDER`,
 `TETHER_OPENAI_MODEL` and `TETHER_OPENAI_API_KEY` from `deploy/compose/.env` to `api` and
@@ -82,8 +89,8 @@ attempt's row and checks the stop again. A stop committed at any point ends the 
 attempt failing, ends the run `failed`. After a worker crash mid-sequence the node re-runs from
 attempt 1; every attempt still gets its own row and none is deduplicated.
 
-A slow model call can outlive the 60-second job lease. That is safe (the per-run lock and the
-fencing token still hold) and goes away with lease heartbeats (W6.1).
+A slow model call no longer outlives its job lease: since W6.1 the worker extends the lease of
+the job it is processing with a heartbeat (and the per-run lock and the fencing token still hold).
 
 ### Error classification
 
