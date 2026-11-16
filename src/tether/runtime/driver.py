@@ -161,6 +161,8 @@ async def drive(
         approval_ttl_seconds=runtime.settings.approval_ttl_seconds,
         policy=BuiltinPolicyEngine(workspace),
         provider_max_attempts=runtime.settings.provider_max_attempts,
+        max_repairs=runtime.settings.max_repairs,
+        max_denials=runtime.settings.max_denials,
     )
     graph = build_graph(ctx).compile(checkpointer=runtime.checkpointer)
     config: Any = {"configurable": {"thread_id": str(run_id)}}

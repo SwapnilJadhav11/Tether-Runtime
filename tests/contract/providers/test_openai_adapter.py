@@ -236,38 +236,43 @@ async def test_missing_usage_is_reported_as_unknown() -> None:
     assert turn.usage is None
 
 
-async def test_arguments_that_are_not_valid_json_are_a_malformed_call() -> None:
-    """Invalid model output is never a provider failure (ADR-0016 rule 4)."""
+@pytest.mark.parametrize(
+    "raw",
+    ['{"service": "checkout", "note": "raw-model-text"', '["checkout", "raw-model-text"]', "7"],
+    ids=["not-json", "not-an-object", "a-number"],
+)
+async def test_t22_unparseable_arguments_are_a_malformed_proposal_not_a_provider_failure(
+    raw: str,
+) -> None:
+    """Invalid model output is never a provider failure (ADR-0016 rule 4): the call arrives as
+    a malformed proposal with no arguments, and the raw text is dropped (ADR-0017)."""
     body = {
         "output": [
             {
                 "type": "function_call",
                 "call_id": "call_0",
                 "name": "restart_service",
-                "arguments": '{"service": "checkout"',
+                "arguments": raw,
             }
         ]
     }
     provider = openai_provider(ok(body))
-    with pytest.raises(MalformedToolCallError) as raised:
-        await complete(provider, HISTORY)
-    assert raised.value.retryable is False
+    turn = await complete(provider, HISTORY)
+    [call] = turn.tool_calls
+    assert (call.call_id, call.tool, call.arguments, call.malformed) == (
+        "call_0",
+        "restart_service",
+        {},
+        True,
+    )
+    assert "raw-model-text" not in turn.model_dump_json()
+    assert "raw-model-text" not in repr(turn)
 
 
-async def test_arguments_that_are_not_an_object_are_a_malformed_call() -> None:
-    body = {
-        "output": [
-            {
-                "type": "function_call",
-                "call_id": "call_0",
-                "name": "restart_service",
-                "arguments": '["checkout"]',
-            }
-        ]
-    }
-    provider = openai_provider(ok(body))
-    with pytest.raises(MalformedToolCallError):
-        await complete(provider, HISTORY)
+async def test_a_well_formed_call_is_not_marked_malformed() -> None:
+    provider = openai_provider(ok(openai_response_body(TurnSpec(calls=(("get", {"a": 1}),)))))
+    [call] = (await complete(provider, HISTORY)).tool_calls
+    assert call.malformed is False
 
 
 async def test_a_tool_call_without_a_call_id_is_malformed() -> None:
