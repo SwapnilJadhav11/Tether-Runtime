@@ -219,6 +219,10 @@ ledger_entries = Table(
     Column("resolved_by", Text),
     Column("justification", Text),
     _created_at(),
+    # ADR-0019 (migration 0005): probes started by the verification gate (TX-V1), and the masked
+    # evidence of the definitive result that resolved the entry (TX-V2).
+    Column("verification_attempts", Integer, nullable=False, server_default=text("0")),
+    Column("verification_evidence_masked", JSONB),
     PrimaryKeyConstraint("id", name="pk_ledger_entries"),
     UniqueConstraint("run_id", "step_ordinal", name="uq_ledger_entries_run_id_step_ordinal"),
     UniqueConstraint("idempotency_key", name="uq_ledger_entries_idempotency_key"),

@@ -164,6 +164,9 @@ MAX_ATTEMPTS = {
     JobKind.EXECUTE_TOOL: 5,
     JobKind.EXPIRE_APPROVAL: 10,
     JobKind.RUN_DEADLINE: 10,
+    # One job per probe (ADR-0019 rule 9): deliveries beyond one are redeliveries after a crash
+    # or a lost lease, each of which re-runs the gate. Not a PD-14 value: chosen in W5.1.
+    JobKind.VERIFY_OUTCOME: 5,
 }
 
 
