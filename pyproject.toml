@@ -241,6 +241,15 @@ sequence = [
 default_item_type = "cmd"
 envfile = "deploy/compose/.env"
 
+[tool.poe.tasks.test-flake-gate]
+help = "Flake gate: run the chaos suite N times (default 20; arguments go to scripts/flake_gate.py). The caller holds the shared database lock"
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "python scripts/flake_gate.py",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
 [tool.poe.tasks.test-perf]
 help = "Load and kill harness (several in-process workers; parameters via TETHER_PERF_* variables)"
 sequence = [

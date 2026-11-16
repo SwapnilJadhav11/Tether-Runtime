@@ -34,4 +34,8 @@ async def env(seeded: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> A
     # Retries are due at once (PD-13 backoff is covered by the retry tests), so a drain reaches
     # every outcome without sleeping.
     monkeypatch.setattr(backoff, "tool_backoff_seconds", lambda attempt, rng=None: 0.0)
-    yield make_env(seeded.db, tmp_path)
+    chaos_env = make_env(seeded.db, tmp_path)
+    try:
+        yield chaos_env
+    finally:
+        chaos_env.close()
