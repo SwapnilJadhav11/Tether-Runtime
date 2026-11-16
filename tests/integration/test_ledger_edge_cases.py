@@ -188,6 +188,8 @@ SCENARIOS = {
     "set": scenario("set", [("kv_set", SET_B)]),
     "put": scenario("put", [("kv_put", SET_B)]),
     "gated": scenario("gated", [("kv_set_gated", SET_B)]),
+    "set_strict": scenario("set_strict", [("kv_set", SET_B), ("kv_get_strict", {"key": "cfg"})]),
+    "set_get": scenario("set_get", [("kv_set", SET_B), ("kv_get", {"key": "cfg"})]),
 }
 
 
@@ -746,3 +748,79 @@ async def test_pd33_a_read_with_invalid_output_is_still_a_typed_failure(
     assert TARGET.sends == 1
     assert tool_results(runtime) == [("failed", "failed: output invalid")]
     assert not [t for t in stored_texts(seeded, run_id) if "s3cr3t-unvalidated-output" in t]
+
+
+# --- on_exhausted interplay (ADR-0021 rules 7-9) ------------------------------------------------
+
+
+@pytest.mark.parametrize("strict", [True, False], ids=["fail_run", "typed_failure"])
+@pytest.mark.asyncio
+async def test_on_exhausted_configuration_unavailable_decides_over_either_setting(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path, strict: bool
+) -> None:
+    """With the configuration gone the graph never runs, so ``on_exhausted`` is never consulted:
+    the read's honest outcome is recorded and the run ends with the configuration reason."""
+    name = "strict" if strict else "get"
+    run_id, entry = await dispatched_after_one_failed_send(runtime, seeded, tmp_path, name)
+    assert entry.state == "dispatched"
+    runtime.bootstrap = WITHOUT_AGENT
+    add_wake(seeded, run_id)
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class) == ("failed", "unknown")
+    assert run_status(seeded, run_id) == ("failed", CONFIGURATION_UNAVAILABLE)
+    assert model_calls(runtime) == 1
+    assert TARGET.sends == 1
+
+
+@pytest.mark.parametrize("strict", [True, False], ids=["fail_run", "typed_failure"])
+@pytest.mark.asyncio
+async def test_on_exhausted_a_read_whose_version_is_gone_after_dispatch_is_a_typed_failure(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path, strict: bool
+) -> None:
+    """The pinned descriptor, and with it ``on_exhausted``, is gone; ADR-0021 rule 7 triggers
+    ``fail_run`` on a spent send budget or TX12, neither of which happened. The read gets the
+    typed failure of ADR-0011 rule 5 and the model goes on."""
+    name, tool = ("strict", "kv_get_strict") if strict else ("get", "kv_get")
+    run_id, _ = await dispatched_after_one_failed_send(runtime, seeded, tmp_path, name)
+    use(runtime, without(tool))
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class) == ("failed", "unknown")
+    reason = "outcome unknown: tool version not resolvable; not re-sent"
+    assert tool_results(runtime) == [("failed", reason)]
+    assert run_status(seeded, run_id) == ("succeeded", f"{name} done")
+    assert TARGET.sends == 1
+
+
+@pytest.mark.asyncio
+async def test_on_exhausted_fail_run_after_a_pd33_write_terminates_and_keeps_the_write_applied(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    """A PD-33 write is applied, so the turn goes on (no skip); the read that follows then
+    exhausts with ``fail_run`` and terminates the run. The write stays recorded as applied."""
+    TARGET.script[:] = ["invalid", "error", "error", "error"]
+    run_id = await submit(seeded, tmp_path, "set_strict")
+    await drain(runtime)
+    written, read = ledger(seeded, run_id)
+    assert (written.tool, written.state) == ("kv_set", "completed")
+    assert written.outcome_class == "applied"
+    assert written.outcome_reason == "applied: output invalid"
+    assert (read.tool, read.state, read.outcome_class) == ("kv_get_strict", "failed", "unknown")
+    assert run_status(seeded, run_id) == ("failed", "tool_exhausted:kv_get_strict")
+    assert "CALL_SKIPPED" not in events(seeded, run_id)
+    assert model_calls(runtime) == 1
+    assert TARGET.store["cfg"] == "b"
+
+
+@pytest.mark.asyncio
+async def test_on_exhausted_typed_failure_after_a_pd33_write_reaches_the_model(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    TARGET.script[:] = ["invalid", "error", "error", "error"]
+    run_id = await submit(seeded, tmp_path, "set_get")
+    await drain(runtime)
+    assert [outcome for outcome, _ in tool_results(runtime)] == ["applied", "failed"]
+    assert tool_results(runtime)[0] == ("applied", json.dumps({"output_invalid": True}))
+    assert run_status(seeded, run_id) == ("succeeded", "set_get done")
+    assert TARGET.sends == 4
