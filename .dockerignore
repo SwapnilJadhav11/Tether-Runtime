@@ -1,7 +1,9 @@
-# The image needs pyproject.toml, uv.lock, README.md, src/, workloads/ and config/ (see Dockerfile).
+# The images need pyproject.toml, uv.lock, README.md, src/ and workloads/; only the dev image also
+# takes config/ (see Dockerfile).
 .git
 .github
 .claude
+.local-context
 .venv
 **/__pycache__
 **/*.py[cod]

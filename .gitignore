@@ -22,6 +22,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!.env.production.example
 
 # Dev token issuer private keys: never committed; only public keys belong in bootstrap config
 tools/dev_issuer/.keys/
