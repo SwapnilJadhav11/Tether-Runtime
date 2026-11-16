@@ -89,6 +89,9 @@ def _settings(db: Any, tmp_path: Path) -> Settings:
         bootstrap_file=bootstrap_file,
         scenarios_dir=tmp_path,
         worker_poll_interval_seconds=0.05,
+        # One attempt per turn: these tests pin what a single row carries. Retries, and the row
+        # each retry writes, are covered by test_provider_retry.py (W3.3).
+        provider_max_attempts=1,
     )
 
 

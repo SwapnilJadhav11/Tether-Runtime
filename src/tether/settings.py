@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_timeout_seconds: float = Field(default=60.0, gt=0)
 
+    # Provider attempts per model turn (W3.3, ADR-0016 rule 3): a retryable error is retried until
+    # this many attempts were made, with the PD-13 backoff between them; every attempt is recorded.
+    provider_max_attempts: int = Field(default=3, gt=0)
+
     max_model_turns: int = Field(default=8, gt=0)
     # How long an approval request stays decidable (expiry is checked at decision time).
     approval_ttl_seconds: int = Field(default=3600, gt=0)
