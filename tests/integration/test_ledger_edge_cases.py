@@ -575,3 +575,96 @@ async def test_i4_a_stop_keeps_precedence_once_every_effect_is_resolved(
     reason = "cancelled by alice" if stop == "cancel" else "deadline passed"
     assert summary == f"{reason}; kv_put reconciled_not_applied; {CONFIGURATION_UNAVAILABLE}"
     assert model_calls(runtime) == 1
+
+
+# --- ADR-0011 rule 5: the pinned version gone once a ledger row exists --------------------------
+
+
+def without(*names: str) -> Workload:
+    """A deployment that no longer has (offers or retains) the named tools."""
+    return workload(*(t for t in TOOLS if t.name not in names))
+
+
+@pytest.mark.asyncio
+async def test_adr0011_a_dispatched_write_whose_version_is_gone_is_indeterminate_not_diverged(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    run_id, entry = await dispatched_after_one_failed_send(runtime, seeded, tmp_path, "set")
+    assert entry.state == "dispatched"
+    use(runtime, without("kv_set"))
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class, entry.attempts) == ("indeterminate", "unknown", 1)
+    assert entry.outcome_reason == "outcome unknown: tool version not resolvable; not re-sent"
+    assert TARGET.sends == 1  # nothing re-sent
+    assert run_status(seeded, run_id) == ("awaiting_reconciliation", None)
+    assert "REPLAY_DIVERGENCE" not in events(seeded, run_id)
+    await reconcile(seeded, tmp_path, entry.id, "applied")
+    await drain(runtime)
+    # A deployment is not a divergence: the run continues with the reconciled outcome.
+    assert run_status(seeded, run_id) == ("succeeded", "set done")
+    assert tool_results(runtime) == [("applied", json.dumps({"resolution": "reconciled_applied"}))]
+    assert "REPLAY_DIVERGENCE" not in events(seeded, run_id)
+    assert (await view(seeded, tmp_path, run_id))["audit_chain_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_adr0011_a_dispatched_read_whose_version_is_gone_is_a_typed_failure(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    run_id, entry = await dispatched_after_one_failed_send(runtime, seeded, tmp_path, "get")
+    assert entry.state == "dispatched"
+    use(runtime, without("kv_get"))
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class) == ("failed", "unknown")
+    assert TARGET.sends == 1
+    reason = "outcome unknown: tool version not resolvable; not re-sent"
+    assert tool_results(runtime) == [("failed", reason)]
+    assert run_status(seeded, run_id) == ("succeeded", "get done")
+    assert "REPLAY_DIVERGENCE" not in events(seeded, run_id)
+
+
+@pytest.mark.asyncio
+async def test_adr0011_a_pending_entry_whose_version_is_gone_is_not_applied_and_the_run_goes_on(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    run_id = await submit(seeded, tmp_path, "set")
+    await drain(runtime, ["advance_run"])
+    assert [e.state for e in ledger(seeded, run_id)] == ["pending"]
+    use(runtime, without("kv_set"))
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class) == ("failed", "not_applied")
+    assert TARGET.sends == 0
+    assert tool_results(runtime) == [("not_applied", "not applied: tool version not resolvable")]
+    assert run_status(seeded, run_id) == ("succeeded", "set done")
+    assert "REPLAY_DIVERGENCE" not in events(seeded, run_id)
+
+
+@pytest.mark.asyncio
+async def test_adr0011_a_version_gone_never_excuses_rows_that_disagree(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    """Without the descriptor the persisted rows must agree; a ledger row whose hash differs
+    from the call's decision is still a divergence, and nothing is sent."""
+    run_id, entry = await dispatched_after_one_failed_send(runtime, seeded, tmp_path, "set")
+    sql(
+        seeded,
+        "UPDATE tether.ledger_entries SET call_hash = %s WHERE id = %s RETURNING id",
+        "d" * 64,
+        entry.id,
+    )
+    use(runtime, without("kv_set"))
+    add_wake(seeded, run_id)
+    await drain(runtime)
+    assert "REPLAY_DIVERGENCE" in events(seeded, run_id)
+    assert TARGET.sends == 1
+    # The divergence drains: the unresolved write holds the run until a human resolves it.
+    [entry] = ledger(seeded, run_id)
+    assert entry.state == "indeterminate"
+    assert run_status(seeded, run_id) == ("awaiting_reconciliation", None)
+    await reconcile(seeded, tmp_path, entry.id, "not_applied")
+    await drain(runtime)
+    assert run_status(seeded, run_id) == ("failed", "replay_divergence")
+    assert model_calls(runtime) == 1

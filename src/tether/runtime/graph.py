@@ -339,6 +339,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         version: object,
         stored: object,
         path: str,
+        decided: object = None,
     ) -> RunState | None:
         """Hash-checked adoption under the call's pinned version (ADR-0003 rule 4, ADR-0011,
         ADR-0021 rule 14). ``None``: the persisted row is for this exact call.
@@ -346,16 +347,30 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         The pinned ``(tool, version)`` comes from the persisted row, never from what is offered
         now. If that version no longer resolves and no ledger row exists for the call, the call
         gets a typed ``not_applied`` and nothing is sent (ADR-0011 rule 3); it is not a
-        divergence. Once a ledger row exists, a missing version keeps the fail-closed divergence
-        path until W5.2. Any other mismatch is a divergence.
+        divergence. Any other mismatch is a divergence.
+
+        Once a ledger row exists, a version gone is a deployment, not a divergence (ADR-0011 rule
+        5, ADR-0021 rule 15): the ledger entry is authoritative, the worker records its honest
+        outcome and wakes the run, and the run follows that outcome. Without the descriptor the
+        hash cannot be recomputed from the arguments, so the persisted rows must agree instead:
+        the ledger row has this call's tool and pinned version and the same call hash as the
+        adopted row and, when this lineage holds one, as its own decision (``decided``).
         """
         if tool != call["tool"] or not isinstance(version, str):
             return _divergence(call, path=path, stored=stored, recomputed=None)
         descriptor = ctx.registry.resolve(call["tool"], version)
         if descriptor is None:
             ledger = uow.repository(LedgerRepository, ctx.scope)
-            if await ledger.by_ordinal(ctx.run_id, call["step_ordinal"]) is None:
+            entry = await ledger.by_ordinal(ctx.run_id, call["step_ordinal"])
+            if entry is None:
                 return {"result": _result(CallOutcome.NOT_APPLIED, TOOL_VERSION_UNAVAILABLE)}
+            if (
+                entry["tool"] == call["tool"]
+                and entry["tool_version"] == version
+                and call_hashes_equal(entry["call_hash"], stored)
+                and (decided is None or call_hashes_equal(entry["call_hash"], decided))
+            ):
+                return None
             return _divergence(call, path=path, stored=stored, recomputed=None)
         recomputed = _pinned_hash(ctx, run, call, descriptor)
         if _hashes_match(stored, recomputed):
@@ -653,6 +668,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=existing["tool_version"],
                     stored=existing["call_hash"],
                     path="approval",
+                    decided=decided["call_hash"],
                 )
                 return found if found is not None else {"approval_id": str(existing["id"])}
             if run["stopped"]:
@@ -720,6 +736,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         """Wait node: re-read the approval; interrupt while it is pending."""
         call = _required(state["current"], "current call")
         approval_id = uuid.UUID(_required(state["approval_id"], "approval id"))
+        decided_hash = _required(state["decision"], "decision").get("call_hash")
         while True:
             async with UnitOfWork(ctx.engine) as uow:
                 row = await uow.repository(ApprovalsRepository, ctx.scope).get(approval_id)
@@ -739,6 +756,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=approval["tool_version"],
                     stored=approval["call_hash"],
                     path="approval_wait",
+                    decided=decided_hash,
                 )
             if found is not None:
                 return found
@@ -796,6 +814,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=existing["tool_version"],
                     stored=existing["call_hash"],
                     path="ledger",
+                    decided=decided["call_hash"],
                 )
                 return found if found is not None else {"ledger_id": str(existing["id"])}
             if run["stopped"]:
@@ -889,6 +908,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         call = _required(state["current"], "current call")
         ledger_id = state["ledger_id"]
         ledger_id = _required(ledger_id, "ledger entry id")
+        decided_hash = _required(state["decision"], "decision").get("call_hash")
         while True:
             async with UnitOfWork(ctx.engine) as uow:
                 entry = await uow.repository(LedgerRepository, ctx.scope).get(uuid.UUID(ledger_id))
@@ -909,6 +929,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=entry["tool_version"],
                     stored=entry["call_hash"],
                     path="ledger_wait",
+                    decided=decided_hash,
                 )
             if found is not None:
                 return found
