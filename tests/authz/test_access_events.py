@@ -59,6 +59,21 @@ async def test_t24_g2_an_ops_inspection_is_recorded_after_a_flush(world: World) 
 
 
 @pytest.mark.asyncio
+async def test_t24_g2_a_clean_shutdown_flushes_what_is_still_buffered(world: World) -> None:
+    """The api lifespan closes the writer before the engine goes: no flush call, no timer."""
+    run_id = await world.submit(OPS_DEMO, "restart")
+    async with world.serving() as (app, http):
+        # A writer whose timer never fires inside this test: only the shutdown can write.
+        app.state.access_events = AccessEventWriter(app.state.db_engine, flush_interval=3600)
+        response = await http.get(f"/v1/ops/runs/{run_id}", headers=AUDITOR)
+        assert response.status_code == 200, response.text
+        assert stored(world) == [], "still buffered while the app is serving"
+    [event] = stored(world)
+    assert event[:5] == (OPS_DEMO, "audrey", OPS, "run.inspect", run_id)
+    assert app.state.access_events.record(_event(run_id)) is False, "closed at shutdown"
+
+
+@pytest.mark.asyncio
 async def test_t24_g2_an_approver_inspection_through_the_approvals_audience_is_recorded(
     world: World,
 ) -> None:

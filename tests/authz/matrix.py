@@ -196,10 +196,12 @@ ROUTES: tuple[RouteSpec, ...] = (
     ),
 )
 
-# Routes that exist without any credential. Each carries no tenant data.
-PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
-    {("GET", "/healthz"), ("GET", "/readyz"), ("GET", "/openapi.json")}
+# Routes that exist without any credential. Each carries no tenant data. In ``prod`` the API schema
+# is not served at all, so only the probes are public there.
+PUBLIC_ROUTES_PROD: frozenset[tuple[str, str]] = frozenset(
+    {("GET", "/healthz"), ("GET", "/readyz")}
 )
+PUBLIC_ROUTES: frozenset[tuple[str, str]] = PUBLIC_ROUTES_PROD | {("GET", "/openapi.json")}
 MATRIX_ROUTES: frozenset[tuple[str, str]] = frozenset(spec.key for spec in ROUTES)
 
 
@@ -329,4 +331,13 @@ def _most_privileged(spec: RouteSpec) -> str:
     raise AssertionError(f"{spec.label}: the table grants nobody anything")
 
 
-__all__ = ["MATRIX_ROUTES", "PUBLIC_ROUTES", "ROUTES", "WORKSPACES", "Case", "RouteSpec", "cases"]
+__all__ = [
+    "MATRIX_ROUTES",
+    "PUBLIC_ROUTES",
+    "PUBLIC_ROUTES_PROD",
+    "ROUTES",
+    "WORKSPACES",
+    "Case",
+    "RouteSpec",
+    "cases",
+]
