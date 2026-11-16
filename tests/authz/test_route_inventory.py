@@ -10,12 +10,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
 from starlette.routing import BaseRoute
 from tests.authz.fixtures import APPROVALS, OPS, TASKS
-from tests.authz.matrix import MATRIX_ROUTES, PUBLIC_ROUTES, ROUTES
+from tests.authz.matrix import MATRIX_ROUTES, PUBLIC_ROUTES, PUBLIC_ROUTES_PROD, ROUTES
 
 from tether.api.app import create_app
 from tether.settings import Settings
@@ -44,9 +45,9 @@ ADMIN_SEGMENTS = frozenset(
 Route = tuple[str, str]
 
 
-def app_under_test() -> FastAPI:
+def app_under_test(env: str = "test") -> FastAPI:
     # No lifespan is entered: building the app touches neither the database nor the network.
-    return create_app(Settings(database_url=SecretStr("postgresql://x:y@localhost/z"), env="test"))
+    return create_app(Settings(database_url=SecretStr("postgresql://x:y@localhost/z"), env=env))
 
 
 def declared_routes(routes: Iterable[BaseRoute]) -> set[Route]:
@@ -154,7 +155,34 @@ def test_t24_the_matrix_ties_each_route_to_the_audience_of_its_prefix() -> None:
 
 def test_t24_only_the_probes_and_the_api_schema_are_public() -> None:
     assert {("GET", "/healthz"), ("GET", "/readyz"), ("GET", "/openapi.json")} == PUBLIC_ROUTES
+    assert {("GET", "/healthz"), ("GET", "/readyz")} == PUBLIC_ROUTES_PROD
     assert not any(path.startswith("/v1/") for _, path in PUBLIC_ROUTES)
+
+
+@pytest.mark.parametrize("env", ["dev", "test", "prod"])
+def test_t24_every_route_served_in_each_environment_has_a_row_and_nothing_else_is_public(
+    env: str,
+) -> None:
+    served = declared_routes(app_under_test(env).routes)
+    public = PUBLIC_ROUTES_PROD if env == "prod" else PUBLIC_ROUTES
+    unlisted, stale = inventory_gaps(served, MATRIX_ROUTES, public)
+    assert not unlisted, f"{env}: routes without an authorization table row: {sorted(unlisted)}"
+    assert not stale, f"{env}: matrix or public rows for routes that do not exist: {sorted(stale)}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("env", "expected"), [("dev", 200), ("test", 200), ("prod", 404)])
+async def test_t24_the_api_schema_is_served_without_credentials_only_outside_prod(
+    env: str, expected: int
+) -> None:
+    app = app_under_test(env)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://t"
+    ) as http:
+        response = await http.get("/openapi.json")
+    assert response.status_code == expected
+    if expected == 404:
+        assert "/v1/" not in response.text, "a refused schema request names no route"
 
 
 @pytest.mark.parametrize("spec", ROUTES, ids=lambda spec: spec.label)

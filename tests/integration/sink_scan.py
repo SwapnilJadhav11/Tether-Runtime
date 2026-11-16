@@ -103,7 +103,8 @@ class RouteInventory:
 
 def inventory(settings: Any) -> RouteInventory:
     """Every ``/v1`` route of the app, split into GETs (called generically) and the rest."""
-    # The OpenAPI document is the public, router-nesting-independent list of every route.
+    # The OpenAPI document is the router-nesting-independent list of every route. It is built in
+    # process, so it does not depend on ``/openapi.json`` being served (it is not, in ``prod``).
     paths: dict[str, Any] = create_app(settings).openapi()["paths"]
     gets: list[str] = []
     unknown: list[str] = []

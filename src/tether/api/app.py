@@ -51,6 +51,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
+        # The schema needs no credentials, so production does not serve it at all.
+        openapi_url=None if resolved.env == "prod" else "/openapi.json",
         # FastAPI's own telemetry: keep its bounded HTTP metrics (route template, method,
         # status); request spans come from ``RequestSpans`` instead, which never continues a
         # caller-supplied trace (AD-13: the run's trace is created at submission) and never
