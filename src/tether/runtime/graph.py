@@ -298,26 +298,37 @@ def _record_decision(uow: UnitOfWork, current: Any, decision: str, tool: str, st
     uow.on_commit(committed)
 
 
+async def reconciled_outcomes(
+    uow: UnitOfWork, scope: WorkspaceScope, run_id: uuid.UUID
+) -> list[str]:
+    """Every reconciled outcome of the run, for its terminal summary."""
+    entries = await uow.repository(LedgerRepository, scope).for_run(run_id)
+    return [
+        f"{entry['tool']} {entry['resolution']}"
+        for entry in entries
+        if str(entry["resolution"] or "").startswith("reconciled_")
+    ]
+
+
+async def stop_ending(uow: UnitOfWork, scope: WorkspaceScope, run: Any) -> tuple[RunStatus, str]:
+    """How a stopped run ends: ``cancelled`` or ``timed_out`` (ADR-0006), with a summary that
+    names every reconciled outcome, so a reconciled stop is never reported as clean."""
+    status = RunStatus(run["stop_status"])
+    reason = (
+        f"cancelled by {run['cancel_requested_by']}"
+        if status == RunStatus.CANCELLED
+        else "deadline passed"
+    )
+    return status, "; ".join([reason, *await reconciled_outcomes(uow, scope, run["id"])])
+
+
 def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     async def reconciled(uow: UnitOfWork) -> list[str]:
-        """Every reconciled outcome of the run, for its terminal summary."""
-        entries = await uow.repository(LedgerRepository, ctx.scope).for_run(ctx.run_id)
-        return [
-            f"{entry['tool']} {entry['resolution']}"
-            for entry in entries
-            if str(entry["resolution"] or "").startswith("reconciled_")
-        ]
+        return await reconciled_outcomes(uow, ctx.scope, ctx.run_id)
 
     async def stopped(uow: UnitOfWork, run: Any) -> RunState:
-        """A stopped run ends ``cancelled`` or ``timed_out`` (ADR-0006). The summary names every
-        reconciled outcome, so a reconciled stop is never reported as clean."""
-        status = RunStatus(run["stop_status"])
-        reason = (
-            f"cancelled by {run['cancel_requested_by']}"
-            if status == RunStatus.CANCELLED
-            else "deadline passed"
-        )
-        return {"end_status": status, "final_text": "; ".join([reason, *await reconciled(uow)])}
+        status, summary = await stop_ending(uow, ctx.scope, run)
+        return {"end_status": status, "final_text": summary}
 
     async def check_pinned(
         uow: UnitOfWork,

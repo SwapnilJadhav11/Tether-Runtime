@@ -64,13 +64,15 @@ def _unknown_state(entry: RowMapping) -> str:
 
 def _descriptor(
     runtime: WorkerRuntime, scope: WorkspaceScope, run: RowMapping, entry: RowMapping
-) -> ToolDescriptor | None:
+) -> ToolDescriptor | str:
+    """The entry's pinned descriptor, or why this worker cannot resolve it."""
     workspace = runtime.bootstrap.workspace(scope.workspace_id)
     agent = workspace.agent(run["agent_id"]) if workspace else None
     if agent is None:
-        return None
+        return "agent is not configured"  # configuration unavailable (scope delta I-4)
     # Exactly the pinned version, never another one (ADR-0011 rule 1, ADR-0021 rule 14).
-    return runtime.registries[agent.workload].resolve(entry["tool"], entry["tool_version"])
+    found = runtime.registries[agent.workload].resolve(entry["tool"], entry["tool_version"])
+    return found if found is not None else "tool version not resolvable"
 
 
 async def _record(
@@ -135,19 +137,27 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
         state = entry["state"]
         not_applied = OutcomeClass.NOT_APPLIED
         descriptor = _descriptor(runtime, scope, run, entry)
-        if descriptor is None:
-            reason = "not applied: tool version not resolvable"
+        if isinstance(descriptor, str):
             if state == "pending":
-                await _record(
-                    uow,
-                    runtime,
-                    scope,
-                    entry,
-                    expected=state,
-                    new="failed",
-                    outcome_class=not_applied,
-                    reason=reason,
-                )
+                # Nothing has left Tether (ADR-0011 rule 4).
+                new, outcome_class = "failed", not_applied
+                reason = f"not applied: {descriptor}"
+            else:
+                # A re-send is needed but impossible, and the first send may have applied
+                # (ADR-0011 rule 5): the outcome is unknown, never not applied. The run is woken
+                # and holds a write for reconciliation (ADR-0018).
+                new, outcome_class = _unknown_state(entry), OutcomeClass.UNKNOWN
+                reason = f"outcome unknown: {descriptor}; not re-sent"
+            await _record(
+                uow,
+                runtime,
+                scope,
+                entry,
+                expected=state,
+                new=new,
+                outcome_class=outcome_class,
+                reason=reason,
+            )
             return None
         args = descriptor.input_model.model_validate(job.payload.get("arguments", {}))
         hashed = call_hash_for(runtime.keys, run, descriptor, args)
