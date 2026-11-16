@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -43,7 +44,16 @@ from tether.policy.config import BootstrapFile
 from tether.providers.history import ModelTurn, NeutralMessage
 from tether.registry.registry import ToolRegistry
 from tether.runtime.driver import WorkerRuntime
-from tether.sdk import AgentDefinition, Sensitive, ToolContext, ToolDescriptor, Workload
+from tether.sdk import (
+    AgentDefinition,
+    Sensitive,
+    ToolContext,
+    ToolDescriptor,
+    VerificationResult,
+    VerifyContext,
+    VerifyDeclaration,
+    Workload,
+)
 from tether.settings import Settings
 from tether.testing.scripted import ScriptedProvider
 from tether.worker.main import process_next_job
@@ -85,12 +95,62 @@ SENSITIVE_WORKLOAD = Workload(
     agent=AgentDefinition(system_prompt="test", tools=(*TEST_WORKLOAD.agent.tools, ROTATE.name)),
 )
 
+# W5.1: a rotation whose answer is always lost (an unknown outcome) and whose read-back returns
+# evidence with a Sensitive receipt, so verification evidence crosses every masking boundary.
+CANARY_EVIDENCE = "canary-evidence-4c19e8a07b2d63f5"
+_ROTATED: set[str] = set()
+
+
+class RotationCheck(BaseModel):
+    service: str
+    rotated: bool
+    receipt: Annotated[str, Sensitive]
+
+
+async def _rotate_lost(args: RotateIn, ctx: ToolContext) -> RotateOut:
+    _ROTATED.add(ctx.idempotency_key)
+    raise httpx.ReadTimeout("the rotation applied; its answer was lost")
+
+
+async def _check_rotation(args: RotateIn, ctx: VerifyContext) -> VerificationResult:
+    evidence = RotationCheck(
+        service=args.service, rotated=ctx.idempotency_key in _ROTATED, receipt=CANARY_EVIDENCE
+    )
+    if evidence.rotated:
+        return VerificationResult("confirmed_applied", evidence)
+    return VerificationResult("confirmed_not_applied", evidence)
+
+
+ROTATE_CHECKED = replace(
+    ROTATE,
+    name="rotate_secret_checked",
+    idempotency="unsupported",
+    handler=_rotate_lost,
+    verify=VerifyDeclaration(
+        probe=_check_rotation, evidence_model=RotationCheck, required_permissions=("service:read",)
+    ),
+)
+VERIFY_WORKLOAD = Workload(
+    name=TEST_WORKLOAD.name,
+    tools=(*SENSITIVE_WORKLOAD.tools, ROTATE_CHECKED),
+    agent=AgentDefinition(
+        system_prompt="test", tools=(*SENSITIVE_WORKLOAD.agent.tools, ROTATE_CHECKED.name)
+    ),
+)
+
 
 def _boot() -> BootstrapFile:
     data = BOOT.model_dump(mode="json")
     for workspace in data["workspaces"]:
         workspace["policy"]["rules"].append(
             {"tool": "rotate_secret", "decision": "require_approval", "approver_roles": ["oncall"]}
+        )
+        workspace["policy"]["rules"].append(
+            {
+                "tool": "rotate_secret_checked",
+                "decision": "require_approval",
+                "approver_roles": ["oncall"],
+            }
         )
     return BootstrapFile.model_validate(data)
 
@@ -101,6 +161,9 @@ ROTATE_SCENARIO = (
     "  - tool_calls: [{tool: rotate_secret,"
     f" arguments: {{service: checkout, api_token: {CANARY_ARG}}}}}]\n"
     "  - final: rotated\n"
+)
+ROTATE_CHECKED_SCENARIO = ROTATE_SCENARIO.replace("rotate_secret", "rotate_secret_checked").replace(
+    "name: rotate", "name: rotate_checked"
 )
 
 
@@ -153,7 +216,8 @@ def demo_target() -> Iterator[CountingTransport]:
 
 @pytest.fixture
 def provider(tmp_path: Path) -> RecordingProvider:
-    for name, text in {**SCENARIOS, "rotate": ROTATE_SCENARIO}.items():
+    scenarios = {**SCENARIOS, "rotate": ROTATE_SCENARIO, "rotate_checked": ROTATE_CHECKED_SCENARIO}
+    for name, text in scenarios.items():
         (tmp_path / f"{name}.yaml").write_text(text, encoding="utf-8")
     return RecordingProvider(tmp_path)
 
@@ -252,8 +316,10 @@ async def approve(seeded: Any, tmp_path: Path, found: uuid.UUID) -> httpx.Respon
 
 __all__ = [
     "CANARY_ARG",
+    "CANARY_EVIDENCE",
     "CANARY_OUT",
     "OPS",
+    "VERIFY_WORKLOAD",
     "WS",
     "CountingTransport",
     "RecordingProvider",

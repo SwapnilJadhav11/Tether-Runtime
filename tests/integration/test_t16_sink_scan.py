@@ -14,7 +14,9 @@ Where a canary may appear is the exceptions ADR-0017 §2 writes down, and nothin
   that call). It may not appear in a tool, user, system or manifest entry, a log line, a span, an
   audit payload, an approval row, the ledger, or any response.
 
-Not covered, because it does not exist yet: verification evidence (W5.1, architecture §12.3).
+Verification evidence (W5.1, ADR-0019 rule 10): a second run, ``rotate_secret_checked``, loses
+the rotation's answer (an unknown outcome) and its read-back returns evidence whose ``receipt`` is
+``Sensitive``. That **evidence** canary may appear nowhere either.
 """
 
 from __future__ import annotations
@@ -30,7 +32,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from tests.integration.evidence_support import (
     BOOT_SENSITIVE,
     CANARY_ARG,
+    CANARY_EVIDENCE,
     CANARY_OUT,
+    VERIFY_WORKLOAD,
     RecordingProvider,
     alice,
     approval_id,
@@ -65,6 +69,7 @@ from tests.integration.sink_scan import (
 from tether.observability import tracing
 from tether.observability.logging import get_logger
 from tether.registry.masking import MASK
+from tether.registry.registry import ToolRegistry
 from tether.runtime.driver import WorkerRuntime
 
 CANARIES = {"arg": CANARY_ARG, "out": CANARY_OUT}
@@ -270,6 +275,51 @@ async def test_t16_a_sensitive_value_reaches_no_sink_outside_the_adr_0017_except
     assert any(" in provider:assistant:" in finding for finding in unexempted)
     assert any(" in table:tether.jobs" in finding for finding in unexempted)
     assert any(" in checkpoint:langgraph." in finding for finding in unexempted)
+
+
+@pytest.mark.asyncio
+async def test_t16_verification_evidence_reaches_no_sink_unmasked(
+    runtime: WorkerRuntime,
+    seeded: Any,
+    tmp_path: Path,
+    provider: RecordingProvider,
+    spans: InMemorySpanExporter,
+    raw_log: Any,
+) -> None:
+    runtime.registries[VERIFY_WORKLOAD.name] = ToolRegistry(VERIFY_WORKLOAD)
+    scene = Scene()
+    scene.run_id = await submit(runtime, seeded, tmp_path, "rotate_checked")
+    scene.approval_id = approval_id(seeded, scene.run_id)
+    decided = await approve(seeded, tmp_path, scene.approval_id)
+    assert decided.status_code == 200, decided.text
+    await drain(runtime)
+    assert run_status(seeded, scene.run_id) == "succeeded"
+    [(ledger_id, resolution, evidence)] = rows(
+        seeded,
+        "SELECT id, resolution, verification_evidence_masked FROM tether.ledger_entries"
+        " WHERE run_id = %s",
+        scene.run_id,
+    )
+    scene.ledger_id = ledger_id
+    # The evidence really was produced, persisted, audited and handed to the model, masked.
+    assert resolution == "verified_applied"
+    assert evidence == {"service": "checkout", "rotated": True, "receipt": MASK}
+    [tool_message] = [m for m in provider.histories[-1] if m["role"] == "tool"]
+    assert '"verified": true' in tool_message["content"]
+    assert MASK in tool_message["content"]
+    await sweep_routes(scene, seeded, tmp_path)
+    sinks = all_sinks(scene, seeded, spans, raw_log.getvalue(), provider)
+    assert {name.split(":", 1)[0] for name in sinks} == {
+        "span",
+        "log",
+        "table",
+        "checkpoint",
+        "route",
+        "provider",
+    }
+    assert any(name.endswith("tool.verify") for name in sinks)  # the probe's span was scanned
+    assert scan(sinks, {"evidence": CANARY_EVIDENCE, "out": CANARY_OUT}) == []
+    assert scan(sinks, {"arg": CANARY_ARG}, EXEMPT) == []
 
 
 @pytest.mark.asyncio

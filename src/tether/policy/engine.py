@@ -15,6 +15,12 @@ The built-in evaluator is deny by default. Requester permissions are the union o
 the agent's permissions; every required permission of the tool must be in it. Risk is ``low`` or
 ``high``; a high-risk tool is never allowed. Separation of duties is built in: an approver or a
 reconciler is never the run's requester.
+
+The fourth decision point, ``evaluate_verification`` (ADR-0022, amending ADR-0020 rule 1), decides
+an ADR-0019 verification probe as its own read-purpose action: ``allow`` or ``deny`` only. The
+write's approval is never authority for it; the probe must be the declared read-back of the exact
+pinned version, for the exact original call, in the run's own context, under the very policy
+version that authorized the write, and the requester and agent must hold its permissions.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from tether.core.hashing import call_hashes_equal
 from tether.policy.config import BootstrapConfigError, WorkspaceConfig
 from tether.sdk import Effect, Risk, ToolDescriptor
 
@@ -76,15 +83,20 @@ class ToolPolicyMetadata:
     effect: Effect
     risk: Risk
     required_permissions: frozenset[str]
+    # The permissions of the version's declared read-back (ADR-0019 rule 7), or ``None`` when the
+    # version declares no ``verify``.
+    verify_permissions: frozenset[str] | None = None
 
     @classmethod
     def from_descriptor(cls, descriptor: ToolDescriptor) -> ToolPolicyMetadata:
+        verify = descriptor.verify
         return cls(
             name=descriptor.name,
             version=descriptor.version,
             effect=descriptor.effect,
             risk=descriptor.risk,
             required_permissions=frozenset(descriptor.required_permissions),
+            verify_permissions=None if verify is None else frozenset(verify.required_permissions),
         )
 
 
@@ -144,6 +156,26 @@ class ReconciliationEligibilityRequest:
     tool_name: str
 
 
+@dataclass(frozen=True)
+class VerificationRequest:
+    """A verification probe of one ledger entry (ADR-0019 rule 8, ADR-0022 rules 5-8).
+
+    Every field is a trusted runtime value: ``tool`` is the metadata of the descriptor resolved
+    for the entry's pinned version; ``pinned_version`` and ``context.call_hash`` are the ledger
+    entry's; ``probe_call_hash`` is the keyed hash recomputed from the arguments the probe would
+    receive; ``authorized_policy_version`` is the version recorded when TX5 authorized the write.
+    """
+
+    workspace_id: str
+    requester: TrustedRequester
+    agent: TrustedAgent
+    tool: ToolPolicyMetadata
+    pinned_version: str
+    context: ActionContext
+    probe_call_hash: str
+    authorized_policy_version: str | None
+
+
 # --- answers ----------------------------------------------------------------------------------
 
 
@@ -181,6 +213,8 @@ class PolicyEngine(Protocol):
     def evaluate_reconciliation_eligibility(
         self, request: ReconciliationEligibilityRequest
     ) -> Eligibility: ...
+
+    def evaluate_verification(self, request: VerificationRequest) -> PolicyDecision: ...
 
 
 # --- the built-in V1 evaluator ----------------------------------------------------------------
@@ -271,6 +305,44 @@ class BuiltinPolicyEngine:
         if not request.reconciler.roles & set(self._policy.reconciliation.reconciler_roles):
             return self._answer(False, "role_not_eligible")
         return self._answer(True, "eligible")
+
+    def evaluate_verification(self, request: VerificationRequest) -> PolicyDecision:
+        """ADR-0022: ``allow`` or ``deny`` only; the write's approval rule is never authority."""
+        if request.workspace_id != self.workspace_id:
+            return self._deny("workspace_mismatch")
+        if not request.requester.subject:
+            return self._deny("context_missing:requester")
+        agent_permissions = self._policy.agent_permissions.get(request.agent.agent_id)
+        if agent_permissions is None:
+            return self._deny("context_missing:agent")
+        # Conditions 1, 2, 7: only the declared read-back of the exact pinned version of a write.
+        required = request.tool.verify_permissions
+        if request.tool.effect != "write" or not required:
+            return self._deny("verify_not_declared")
+        if request.tool.version != request.pinned_version:
+            return self._deny("version_mismatch")
+        # Condition 3: only the exact original call.
+        if not call_hashes_equal(request.probe_call_hash, request.context.call_hash):
+            return self._deny("target_mismatch")
+        # Condition 6: under the version that authorized the write, the effective permissions are
+        # exactly those that authorized it (the requester snapshot and the agent never change).
+        if request.authorized_policy_version is None:
+            return self._deny("authorization_unknown")
+        if request.authorized_policy_version != self.policy_version:
+            return self._deny("policy_changed")
+        # Condition 5: an explicit refusal of the tool refuses its read-back; an allow or
+        # require_approval rule neither grants nor refuses it.
+        rule = self._policy.rule_for(request.tool.name)
+        if rule is None:
+            return self._deny("no_matching_rule")
+        if rule.decision == "deny":
+            return self._deny("rule_deny")
+        requester_permissions = self._role_permissions(request.requester.roles)
+        lacking = [f"agent_lacks:{p}" for p in sorted(required - set(agent_permissions))]
+        lacking += [f"requester_lacks:{p}" for p in sorted(required - requester_permissions)]
+        if lacking:
+            return self._deny(*lacking)
+        return PolicyDecision("allow", ("verification_allow",), self.policy_version)
 
 
 def check_tools_against_policy(

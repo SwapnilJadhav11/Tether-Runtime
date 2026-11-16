@@ -2,9 +2,9 @@
 
 Each poll interval the worker checks database connectivity and, while the database is reachable,
 refreshes a heartbeat file that the container healthcheck reads and processes every due job.
-It leases ``advance_run``, ``execute_tool`` and the two timers (``run_deadline``,
-``expire_approval``). A job leased past its ``max_attempts`` goes to its TX12 dead-letter
-transition instead of its handler.
+It leases ``advance_run``, ``execute_tool``, ``verify_outcome`` (ADR-0019) and the two timers
+(``run_deadline``, ``expire_approval``). A job leased past its ``max_attempts`` goes to its TX12
+dead-letter transition instead of its handler.
 
 While a job is processed the worker extends its lease every ``lease_heartbeat_interval`` (W6.1,
 ADR-0004 rule 2). A lost lease, or no successful beat for a full lease, aborts the handler: the
@@ -35,7 +35,7 @@ from tether.queue import postgres as queue
 from tether.runtime.driver import WorkerRuntime
 from tether.settings import Settings, load_settings
 from tether.storage.engine import create_pool, database_is_reachable
-from tether.worker.handlers import advance_run, execute_tool, timers
+from tether.worker.handlers import advance_run, execute_tool, timers, verify_outcome
 
 logger = logging.getLogger(__name__)
 _log = get_logger(__name__)
@@ -57,7 +57,7 @@ TIMER_KINDS = {
     JobKind.RUN_DEADLINE: timers.run_deadline,
     JobKind.EXPIRE_APPROVAL: timers.expire_approval,
 }
-HANDLED_KINDS = (JobKind.ADVANCE_RUN, JobKind.EXECUTE_TOOL, *TIMER_KINDS)
+HANDLED_KINDS = (JobKind.ADVANCE_RUN, JobKind.EXECUTE_TOOL, JobKind.VERIFY_OUTCOME, *TIMER_KINDS)
 
 
 async def process_next_job(runtime: WorkerRuntime, kinds: Sequence[str] | None = None) -> bool:
@@ -214,6 +214,8 @@ async def _handle(runtime: WorkerRuntime, job: queue.LeasedJob) -> _Finish:
         # Bounded delivery (§11 AD-08): TX12 instead of the handler; it marks the job dead.
         if job.kind == JobKind.EXECUTE_TOOL:
             await execute_tool.dead_letter(runtime, job)
+        elif job.kind == JobKind.VERIFY_OUTCOME:
+            await verify_outcome.dead_letter(runtime, job)
         elif job.kind in TIMER_KINDS:
             await timers.dead_letter(runtime, job)
         elif await advance_run.dead_letter(runtime, job) is advance_run.Outcome.CONTENDED:
@@ -226,6 +228,12 @@ async def _handle(runtime: WorkerRuntime, job: queue.LeasedJob) -> _Finish:
             return _Finish("completed", complete=True)
         # A retry is this job delivered again after its backoff; the attempt stays spent.
         return _Finish("retry", release_in=retry_in)
+    if job.kind == JobKind.VERIFY_OUTCOME:
+        # One probe per delivery; an inconclusive one is followed by the next after its backoff.
+        next_in = await verify_outcome.handle(runtime, job)
+        if next_in is None:
+            return _Finish("completed", complete=True)
+        return _Finish("retry", release_in=next_in)
     if job.kind in TIMER_KINDS:
         await TIMER_KINDS[JobKind(job.kind)](runtime, job)
         return _Finish("completed", complete=True)

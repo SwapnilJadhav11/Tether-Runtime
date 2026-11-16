@@ -79,6 +79,11 @@ DENIAL_BUDGET_EXHAUSTED = "denial_budget_exhausted"
 MALFORMED_ARGUMENTS = "arguments: malformed"
 # TX5's typed result when the current policy now denies a decided call: a policy denial.
 _POLICY_NOW_DENY = "policy now: deny"
+# The model-visible outcome of an entry resolved by verification (ADR-0019 rules 10, 12).
+_VERIFIED_OUTCOMES = {
+    LedgerResolution.VERIFIED_APPLIED: CallOutcome.APPLIED,
+    LedgerResolution.VERIFIED_NOT_APPLIED: CallOutcome.NOT_APPLIED,
+}
 # The pause before a provider retry; a module attribute so tests can observe the delays.
 _sleep = asyncio.sleep
 
@@ -305,12 +310,13 @@ def _record_decision(uow: UnitOfWork, current: Any, decision: str, tool: str, st
 async def reconciled_outcomes(
     uow: UnitOfWork, scope: WorkspaceScope, run_id: uuid.UUID
 ) -> list[str]:
-    """Every reconciled outcome of the run, for its terminal summary."""
+    """Every reconciled or verified outcome of the run, for its terminal summary (ADR-0019 rule
+    9: a verified outcome after a stop is named, never reported as clean)."""
     entries = await uow.repository(LedgerRepository, scope).for_run(run_id)
     return [
         f"{entry['tool']} {entry['resolution']}"
         for entry in entries
-        if str(entry["resolution"] or "").startswith("reconciled_")
+        if str(entry["resolution"] or "").startswith(("reconciled_", "verified_"))
     ]
 
 
@@ -941,6 +947,20 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             if found is not None:
                 return found
             resolution = entry["resolution"]
+            if resolution in _VERIFIED_OUTCOMES:
+                # Resolved by a definitive read-back (ADR-0019 rule 10, invariant 37): the write's
+                # own output is unknown and not fabricated; the model gets the masked evidence
+                # with the verification marker.
+                return {
+                    "result": _result(
+                        _VERIFIED_OUTCOMES[resolution],
+                        {
+                            "resolution": resolution,
+                            "verified": True,
+                            "evidence": entry["verification_evidence_masked"],
+                        },
+                    )
+                }
             if entry["state"] == "completed":
                 if resolution == LedgerResolution.RECONCILED_APPLIED:
                     # A human confirmed the write happened; its real output is unknown.

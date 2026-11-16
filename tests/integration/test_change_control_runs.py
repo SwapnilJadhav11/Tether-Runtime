@@ -72,8 +72,9 @@ def github(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeGitHub]:
     monkeypatch.setenv("CHANGE_CONTROL_GITHUB_REPO", REPO)
     monkeypatch.setenv("CHANGE_CONTROL_GITHUB_TOKEN", "ghp_integration_test_token")  # synthetic
     monkeypatch.delenv("CHANGE_CONTROL_GITHUB_API_URL", raising=False)
-    # Retries are immediate.
+    # Retries and verification probes are immediate.
     monkeypatch.setattr(backoff, "tool_backoff_seconds", lambda attempt, rng=None: 0.0)
+    monkeypatch.setattr(backoff, "verify_backoff_seconds", lambda declared, attempt, rng=None: 0.0)
     github_client.set_transport(fake.transport())
     yield fake
     github_client.set_transport(None)
@@ -203,6 +204,18 @@ async def chain_valid(seeded: Any, scenarios: Path, run_id: uuid.UUID) -> bool:
     return bool(response.json()["audit_chain_valid"])
 
 
+# Every verification probe (three by default) finds the issue listing unavailable: automatic
+# verification cannot establish the outcome and hands it to a person (ADR-0019 rule 11).
+UNREADABLE = [("GET", "issues", "503")] * 3
+
+
+def assert_verification_exhausted(seeded: Any, run_id: uuid.UUID) -> None:
+    trail = events(seeded, run_id)
+    assert trail.count("VERIFICATION_INCONCLUSIVE") == 3
+    assert trail.count("VERIFICATION_EXHAUSTED") == 1
+    assert "VERIFIED" not in trail
+
+
 async def awaiting_create_approval(
     runtime: WorkerRuntime, seeded: Any, scenarios: Path, scenario: str = "open_change"
 ) -> uuid.UUID:
@@ -306,12 +319,16 @@ async def test_t31_a_create_that_times_out_is_indeterminate_after_exactly_one_re
 ) -> None:
     run_id = await awaiting_create_approval(runtime, seeded, scenarios)
     [(approval_id, *_)] = approvals(seeded, run_id)
-    github.script[:] = [("POST", "issues", "timeout_after")]  # applied, but no response
+    github.script[:] = [
+        ("POST", "issues", "timeout_after"),  # applied, but no response
+        *UNREADABLE,  # and the read-back cannot establish it: a person must (ADR-0019 rule 11)
+    ]
     await decide(seeded, scenarios, approval_id, "approve", APPROVER)
     await drain(runtime)
     assert len(github.writes()) == 1
     create = [e for e in ledger(seeded, run_id) if e[1] == "create_change_issue"]
     assert [(e[2], e[3]) for e in create] == [("indeterminate", 1)]
+    assert_verification_exhausted(seeded, run_id)
     assert run_status(seeded, run_id)[0] == "awaiting_reconciliation"
     await drain(runtime)
     assert len(github.writes()) == 1  # never re-sent, however long the run waits
@@ -343,10 +360,12 @@ async def test_t31_a_crash_after_the_create_was_dispatched_sends_no_second_reque
         run_id,
     )
     assert len(changed) == 1
+    github.script[:] = list(UNREADABLE)  # the read-back cannot establish what happened
     await drain(runtime)
     assert github.writes() == []
     create = [e for e in ledger(seeded, run_id) if e[1] == "create_change_issue"]
     assert [e[2] for e in create] == ["indeterminate"]
+    assert_verification_exhausted(seeded, run_id)
     assert run_status(seeded, run_id)[0] == "awaiting_reconciliation"
 
 
@@ -397,10 +416,70 @@ async def test_t31_a_server_error_on_the_create_is_unknown_not_a_failure(
 ) -> None:
     run_id = await awaiting_create_approval(runtime, seeded, scenarios)
     [(approval_id, *_)] = approvals(seeded, run_id)
-    github.script[:] = [("POST", "issues", "503")]
+    github.script[:] = [("POST", "issues", "503"), *UNREADABLE]
     await decide(seeded, scenarios, approval_id, "approve", APPROVER)
     await drain(runtime)
     create = [e for e in ledger(seeded, run_id) if e[1] == "create_change_issue"]
     assert [e[2] for e in create] == ["indeterminate"]
     assert len(github.writes()) == 1
+    assert_verification_exhausted(seeded, run_id)
     assert run_status(seeded, run_id)[0] == "awaiting_reconciliation"
+
+
+# --- W5.1: automatic verification by the marker read-back (ADR-0019, T-27) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_t27_a_create_that_timed_out_after_applying_is_verified_applied_without_a_person(
+    runtime: WorkerRuntime, seeded: Any, scenarios: Path, github: FakeGitHub
+) -> None:
+    run_id = await awaiting_create_approval(runtime, seeded, scenarios)
+    [(approval_id, *_)] = approvals(seeded, run_id)
+    github.script[:] = [("POST", "issues", "timeout_after")]  # applied, but no response
+    await decide(seeded, scenarios, approval_id, "approve", APPROVER)
+    await drain(runtime)
+    [create] = [e for e in ledger(seeded, run_id) if e[1] == "create_change_issue"]
+    assert (create[2], create[4]) == ("completed", "verified_applied")
+    assert len(github.writes()) == 1  # verified by reads only, never re-sent
+    assert len(github.issues) == 1
+    assert run_status(seeded, run_id)[0] == "succeeded"
+    trail = events(seeded, run_id)
+    assert "VERIFIED" in trail
+    assert "RECONCILED" not in trail
+    assert await chain_valid(seeded, scenarios, run_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["503", "timeout_before"])
+async def test_t27_a_create_that_never_arrived_is_verified_not_applied(
+    runtime: WorkerRuntime, seeded: Any, scenarios: Path, github: FakeGitHub, failure: str
+) -> None:
+    run_id = await awaiting_create_approval(runtime, seeded, scenarios)
+    [(approval_id, *_)] = approvals(seeded, run_id)
+    github.script[:] = [("POST", "issues", failure)]
+    await decide(seeded, scenarios, approval_id, "approve", APPROVER)
+    await drain(runtime)
+    [create] = [e for e in ledger(seeded, run_id) if e[1] == "create_change_issue"]
+    assert (create[2], create[4]) == ("failed", "verified_not_applied")
+    assert len(github.writes()) == 1
+    assert github.issues == {}
+    assert run_status(seeded, run_id)[0] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_t27_change_control_verification_only_reads(
+    runtime: WorkerRuntime, seeded: Any, scenarios: Path, github: FakeGitHub
+) -> None:
+    """The probe is a GET of the issue listing with the change-control label; nothing else."""
+    run_id = await awaiting_create_approval(runtime, seeded, scenarios)
+    [(approval_id, *_)] = approvals(seeded, run_id)
+    github.script[:] = [("POST", "issues", "timeout_after")]
+    before = len(github.seen)
+    await decide(seeded, scenarios, approval_id, "approve", APPROVER)
+    await drain(runtime)
+    after = github.seen[before:]
+    assert [s.method for s in after] == ["POST", "GET"]
+    probe = after[1]
+    assert probe.path == f"/repos/{REPO}/issues"
+    assert probe.query["labels"] == "change-control"
+    assert run_status(seeded, run_id)[0] == "succeeded"

@@ -30,6 +30,7 @@ Architecture Decision Records (ADRs) for Tether V1. Each ADR records one signifi
 | [0019](0019-automatic-verification-of-unknown-outcomes.md) | Execution ledger, honest outcomes, bounded automatic verification of unknown outcomes, human reconciliation as the fallback (complete restatement superseding ADR-0007) | accepted | 2026-11-09 |
 | [0020](0020-v1-policy-engine-contract.md) | Clarification of ADR-0009: the V1 policy engine contract, mandatory separation of duties and trusted policy inputs (amends ADR-0009 rule 1 on separation of duties and SDK rule code) | accepted | 2026-11-15 |
 | [0021](0021-v1-tool-contract.md) | The V1 governed tool contract: target-enforced preconditions, timeout, `on_exhausted`, outcome classification, `ToolSource`, retained and pinned versions, `verify` declaration (clarifies ADR-0011, ADR-0012 rule 6, ADR-0019 naming) | accepted | 2026-11-15 |
+| [0022](0022-verify-operation-policy-mapping.md) | How the verify operation is authorized: a separate, read-purpose policy decision bounded by the original action (clarifies ADR-0019 rule 8, resolves ADR-0021 rule 18, amends ADR-0020 rule 1 with a fourth decision point) | accepted (owner decision 2026-11-16; wording pending owner review) | 2026-11-16 |
 
 ADR-0019 was accepted on 2026-11-09 and supersedes ADR-0007 (rules 1–6 carried over; rules 7–8 replaced). Its design is **required, not yet implemented** (plan W5.1); the baseline behaviour is still human-only reconciliation.
 

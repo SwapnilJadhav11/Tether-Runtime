@@ -53,6 +53,9 @@ class LedgerResolution(StrEnum):
     RECONCILED_APPLIED = "reconciled_applied"
     RECONCILED_NOT_APPLIED = "reconciled_not_applied"
     RECONCILED_ABANDON = "reconciled_abandon"
+    # Resolved by a definitive verification probe (ADR-0019 rule 10, migration 0005).
+    VERIFIED_APPLIED = "verified_applied"
+    VERIFIED_NOT_APPLIED = "verified_not_applied"
 
 
 class ApprovalStatus(StrEnum):
@@ -75,3 +78,4 @@ class JobKind(StrEnum):
     EXECUTE_TOOL = "execute_tool"
     EXPIRE_APPROVAL = "expire_approval"
     RUN_DEADLINE = "run_deadline"
+    VERIFY_OUTCOME = "verify_outcome"
