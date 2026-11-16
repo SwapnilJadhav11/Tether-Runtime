@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from tether.api.request_spans import RequestSpans
 from tether.api.routers import approvals, ops, tasks
+from tether.audit import access_events
 from tether.observability.telemetry import setup_telemetry
 from tether.policy.config import BootstrapFile, load_bootstrap
 from tether.secrets.env_provider import EnvSecretsProvider
@@ -36,6 +37,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            # Access events still buffered at a clean shutdown are written before the engine goes.
+            writer: access_events.AccessEventWriter | None = getattr(
+                app.state, "access_events", None
+            )
+            if writer is not None:
+                await writer.aclose()
             await app.state.db_engine.dispose()
             await pool.close()
 
