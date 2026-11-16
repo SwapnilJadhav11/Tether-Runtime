@@ -47,7 +47,7 @@ from tether.policy.config import BootstrapFile
 from tether.providers.history import ModelTurn, NeutralMessage
 from tether.queue import backoff
 from tether.registry.masking import MASK
-from tether.registry.registry import ToolRegistry, WorkloadLoadError
+from tether.registry.registry import ToolRegistry
 from tether.runtime import driver as driver_module
 from tether.runtime.driver import WorkerRuntime
 from tether.runtime.graph import call_hash_for
@@ -945,19 +945,19 @@ async def test_w3_2_a_non_idempotent_write_timing_out_is_indeterminate_and_never
 
 
 @pytest.mark.parametrize(
-    ("timeout", "retained", "starts"),
-    [(59.9, False, True), (60.0, False, False), (120.0, False, False), (60.0, True, False)],
+    ("timeout", "retained"),
+    [(59.9, False), (60.0, False), (120.0, False), (60.0, True)],
     ids=["below-lease", "equal-to-lease", "above-lease", "retained-at-lease"],
 )
 @pytest.mark.asyncio
-async def test_w3_2_worker_startup_requires_every_tool_timeout_below_the_lease(
+async def test_w6_1_worker_startup_accepts_a_tool_timeout_at_or_above_the_lease(
     seeded: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     timeout: float,
     retained: bool,
-    starts: bool,
 ) -> None:
+    """Lease heartbeats keep a long send's lease alive (ADR-0021 rule 6), so no bound applies."""
     if retained:
         old = _tool("cas_get", "read", _get, KeyIn, version="0.9.0", timeout_seconds=timeout)
         tools = workload(*OTHERS, GATED_V1, retained=(old,))
@@ -966,12 +966,8 @@ async def test_w3_2_worker_startup_requires_every_tool_timeout_below_the_lease(
         tools = workload(slow, *OTHERS[1:], GATED_V1)
     monkeypatch.setattr(driver_module, "load_workload", lambda name: tools)
     settings = _settings(seeded.db, tmp_path, worker_lease_seconds=60.0)
-    if starts:
-        runtime = await WorkerRuntime.open(settings, bootstrap=BOOT)
-        await runtime.close()
-        return
-    with pytest.raises(WorkloadLoadError, match="timeout"):
-        await WorkerRuntime.open(settings, bootstrap=BOOT)
+    runtime = await WorkerRuntime.open(settings, bootstrap=BOOT)
+    await runtime.close()
 
 
 # --- pinned versions (ADR-0011, ADR-0021 rules 12-15) -------------------------------------------
