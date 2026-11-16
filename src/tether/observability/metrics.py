@@ -62,6 +62,11 @@ _INSTRUMENTS: dict[str, Any] = {
     "tether.policy.decisions": _METER.create_counter(
         "tether.policy.decisions", unit="{decision}", description="Recorded policy decisions"
     ),
+    "tether.verifications": _METER.create_counter(
+        "tether.verifications",
+        unit="{probe}",
+        description="Verification probes of indeterminate entries, and their ends (ADR-0019)",
+    ),
     "tether.approval.wait_duration": _histogram(
         "tether.approval.wait_duration", "Approval requested to decided, expired or closed"
     ),
@@ -147,6 +152,12 @@ def ledger_indeterminate(tool: str) -> None:
 
 def reconciled(outcome: str) -> None:
     _emit("tether.reconciliations", 1, outcome=outcome)
+
+
+def verification(tool: str, result: str) -> None:
+    """``result``: a probe's kind (``confirmed_applied``, ``confirmed_not_applied``,
+    ``inconclusive``), ``late``, or ``exhausted``. Bounded labels only; never a reason text."""
+    _emit("tether.verifications", 1, tool=tool, result=result)
 
 
 def policy_decision(decision: str, tool: str) -> None:

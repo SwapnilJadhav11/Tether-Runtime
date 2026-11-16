@@ -5,9 +5,9 @@ back, and cancel it (TX9). Reading and cancelling are for the run's requester on
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from psycopg import errors as pg_errors
@@ -61,6 +61,31 @@ class LedgerView(BaseModel):
     outcome_reason: str | None
     resolution: str | None
     resolved_by: str | None
+    # ADR-0019 rule 12: probes started, whether automatic verification is still in progress for
+    # an unresolved entry, and the masked evidence of a verified resolution.
+    verification_attempts: int = 0
+    verification: Literal["in_progress"] | None = None
+    verification_evidence: dict[str, Any] | None = None
+
+
+def ledger_views(entries: Iterable[RowMapping], verifying: set[uuid.UUID]) -> list[LedgerView]:
+    """Masked ledger rows for an inspection view; ``verifying``: entries with a pending
+    ``verify_outcome`` job."""
+    return [
+        LedgerView(
+            **dict(entry),
+            outcome=entry["outcome_payload_masked"],
+            verification=(
+                "in_progress"
+                if entry["id"] in verifying
+                and entry["state"] == "indeterminate"
+                and entry["resolution"] is None
+                else None
+            ),
+            verification_evidence=entry["verification_evidence_masked"],
+        )
+        for entry in entries
+    ]
 
 
 class AuditView(BaseModel):
@@ -234,15 +259,14 @@ async def get_run(
             raise HTTPException(status.HTTP_404_NOT_FOUND)
         approvals = await uow.repository(ApprovalsRepository, scope).for_run(run_id)
         ledger = await uow.repository(LedgerRepository, scope).for_run(run_id)
+        verifying = await uow.repository(JobsRepository, scope).verifying(run_id)
         audit_repo = uow.repository(AuditRepository, scope)
         events = await audit_repo.events(run_id)
         chain_valid = await verify_run(audit_repo, request.app.state.keyring, run_id)
     return RunView(
         **{name: row[name] for name in RunView.model_fields if name in row},
         approvals=[ApprovalView.model_validate(dict(a)) for a in approvals],
-        ledger=[
-            LedgerView(**dict(entry), outcome=entry["outcome_payload_masked"]) for entry in ledger
-        ],
+        ledger=ledger_views(ledger, verifying),
         audit=[
             AuditView(
                 seq=event.seq,

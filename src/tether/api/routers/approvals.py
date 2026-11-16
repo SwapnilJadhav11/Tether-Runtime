@@ -17,7 +17,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from pydantic import BaseModel
 from sqlalchemy.engine import RowMapping
 
-from tether.api.routers.tasks import AuditView, LedgerView
+from tether.api.routers.tasks import AuditView, LedgerView, ledger_views
 from tether.audit.access_events import record_run_inspection
 from tether.audit.chain import verify_run
 from tether.authz.deps import approvals_principal, approvals_reader
@@ -314,6 +314,7 @@ async def get_run_evidence(
         ):
             raise HTTPException(status.HTTP_404_NOT_FOUND)
         ledger = await uow.repository(LedgerRepository, reader.scope).for_run(run_id)
+        verifying = await uow.repository(JobsRepository, reader.scope).verifying(run_id)
         audit_repo = uow.repository(AuditRepository, reader.scope)
         events = await audit_repo.events(run_id)
         chain_valid = await verify_run(audit_repo, request.app.state.keyring, run_id)
@@ -322,9 +323,7 @@ async def get_run_evidence(
         **{name: run[name] for name in ApproverRunView.model_fields if name in run},
         requester=_requester_subject(run["requester_snapshot"]),
         approvals=details,
-        ledger=[
-            LedgerView(**dict(entry), outcome=entry["outcome_payload_masked"]) for entry in ledger
-        ],
+        ledger=ledger_views(ledger, verifying),
         audit=[
             AuditView(
                 seq=event.seq,

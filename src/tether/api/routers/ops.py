@@ -25,9 +25,9 @@ from tether.api.routers.tasks import (
     ApprovalView,
     AuditView,
     CancelRequested,
-    LedgerView,
     RunView,
     cancel_as,
+    ledger_views,
 )
 from tether.audit.access_events import record_run_inspection
 from tether.audit.chain import verify_run
@@ -194,6 +194,7 @@ async def get_run_for_oversight(
             raise HTTPException(status.HTTP_404_NOT_FOUND)
         approvals = await uow.repository(ApprovalsRepository, scope).for_run(run_id)
         ledger = await uow.repository(LedgerRepository, scope).for_run(run_id)
+        verifying = await uow.repository(JobsRepository, scope).verifying(run_id)
         audit_repo = uow.repository(AuditRepository, scope)
         events = await audit_repo.events(run_id)
         chain_valid = await verify_run(audit_repo, request.app.state.keyring, run_id)
@@ -201,9 +202,7 @@ async def get_run_for_oversight(
     return RunView(
         **{name: row[name] for name in RunView.model_fields if name in row},
         approvals=[ApprovalView.model_validate(dict(a)) for a in approvals],
-        ledger=[
-            LedgerView(**dict(entry), outcome=entry["outcome_payload_masked"]) for entry in ledger
-        ],
+        ledger=ledger_views(ledger, verifying),
         audit=[
             AuditView(
                 seq=event.seq,

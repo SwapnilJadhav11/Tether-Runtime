@@ -40,6 +40,7 @@ from tether.storage.repos.ledger import LedgerRepository
 from tether.storage.repos.runs import JobsRepository, RunsRepository
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
+from tether.worker.handlers.verify_outcome import verification_payload
 
 TERMINAL_LEDGER_STATES = frozenset({"completed", "failed", "indeterminate", "abandoned"})
 _log = get_logger(__name__)
@@ -86,8 +87,13 @@ async def _record(
     outcome_class: OutcomeClass,
     output: dict[str, Any] | None = None,
     reason: str | None = None,
+    verify: dict[str, Any] | None = None,
 ) -> None:
-    """TX7 (and the not-dispatched failures): outcome + audit + wake the run, atomically."""
+    """TX7 (and the not-dispatched failures): outcome + audit + wake the run, atomically.
+
+    ``verify`` is the ``verify_outcome`` payload when the entry's pinned version declares a
+    read-back: an entry going ``indeterminate`` then enqueues its verification in this same
+    transaction (ADR-0019 rule 9). Without one it goes straight to human reconciliation."""
     changed = await uow.repository(LedgerRepository, scope).transition(
         entry["id"],
         expected=expected,
@@ -111,7 +117,12 @@ async def _record(
         },
         tool=entry["tool"],
     )
-    await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, entry["run_id"])
+    jobs = uow.repository(JobsRepository, scope)
+    await jobs.enqueue(JobKind.ADVANCE_RUN, entry["run_id"])
+    if new == "indeterminate" and verify is not None:
+        await jobs.enqueue(
+            JobKind.VERIFY_OUTCOME, entry["run_id"], ref_id=entry["id"], payload=verify
+        )
     tool = str(entry["tool"])
 
     def recorded() -> None:
@@ -160,9 +171,9 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
             )
             return None
         args = descriptor.input_model.model_validate(job.payload.get("arguments", {}))
+        verify = verification_payload(descriptor, job.payload.get("arguments", {}))
         hashed = call_hash_for(runtime.keys, run, descriptor, args)
         if not call_hashes_equal(hashed, entry["call_hash"]):
-            reason = "call hash mismatch: not dispatched"
             if state == "pending":
                 await _record(
                     uow,
@@ -172,7 +183,24 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
                     expected=state,
                     new="failed",
                     outcome_class=not_applied,
-                    reason=reason,
+                    reason="call hash mismatch: not dispatched",
+                )
+            else:
+                # A re-send is needed but these are not the governed call's arguments, and the
+                # first send may have applied: the outcome is unknown, never not applied, and
+                # the run is woken (as for a pinned version gone after dispatch). Never re-sent.
+                # Verification, if declared, runs only if every ADR-0022 condition holds: its gate
+                # re-checks these arguments against the ledger's call hash and refuses.
+                await _record(
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new=_unknown_state(entry),
+                    outcome_class=OutcomeClass.UNKNOWN,
+                    reason="outcome unknown: call hash mismatch; not re-sent",
+                    verify=verify,
                 )
             return None
         attempt = entry["attempts"] + 1
@@ -219,6 +247,7 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
                     new=_unknown_state(entry),
                     outcome_class=OutcomeClass.UNKNOWN,
                     reason=refusal,
+                    verify=verify,
                 )
                 return None
             event = "REDISPATCHED"
@@ -243,8 +272,9 @@ async def handle(runtime: WorkerRuntime, job: LeasedJob) -> float | None:
     if prepared is None:
         return None
     entry, descriptor, args, attempt = prepared
+    verify = verification_payload(descriptor, job.payload.get("arguments", {}))
     with bound(tool=descriptor.name):
-        return await _send(runtime, scope, entry, descriptor, args, attempt)
+        return await _send(runtime, scope, entry, descriptor, args, attempt, verify)
 
 
 async def _send(
@@ -254,6 +284,7 @@ async def _send(
     descriptor: ToolDescriptor,
     args: BaseModel,
     attempt: int,
+    verify: dict[str, Any] | None,
 ) -> float | None:
     """One send to the tool and its TX7; returns the retry delay, or ``None`` when done."""
     output: dict[str, Any] | None = None
@@ -338,6 +369,7 @@ async def _send(
             outcome_class=outcome_class,
             output=output,
             reason=reason,
+            verify=verify,
         )
     return None
 
@@ -351,7 +383,7 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
     try:
         async with UnitOfWork(runtime.engine) as uow:
             # Lock order: run row → ledger row → audit head → jobs (§13.1).
-            await uow.repository(RunsRepository, scope).share_lock(job.run_id)
+            run = await uow.repository(RunsRepository, scope).share_lock(job.run_id)
             entry = None
             if job.ref_id is not None:
                 entry = await uow.repository(LedgerRepository, scope).lock(job.ref_id)
@@ -370,6 +402,12 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
                 )
             elif entry is not None and entry["state"] == "dispatched":
                 reason = "outcome unknown: delivery exhausted"
+                descriptor = _descriptor(runtime, scope, run, entry)
+                verify = (
+                    None
+                    if isinstance(descriptor, str)
+                    else verification_payload(descriptor, job.payload.get("arguments", {}))
+                )
                 await _record(
                     uow,
                     runtime,
@@ -379,6 +417,7 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
                     new=_unknown_state(entry),
                     outcome_class=OutcomeClass.UNKNOWN,
                     reason=reason,
+                    verify=verify,
                 )
             if not await uow.repository(JobsRepository, scope).mark_dead(job.id, job.lease_token):
                 raise _StaleLease
