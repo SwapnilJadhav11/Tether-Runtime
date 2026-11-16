@@ -1,0 +1,13 @@
+# Scripted model turns: read an issue, label it (no approval), close it (needs approval), report.
+name: label_and_close
+turns:
+  - tool_calls:
+      - tool: get_issue
+        arguments: {issue_number: 1}
+  - tool_calls:
+      - tool: apply_label
+        arguments: {issue_number: 1, label: approved}
+  - tool_calls:
+      - tool: close_issue
+        arguments: {issue_number: 1}
+  - final: "labelled the issue approved and closed it."
