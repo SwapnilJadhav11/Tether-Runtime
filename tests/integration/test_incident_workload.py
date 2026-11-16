@@ -289,8 +289,10 @@ def _settings(db: Any, tmp_path: Path) -> Settings:
 def target(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     app = create_demo_target()
     demo_client.set_transport(httpx.ASGITransport(app=app))
-    # Retries are due at once; the PD-13 backoff delays are covered by the retry tests.
+    # Retries and verification probes are due at once; the PD-13 backoff delays are covered by the
+    # retry tests.
     monkeypatch.setattr(backoff, "tool_backoff_seconds", lambda attempt, rng=None: 0.0)
+    monkeypatch.setattr(backoff, "verify_backoff_seconds", lambda declared, attempt, rng=None: 0.0)
     yield app
     demo_client.set_transport(None)
 
@@ -465,10 +467,15 @@ async def test_t20_the_real_restart_exhausting_its_retries_is_indeterminate_not_
     # Every send is applied-then-lost. Were a send to carry a new key, the target would restart
     # again; one restart across three sends proves the same key was reused.
     world.faults.restart[:] = ["applied_then_unavailable"] * 3
+    # And the read-back cannot answer either (W5.1): automatic verification cannot establish the
+    # outcome, so it stays a person's question (ADR-0019 rule 11).
+    world.faults.restart_check[:] = ["unavailable"] * 3
     assert (await world.approve(approval_id)).status_code == 200
     await world.drain()
     [(_, _, state, outcome_class, attempts)] = world.ledger(run_id)
     assert (state, outcome_class, attempts) == ("indeterminate", "unknown", 3)
+    assert world.events(run_id).count("VERIFICATION_INCONCLUSIVE") == 3
+    assert world.events(run_id).count("VERIFICATION_EXHAUSTED") == 1
     assert world.status(run_id) == "awaiting_reconciliation"
     assert world.events(run_id).count("DISPATCHED") == 1  # the first send
     assert world.events(run_id).count("REDISPATCHED") == 2
@@ -602,3 +609,86 @@ async def test_t23_approving_the_adversarial_change_is_the_only_way_it_applies(
     config = await world.target_get("/services/checkout/config")
     assert (config["config_version"], config["values"]["auth.enabled"]) == (2, "false")
     assert world.approval(run_id)[4] == "bob"
+
+
+# --- T-27 (W5.1): the real restart's read-back --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_t27_the_real_restart_lost_behind_503s_is_verified_applied_without_a_person(
+    world: World,
+) -> None:
+    run_id, approval_id = await to_approval(world, "restart")
+    world.faults.restart[:] = ["applied_then_unavailable"] * 3
+    assert (await world.approve(approval_id)).status_code == 200
+    await world.drain()
+    [(state, resolution, resolved_by, evidence)] = world.sql(
+        "SELECT state, resolution, resolved_by, verification_evidence_masked"
+        " FROM tether.ledger_entries WHERE run_id = %s",
+        run_id,
+    )
+    assert (state, resolution, resolved_by) == (
+        "completed",
+        "verified_applied",
+        "system:verification",
+    )
+    assert evidence == {"service": "checkout", "applied": True}
+    assert world.status(run_id) == "succeeded"
+    assert (await world.target_get("/services/checkout"))["restarts"] == 1
+    assert world.provider.results(1) == [("call_0_0", "applied")]
+    # One approval only: the read-back needed no second one (ADR-0022).
+    assert world.events(run_id).count("APPROVAL_REQUESTED") == 1
+    assert "RECONCILED" not in world.events(run_id)
+    assert (await world.view(run_id))["audit_chain_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_t27_a_restart_that_never_reached_the_target_is_verified_not_applied(
+    world: World,
+) -> None:
+    run_id, approval_id = await to_approval(world, "restart")
+    world.faults.restart[:] = ["unavailable"] * 3
+    assert (await world.approve(approval_id)).status_code == 200
+    await world.drain()
+    [(state, resolution)] = world.sql(
+        "SELECT state, resolution FROM tether.ledger_entries WHERE run_id = %s", run_id
+    )
+    assert (state, resolution) == ("failed", "verified_not_applied")
+    assert (await world.target_get("/services/checkout"))["restarts"] == 0
+    assert world.provider.results(1) == [("call_0_0", "not_applied")]
+    assert world.status(run_id) == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_t27_no_mutation_contract_probing_the_demo_target_changes_nothing(
+    world: World,
+) -> None:
+    """ADR-0019 Consequences: however many times the read-back runs, for a key that applied and
+    for one that did not, the target's state is identical before and after."""
+    from workloads.incident_remediation.tools import ServiceRef, restart_service
+
+    from tether.sdk import ToolContext, VerifyContext
+
+    applied_key, unknown_key = "tth_" + "a" * 52, "tth_" + "b" * 52
+    await restart_service.handler(ServiceRef(service="checkout"), ToolContext(applied_key))
+
+    async def snapshot() -> tuple[Any, ...]:
+        return (
+            await world.target_get("/services/checkout"),
+            await world.target_get("/services/checkout/config"),
+            await world.target_get("/services/checkout/logs"),
+            await world.target_get(f"/services/checkout/restarts/{applied_key}"),
+            await world.target_get(f"/services/checkout/restarts/{unknown_key}"),
+        )
+
+    before = await snapshot()
+    declaration = restart_service.verify
+    assert declaration is not None
+    kinds = []
+    for _ in range(25):
+        for key in (applied_key, unknown_key):
+            result = await declaration.probe(ServiceRef(service="checkout"), VerifyContext(key))
+            kinds.append(result.kind)
+    assert await snapshot() == before
+    assert set(kinds) == {"confirmed_applied", "confirmed_not_applied"}
+    assert before[0]["restarts"] == 1

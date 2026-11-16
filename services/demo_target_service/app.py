@@ -6,6 +6,9 @@ MVP scope: state and idempotency records live in memory (a restart of this proce
 W9.3 additions, all deterministic: a versioned configuration with a target-enforced precondition
 (``expected_config_version``), a log feed that can carry an adversarial line, and fault switches
 that tests set in process through ``app.state.faults`` (there is no network control endpoint).
+
+W5.1 addition: a read-back of a restart by its idempotency key, for the workload's ADR-0019
+``verify`` probe. It only reads.
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ class Faults:
 
     restart: list[str] = field(default_factory=list)
     config: list[str] = field(default_factory=list)
+    # W5.1: scripts each read-back of a restart by idempotency key: ``ok`` or ``unavailable``.
+    restart_check: list[str] = field(default_factory=list)
     malformed_health: bool = False
     adversarial_logs: bool = False
 
@@ -97,6 +102,16 @@ def create_app() -> FastAPI:
     @app.get("/services/{name}/config")
     async def read_config(name: str) -> dict[str, Any]:
         return {**config_view(name), "values": dict(configs[name]["values"])}
+
+    @app.get("/services/{name}/restarts/{idempotency_key}")
+    async def restart_check(name: str, idempotency_key: str) -> dict[str, Any]:
+        """A safe read: whether a restart sent with this idempotency key took effect on this
+        service. Definitive either way, because every applied restart is recorded by its key."""
+        if next_fault(faults.restart_check) == "unavailable":
+            raise HTTPException(503, "unavailable")
+        view(name)
+        found = applied.get(idempotency_key)
+        return {"service": name, "applied": found is not None and found[0] == name}
 
     @app.post("/services/{name}/restart")
     async def restart(
