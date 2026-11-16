@@ -290,6 +290,7 @@ def test_the_database_password_is_registered_with_the_scrubber(raw_log: io.Strin
     password = f"pw-{uuid.uuid4().hex}"
     settings = Settings(
         database_url=SecretStr(f"postgresql://tether_app:{password}@db:5432/tether"),
+        env="test",
     )
     telemetry.register_settings_secrets(settings)
     tether_logging.get_logger("probe").warning(f"could not reach {password}")

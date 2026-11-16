@@ -1,7 +1,7 @@
 # Production configuration and dev/test separation
 
 > **Status:** required V1 documentation (direction record TDR-020; owner decision D-12)
-> **Baseline:** commit `ec35254`. Several controls described here are **required, not yet implemented**; §4 lists the gap for each. §6 (migration rollout and downgrade rules) was added with W2.4 on 2026-11-14.
+> **Baseline:** commit `ec35254`. Several controls described here are **required, not yet implemented**; §4 lists the gap for each. §6 (migration rollout and downgrade rules) was added with W2.4 on 2026-11-14. The explicit-environment and scripted-provider controls (§3; §4 items 1 and 2) are implemented by W7.1; the production image variant (§4 items 3 to 5) is W7.2.
 
 ## 1. Principle
 
@@ -11,7 +11,7 @@ Production operation must fail closed. A production process never silently selec
 
 | Setting | Required value in production | Purpose |
 |---|---|---|
-| `TETHER_ENV` | `prod`, **explicit** | Selects the production startup path. **D-12:** absent or invalid → `tether-api` and `tether-worker` must refuse to start. |
+| `TETHER_ENV` | `prod`, **explicit** | Selects the production startup path. **D-12:** absent or invalid → `tether-api`, `tether-worker`, `tether-worker-healthcheck` and every database-connecting `tether` command (`migrate`, `bootstrap`, `audit`) refuse to start with exit code 2 and a message that names `TETHER_ENV` and the three valid values, never a credential. `tether --help` and `tether apikey new` need no environment. |
 | `TETHER_DATABASE_URL` | `postgresql://tether_app:…@…/tether` | Least-privilege application role (no DDL, no DELETE, append-only audit) |
 | `TETHER_MIGRATOR_DATABASE_URL` | `tether_migrator` role, used only by `tether migrate` and `tether bootstrap apply` | Separates schema and configuration writes from runtime |
 | `TETHER_BOOTSTRAP_FILE` | path to the reviewed, version-controlled bootstrap YAML | Workspaces, issuers (public keys only), API-key hashes, agents, policy (ADR-0014) |
@@ -29,9 +29,9 @@ Settings that must **not** be set or must have no effect in production: `TETHER_
 
 | Control | Design | At baseline `ec35254` |
 |---|---|---|
-| Explicit environment | `TETHER_ENV` must be present and one of `dev`, `test`, `prod` | `Settings.env` defaults to `dev` when unset (`src/tether/settings.py:26`). **Gap (D-12).** |
-| Dev identity shortcut | Only with `TETHER_ENV ∈ {dev, test}` and no `Authorization` header; produces the same `Principal` and passes the same authorization as a real token; `401` in `prod` | Implemented and isolated in `src/tether/api/dev_identity.py`; depends on the environment default above |
-| Scripted model provider | Loads only with an explicit `dev`/`test`; the production provider is selected by configuration | Refuses only `prod`; it is the driver's **default** provider (`src/tether/runtime/driver.py:88`); no provider setting exists. **Gap (D-12, TDR-004).** |
+| Explicit environment | `TETHER_ENV` must be present and one of `dev`, `test`, `prod` | **Implemented (W7.1).** `Settings.env` and `MigrationSettings.env` have no default; the entrypoints read settings through `load_settings()` and the CLI gates its database commands in one place (`src/tether/cli/main.py`). Tests: `tests/unit/test_T32_explicit_environment.py`. |
+| Dev identity shortcut | Only with `TETHER_ENV ∈ {dev, test}` and no `Authorization` header; produces the same `Principal` and passes the same authorization as a real token; `401` in `prod` | Implemented and isolated in `src/tether/api/dev_identity.py`. The environment is now always explicit, so an omitted variable cannot enable it. The module is still part of every build (the route dependencies import it); it is inert unless the environment is `dev` or `test`. |
+| Scripted model provider | Loads only with an explicit `dev`/`test`; the production provider is selected by configuration | **Implemented (W7.1).** The provider is chosen by `TETHER_MODEL_PROVIDER` (`src/tether/providers/factory.py`). `ScriptedProvider` accepts only `dev` or `test` (an allow-list: `prod`, unset and misspelt values are all refused) and decides before it reads any scenario file. The factory imports it only for the `scripted` choice, so a build without the module reports a configuration error. `TETHER_MODEL_PROVIDER` still defaults to `scripted`, which `prod` refuses: a production deployment sets `TETHER_MODEL_PROVIDER=openai` explicitly. |
 | Scenario files | Dev/test only | Copied into the runtime image (`Dockerfile`: `COPY workloads/incident_remediation/scenarios /app/scenarios`). **Gap (D-12).** |
 | Demo components | `demo-target-service` is a separate container and must not be in the production stack; the reference workload is a demo client | Workload wheel is installed in the runtime image by design (entry point); demo target is a separate image. Production build must exclude demo-only workloads. **Gap (D-12).** |
 | Issuer private keys | Never deployed with Tether; dev minting tool outside the image | Correct: `tools/dev_issuer/.keys/` is git-ignored; `config/bootstrap/dev.yaml` holds public keys and API-key hashes only; bootstrap rejects private key material |
@@ -41,8 +41,8 @@ Settings that must **not** be set or must have no effect in production: `TETHER_
 
 ## 4. Required changes before a production claim (D-12)
 
-1. Make `TETHER_ENV` mandatory: no default; invalid or missing → startup error naming the variable.
-2. Select the model provider by configuration; the scripted provider is constructible only when `TETHER_ENV` is `dev` or `test`, and the production configuration must name a real provider (OpenAI first).
+1. **Done (W7.1).** `TETHER_ENV` is mandatory: no default; invalid or missing → startup error naming the variable.
+2. **Done (W7.1).** The model provider is selected by configuration; the scripted provider is constructible only when `TETHER_ENV` is `dev` or `test`.
 3. Build a production image variant (or build argument) that contains no scenario files and no demo-only workload; keep the dev image for Compose.
 4. Add `T-32`: unit tests for the startup refusal and the environment binding of the dev shortcut and scripted provider; a build inspection that the production image lacks scenario files.
 5. Document the Compose stack as **development only** (`TETHER_ENV=dev` is set explicitly in `deploy/compose/docker-compose.yml`), and provide a production example environment file with placeholders only.

@@ -15,7 +15,6 @@ from tether.providers.protocol import ModelProvider
 from tether.secrets.env_provider import EnvSecretsProvider
 from tether.secrets.provider import SecretsProvider
 from tether.settings import Settings
-from tether.testing.scripted import ScriptedProvider
 
 OPENAI_API_KEY_NAME = "TETHER_OPENAI_API_KEY"
 
@@ -28,7 +27,15 @@ def build_provider(settings: Settings, *, secrets: SecretsProvider | None = None
     """The provider named by ``settings.provider`` (``TETHER_MODEL_PROVIDER``)."""
     match settings.provider:
         case "scripted":
-            # Refuses to load outside an explicit dev/test environment (ADR-0016 rule 6).
+            # Only with an explicit dev/test environment (ADR-0016 rule 6, W7.1): the provider's
+            # constructor refuses anything else before it reads a scenario. The production image
+            # does not contain the module at all, so it is imported here and nowhere else.
+            try:
+                from tether.testing.scripted import ScriptedProvider
+            except ImportError:
+                raise ProviderConfigurationError(
+                    "the scripted provider is not part of this build"
+                ) from None
             return ScriptedProvider(settings.scenarios_dir, env=settings.env)
         case "openai":
             if not settings.openai_model:

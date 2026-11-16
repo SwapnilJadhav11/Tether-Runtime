@@ -64,7 +64,7 @@ def live_provider() -> OpenAIProvider:
     # The provider path needs no database, so this proof must not require one either: a
     # placeholder DSN keeps `Settings` valid without asking the operator to set one. It is
     # never connected to.
-    settings = Settings(database_url=SecretStr("postgresql://unused/unused"))
+    settings = Settings(database_url=SecretStr("postgresql://unused/unused"), env="test")
     provider = build_provider(settings, secrets=EnvSecretsProvider())
     assert isinstance(provider, OpenAIProvider), (
         f"set TETHER_MODEL_PROVIDER=openai; configuration selected {type(provider).__name__}"

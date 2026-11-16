@@ -110,7 +110,7 @@ def test_tether_and_langgraph_schemas_exist(test_db: TestDatabase) -> None:
 
 
 def test_readyz_returns_200_against_the_database(test_db: TestDatabase) -> None:
-    settings = Settings(database_url=SecretStr(test_db.app_dsn))
+    settings = Settings(database_url=SecretStr(test_db.app_dsn), env="test")
     with TestClient(create_app(settings)) as client:
         assert client.get("/healthz").status_code == 200
         assert client.get("/readyz").status_code == 200

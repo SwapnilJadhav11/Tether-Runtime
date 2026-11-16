@@ -15,17 +15,22 @@ DSN = SecretStr("postgresql://tether_app:x@127.0.0.1:1/tether")
 
 
 def test_the_heartbeat_interval_defaults_to_a_third_of_the_lease() -> None:
-    settings = Settings(database_url=DSN, worker_lease_seconds=30.0)
+    settings = Settings(database_url=DSN, env="test", worker_lease_seconds=30.0)
     assert settings.lease_heartbeat_interval == pytest.approx(10.0)
 
 
 def test_an_explicit_heartbeat_interval_must_be_below_the_lease() -> None:
-    ok = Settings(database_url=DSN, worker_lease_seconds=30.0, worker_lease_heartbeat_seconds=5.0)
+    ok = Settings(
+        database_url=DSN, env="test", worker_lease_seconds=30.0, worker_lease_heartbeat_seconds=5.0
+    )
     assert ok.lease_heartbeat_interval == 5.0
     for bad in (30.0, 45.0):
         with pytest.raises(ValidationError):
             Settings(
-                database_url=DSN, worker_lease_seconds=30.0, worker_lease_heartbeat_seconds=bad
+                database_url=DSN,
+                env="test",
+                worker_lease_seconds=30.0,
+                worker_lease_heartbeat_seconds=bad,
             )
 
 

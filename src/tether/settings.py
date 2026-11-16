@@ -6,12 +6,16 @@ credentials, so they are ``SecretStr`` and never rendered in reprs, dumps or log
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+ENVIRONMENTS = ("dev", "test", "prod")
+EXIT_CONFIGURATION = 2
 
 
 def _default_heartbeat_file() -> Path:
@@ -26,7 +30,9 @@ class Settings(BaseSettings):
     # aliased field passed by name without a word.
     model_config = SettingsConfigDict(env_prefix="TETHER_", extra="ignore", populate_by_name=True)
 
-    env: Literal["dev", "test", "prod"] = "dev"
+    # No default (W7.1, D-12): the environment is always stated, never assumed. Absent or invalid,
+    # the process refuses to start rather than quietly running as `dev`.
+    env: Literal["dev", "test", "prod"]
 
     # Connection string for the least-privilege application role (no DDL).
     database_url: SecretStr
@@ -106,4 +112,61 @@ class MigrationSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="TETHER_", extra="ignore")
 
+    # Explicit here too (W7.1): the migrate and bootstrap commands connect to the database.
+    env: Literal["dev", "test", "prod"]
     migrator_database_url: SecretStr
+
+
+def configuration_problems(error: ValidationError) -> list[str]:
+    """One line per invalid or missing setting. Names only: a value can be a credential."""
+    lines: list[str] = []
+    for item in error.errors():
+        location = str(item["loc"][0]) if item["loc"] else "settings"
+        name = location.upper()
+        if not name.startswith("TETHER_"):
+            name = f"TETHER_{name}"
+        if name == "TETHER_ENV":
+            lines.append(f"TETHER_ENV must be set explicitly to one of: {', '.join(ENVIRONMENTS)}")
+        elif item["type"] == "missing":
+            lines.append(f"{name} is required")
+        else:
+            lines.append(f"{name} is invalid")
+    return lines
+
+
+class _EnvironmentOnly(BaseSettings):
+    """Just ``TETHER_ENV``: lets a command check the environment before reading anything else."""
+
+    model_config = SettingsConfigDict(env_prefix="TETHER_", extra="ignore")
+
+    env: Literal["dev", "test", "prod"]
+
+
+def require_explicit_environment() -> None:
+    """Exit non-zero, naming the variable, unless ``TETHER_ENV`` is explicitly valid (W7.1)."""
+    try:
+        _EnvironmentOnly()
+    except ValidationError as error:
+        print(  # noqa: T201 - a startup failure for the operator, before logging exists
+            "tether: invalid configuration\n"
+            + "\n".join(f"  {line}" for line in configuration_problems(error)),
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_CONFIGURATION) from None
+
+
+def load_settings() -> Settings:
+    """Read the process settings, or exit non-zero with a clear message (W7.1).
+
+    The message lists the names of the offending variables and nothing else, so it can never
+    carry a database URL or another credential into a container log.
+    """
+    try:
+        return Settings()
+    except ValidationError as error:
+        print(  # noqa: T201 - a startup failure for the operator, before logging exists
+            "tether: invalid configuration\n"
+            + "\n".join(f"  {line}" for line in configuration_problems(error)),
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_CONFIGURATION) from None

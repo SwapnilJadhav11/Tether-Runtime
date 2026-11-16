@@ -37,6 +37,7 @@ def test_worker_stops_on_request_and_writes_no_heartbeat_without_a_database(
     beat = tmp_path / "beat"
     settings = Settings(
         database_url=UNREACHABLE_DSN,
+        env="test",
         readiness_timeout_seconds=0.2,
         worker_poll_interval_seconds=0.05,
         worker_heartbeat_file=beat,
