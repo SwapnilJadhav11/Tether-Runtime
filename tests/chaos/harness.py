@@ -35,7 +35,16 @@ from tether.policy.config import BootstrapFile
 from tether.providers.history import ModelTurn, NeutralMessage
 from tether.registry.registry import ToolRegistry
 from tether.runtime.driver import WorkerRuntime
-from tether.sdk import AgentDefinition, ToolContext, ToolDescriptor, ToolNotApplied, Workload
+from tether.sdk import (
+    AgentDefinition,
+    ToolContext,
+    ToolDescriptor,
+    ToolNotApplied,
+    VerificationResult,
+    VerifyContext,
+    VerifyDeclaration,
+    Workload,
+)
 from tether.settings import Settings
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.uow import UnitOfWork
@@ -65,6 +74,7 @@ BOOT = BootstrapFile.model_validate(
                         {"tool": "probe_nonidem", "decision": "allow"},
                         {"tool": "probe_read_strict", "decision": "allow"},
                         {"tool": "probe_cas", "decision": "allow"},
+                        {"tool": "probe_verified", "decision": "allow"},
                     ],
                     "reconciliation": {"reconciler_roles": ["reconciler"]},
                     # ADR-0020: requester permissions (by role) ∩ agent permissions.
@@ -98,6 +108,12 @@ SCENARIOS = {
         "  - tool_calls: [{tool: probe_read_strict, arguments: {target: a}},"
         " {tool: probe_write, arguments: {target: a}}]\n"
         "  - final: read\n"
+    ),
+    # W5.1: a non-idempotent write that declares a read-back (ADR-0019).
+    "verified": (
+        "name: verified\nturns:\n"
+        "  - tool_calls: [{tool: probe_verified, arguments: {target: a}}]\n"
+        "  - final: verified\n"
     ),
     # W3.2: a compare-and-swap write whose expected version is stale (T-21).
     "cas_stale": (
@@ -151,6 +167,13 @@ class Target:
     in_flight: int = 0
     gate: asyncio.Event | None = None
     cas_version: int = 7  # the compare-and-swap probe's current version
+    # W5.1 read-backs: ``probes`` counts them, ``probing`` how many are in flight, ``probe_gate``
+    # holds each in flight until set, ``probe_script`` decides each (``read`` or
+    # ``inconclusive``). A read-back only reads ``effects``; it never changes anything.
+    probes: int = 0
+    probing: int = 0
+    probe_gate: asyncio.Event | None = None
+    probe_script: list[str] = field(default_factory=list)
 
     async def _send(self, ctx: ToolContext) -> str:
         self.sends += 1
@@ -184,6 +207,32 @@ class Target:
         if step == "drop":
             raise httpx.RemoteProtocolError("connection dropped after the request was applied")
         return ProbeOut(target=args.target)
+
+    async def verified(self, args: ProbeIn, ctx: ToolContext) -> ProbeOut:
+        """Non-idempotent; ``drop`` applies then loses the answer, ``timeout`` applies nothing."""
+        step = await self._send(ctx)
+        if step == "timeout":
+            raise httpx.ReadTimeout("no response")
+        self.effects.add(ctx.idempotency_key)
+        if step == "drop":
+            raise httpx.RemoteProtocolError("connection dropped after the request was applied")
+        return ProbeOut(target=args.target)
+
+    async def read_back(self, args: ProbeIn, ctx: VerifyContext) -> VerificationResult:
+        self.probes += 1
+        self.probing += 1
+        try:
+            if self.probe_gate is not None:
+                await self.probe_gate.wait()
+        finally:
+            self.probing -= 1
+        step = self.probe_script.pop(0) if self.probe_script else "read"
+        evidence = ProbeOut(target=args.target)
+        if step == "inconclusive":
+            return VerificationResult("inconclusive", evidence)
+        if ctx.idempotency_key in self.effects:
+            return VerificationResult("confirmed_applied", evidence)
+        return VerificationResult("confirmed_not_applied", evidence)
 
     async def read_strict(self, args: ProbeIn, ctx: ToolContext) -> ProbeOut:
         await self._send(ctx)
@@ -232,6 +281,14 @@ async def _cas(args: CasIn, ctx: ToolContext) -> ProbeOut:
     return await TARGET.cas(args, ctx)
 
 
+async def _verified(args: ProbeIn, ctx: ToolContext) -> ProbeOut:
+    return await TARGET.verified(args, ctx)
+
+
+async def _read_back(args: ProbeIn, ctx: VerifyContext) -> VerificationResult:
+    return await TARGET.read_back(args, ctx)
+
+
 PROBES = (
     _probe("probe_write", "supported", _idem),
     _probe("probe_nonidem", "unsupported", _nonidem),
@@ -259,6 +316,21 @@ PROBES = (
         risk="low",
         required_permissions=("probe:write",),
         preconditions=("expected_version",),
+    ),
+    ToolDescriptor(
+        name="probe_verified",
+        version="1.0.0",
+        description="Chaos test non-idempotent write with a read-back.",
+        input_model=ProbeIn,
+        output_model=ProbeOut,
+        effect="write",
+        idempotency="unsupported",
+        handler=_verified,
+        risk="low",
+        required_permissions=("probe:write",),
+        verify=VerifyDeclaration(
+            probe=_read_back, evidence_model=ProbeOut, required_permissions=("probe:read",)
+        ),
     ),
 )
 TEST_WORKLOAD = Workload(
@@ -532,8 +604,15 @@ class Env:
             assert attempts == len(dispatched) + len(redispatched)
             if state not in ("pending", "dispatched"):
                 assert keys[f"outcome:{entry_id}"][0] == "TOOL_OUTCOME"
-            if resolution is not None:
+            if str(resolution or "").startswith("verified_"):
+                # ADR-0019 rule 10: resolved by a probe, never also by a person.
+                assert keys[f"verified:{ordinal}"][0] == "VERIFIED"
+                assert keys[f"verified:{ordinal}"][1]["resolution"] == resolution
+                assert f"reconciled:{entry_id}" not in keys
+            elif resolution is not None:
                 assert keys[f"reconciled:{entry_id}"][0] == "RECONCILED"
+                assert f"verified:{ordinal}" not in keys
+            self._assert_verification_story(audit, entry_id, ordinal)
         # ADR-0012 rule 4 (W2.3): a skipped call is a decision-class event for its own ordinal,
         # caused by an earlier call of the same turn that did not apply. It was never governed,
         # approved or ledgered.
@@ -563,6 +642,39 @@ class Env:
             assert not [e for e in entries if e[2] in ("pending", "dispatched")]
         else:
             assert "run_finished" not in keys
+
+    def _assert_verification_story(
+        self, audit: list[tuple[Any, ...]], entry_id: Any, ordinal: int
+    ) -> None:
+        """W5.1 (ADR-0019 rules 9-11): every probe result follows its own committed gate; the
+        gate count is the entry's ``verification_attempts``; verification ends at most once; a
+        stop's skip comes with that end; nothing about verification touches the write's sends."""
+        [(verification_attempts,)] = self.sql(
+            "SELECT verification_attempts FROM tether.ledger_entries WHERE id = %s", entry_id
+        )
+        seq_of = {dedupe: seq for seq, dedupe, *_ in audit}
+        gates = {
+            int(dedupe.rsplit(":", 1)[1]): seq
+            for dedupe, seq in seq_of.items()
+            if dedupe.startswith(f"verification_attempted:{ordinal}:")
+        }
+        assert sorted(gates) == list(range(1, verification_attempts + 1))
+        for _, dedupe, event, payload in audit:
+            if event in ("VERIFIED", "VERIFICATION_INCONCLUSIVE", "VERIFICATION_LATE"):
+                if payload["ledger_id"] != str(entry_id):
+                    continue
+                attempt = payload["attempt"]
+                assert attempt in gates, (dedupe, sorted(gates))
+                assert gates[attempt] < seq_of[dedupe]
+                assert payload["result"] in (
+                    "confirmed_applied",
+                    "confirmed_not_applied",
+                    "inconclusive",
+                )
+        ended = [d for d in seq_of if d == f"verification_exhausted:{ordinal}"]
+        assert len(ended) <= 1
+        if f"verification_skipped:{ordinal}" in seq_of:
+            assert ended, "a skipped probe always ends verification"
 
     async def assert_terminal_stable(self, run_id: uuid.UUID, worker: WorkerRuntime) -> None:
         """A terminal run never reopens: wakes, timers, cancels and direct writes change nothing."""
@@ -599,6 +711,9 @@ def reset_target(gate: asyncio.Event | None = None) -> Target:
     TARGET.sends = TARGET.nonidem_effects = TARGET.in_flight = 0
     TARGET.gate = gate
     TARGET.cas_version = 7
+    TARGET.probes = TARGET.probing = 0
+    TARGET.probe_gate = None
+    TARGET.probe_script.clear()
     return TARGET
 
 
