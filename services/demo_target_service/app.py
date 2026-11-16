@@ -110,6 +110,8 @@ def create_app() -> FastAPI:
             original_name, response = applied[idempotency_key]
             if original_name != name:
                 raise HTTPException(422, "idempotency key reused for a different request")
+            if fault == "applied_then_unavailable":  # the answer is lost again
+                raise HTTPException(503, "unavailable")
             return response
         view(name)
         services[name]["restarts"] += 1
@@ -133,6 +135,8 @@ def create_app() -> FastAPI:
             original_name, original_change, response = config_applied[idempotency_key]
             if (original_name, original_change) != (name, change):
                 raise HTTPException(422, "idempotency key reused for a different request")
+            if fault == "applied_then_unavailable":  # the answer is lost again
+                raise HTTPException(503, "unavailable")
             return response
         config_view(name)
         if change.expected_config_version != configs[name]["version"]:
