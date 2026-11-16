@@ -17,8 +17,15 @@ a vendor, so switching provider changes no code.
 | `TETHER_OPENAI_MODEL` | *none* | Required when the provider is `openai`. There is deliberately no default: Tether never spends on a model nobody chose. |
 | `TETHER_OPENAI_BASE_URL` | `https://api.openai.com/v1` | For a proxy or an OpenAI-compatible gateway. |
 | `TETHER_OPENAI_TIMEOUT_SECONDS` | `60` | Upper bound on one model call. |
+| `TETHER_PROVIDER_MAX_ATTEMPTS` | `3` | Provider attempts per model turn, retries included (W3.3). Must be positive. |
 
 `TETHER_ENV` still governs the scripted provider: it refuses to load when `TETHER_ENV=prod`.
+
+The compose stack (`deploy/compose/docker-compose.yml`) passes `TETHER_MODEL_PROVIDER`,
+`TETHER_OPENAI_MODEL` and `TETHER_OPENAI_API_KEY` from `deploy/compose/.env` to `api` and
+`worker`. Left unset, the provider is `scripted` and the stack behaves as before. To run the
+stack on OpenAI, set all three in `.env` (git-ignored; `.env.example` holds empty placeholders
+only).
 
 ## Credential handling
 
@@ -58,9 +65,24 @@ module, and a test fails if the SDK is imported anywhere else in the core.
   the tool's input model itself and never relies on provider-side validation.
 - **Usage** is taken from the provider's `usage` object and never estimated. A field the provider
   does not report stays `None`. Dollar cost is deferred (D-7); no price is derived.
-- **No retry and no fallback.** A failure is classified and reported; `ProviderError.retryable`
-  says whether another attempt could plausibly succeed. Bounded, stop-gated retry is plan step
-  W3.3, and automatic failover is deferred (D-5), designed in ADR-0016 and not implemented.
+- **No retry inside the adapter, and no fallback.** A failure is classified and reported;
+  `ProviderError.retryable` says whether another attempt could plausibly succeed. The run graph
+  does the retrying (below). Automatic failover is deferred (D-5), designed in ADR-0016 and not
+  implemented.
+
+### Bounded, stop-gated retry (W3.3)
+
+The run graph's `call_model` node retries a **retryable** error only (ADR-0016 rule 3), up to
+`TETHER_PROVIDER_MAX_ATTEMPTS` attempts per model turn. Between attempts it waits the PD-13
+backoff (base 0.5 s, doubling, capped at 5 s, full jitter). Before **every** attempt it takes the
+fenced run guard and checks the stop predicate (ADR-0006); after every attempt it records the
+attempt's row and checks the stop again. A stop committed at any point ends the run
+`cancelled`/`timed_out` with no further provider call. A non-retryable error, or the last
+attempt failing, ends the run `failed`. After a worker crash mid-sequence the node re-runs from
+attempt 1; every attempt still gets its own row and none is deduplicated.
+
+A slow model call can outlive the 60-second job lease. That is safe (the per-run lock and the
+fencing token still hold) and goes away with lease heartbeats (W6.1).
 
 ### Error classification
 
@@ -91,7 +113,7 @@ Every model attempt writes one `tether.model_calls` row inside the run's existin
 
 | Column | Written |
 |---|---|
-| `provider`, `model`, `turn_ordinal`, `attempt`, `status` | always |
+| `provider`, `model`, `turn_ordinal`, `attempt`, `status`, `occurrence_id` | always; `attempt` is the attempt number within the turn, and every attempt has its own `occurrence_id` |
 | `input_tokens`, `output_tokens` | the provider's own figures; `NULL` when it reported none |
 | `error_code` | on a failed call: the normalised code from the table above |
 | `cost_usd` | never — dollar cost is deferred (D-7) |
@@ -127,4 +149,10 @@ TETHER_OPENAI_MODEL=<an inexpensive model that supports tool calling>
 ```
 
 It sends a synthetic operations prompt and a two-tool manifest, nothing from the repository or
-any real system, and costs a few hundred tokens.
+any real system, and costs a few hundred tokens. It also runs
+`tests/integration/test_live_openai_governed_run.py`: one governed incident-remediation run on
+the real model against the in-process demo target, approved by a second identity, asserting
+structural facts only (terminal status, complete decision/authorization/dispatch/outcome events
+per executed call, a valid audit chain, OpenAI rows with reported tokens). That test needs the
+test database (the task starts it) and skips unless the run selected `-m live`, so a key left in
+`.env` never makes `poe test-integration` spend. It costs a few model turns.

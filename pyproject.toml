@@ -214,8 +214,13 @@ help = "Provider contract suite on the scripted provider and the OpenAI adapter 
 cmd = "pytest tests/contract/providers -m 'not live'"
 
 [tool.poe.tasks.test-live]
-help = "Live provider proof against the real OpenAI API (T-11). Needs TETHER_MODEL_PROVIDER=openai, TETHER_OPENAI_API_KEY and TETHER_OPENAI_MODEL; skips without them. Never run in ordinary CI."
-cmd = "pytest tests/contract/providers -m live"
+help = "Live provider proof against the real OpenAI API (T-11), including one governed run end to end. Needs TETHER_MODEL_PROVIDER=openai, TETHER_OPENAI_API_KEY and TETHER_OPENAI_MODEL; skips without them. Paid calls: never run in ordinary CI."
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "pytest tests/contract/providers tests/integration/test_live_openai_governed_run.py -m live",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
 
 [tool.poe.tasks.test-contract]
 help = "LangGraph semantics contract suite on the pinned versions (required on every LangGraph bump)"
