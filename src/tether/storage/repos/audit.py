@@ -62,6 +62,12 @@ class AuditRecord:
         )
 
 
+@dataclass(frozen=True)
+class AuditHead:
+    seq: int
+    last_mac: str | None
+
+
 class AuditRepository(ScopedRepository):
     table = tables.audit_events
 
@@ -89,6 +95,14 @@ class AuditRepository(ScopedRepository):
         )
         rows = (await self._connection.execute(statement)).mappings().all()
         return [AuditRecord.from_row(row) for row in rows]
+
+    async def head(self, run_id: uuid.UUID) -> AuditHead | None:
+        """The run's persisted chain head (a plain read, no lock), or None if it has none."""
+        statement = select(_HEADS).where(
+            _HEADS.c.run_id == run_id, _HEADS.c.workspace_id == self.scope.workspace_id
+        )
+        row = (await self._connection.execute(statement)).mappings().first()
+        return None if row is None else AuditHead(seq=row["seq"], last_mac=row["last_mac"])
 
     async def append(
         self,
