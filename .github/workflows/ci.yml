@@ -85,6 +85,10 @@ jobs:
       - name: Integration tests
         run: uv run poe test-integration
 
+      # T-24 matrix, route inventory, ops run view and access events, on the same test database.
+      - name: Authorization matrix
+        run: uv run poe test-authz
+
       - name: LangGraph contract tests
         run: uv run poe test-contract
 
