@@ -29,6 +29,8 @@ class _ScriptedCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # A call whose arguments an adapter could not parse (W3.4): scripted without arguments.
+    malformed: bool = False
 
 
 class _Turn(BaseModel):
@@ -84,7 +86,12 @@ class ScriptedProvider:
             return ModelTurn(text=turn.final)
         return ModelTurn(
             tool_calls=tuple(
-                ToolCallProposal(call_id=f"call_{index}_{i}", tool=c.tool, arguments=c.arguments)
+                ToolCallProposal(
+                    call_id=f"call_{index}_{i}",
+                    tool=c.tool,
+                    arguments=c.arguments,
+                    malformed=c.malformed,
+                )
                 for i, c in enumerate(turn.tool_calls)
             )
         )

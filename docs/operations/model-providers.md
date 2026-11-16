@@ -18,6 +18,7 @@ a vendor, so switching provider changes no code.
 | `TETHER_OPENAI_BASE_URL` | `https://api.openai.com/v1` | For a proxy or an OpenAI-compatible gateway. |
 | `TETHER_OPENAI_TIMEOUT_SECONDS` | `60` | Upper bound on one model call. |
 | `TETHER_PROVIDER_MAX_ATTEMPTS` | `3` | Provider attempts per model turn, retries included (W3.3). Must be positive. |
+| `TETHER_MAX_REPAIRS`, `TETHER_MAX_DENIALS` | `3`, `3` | The repair/denial bound per run (W3.4, PD-15). Must be positive. |
 
 `TETHER_ENV` still governs the scripted provider: it refuses to load when `TETHER_ENV=prod`.
 
@@ -94,17 +95,29 @@ fencing token still hold) and goes away with lease heartbeats (W6.1).
 | HTTP 401, 403 | `ProviderAuthError` | no |
 | other 4xx, or a history that cannot be rendered | `ProviderRequestError` | no |
 | response shape not as documented | `ProviderResponseError` | no |
-| tool-call arguments that are not a JSON object | `MalformedToolCallError` | no |
+| a tool call with no call id or no name, or arguments that are not a string | `MalformedToolCallError` | no |
 
 A history is unrenderable when a proposed call has no recorded result, or a result refers to no
 proposed call. ADR-0016 forbids trimming history to make a request acceptable, so this is a typed
 failure rather than a silent drop.
 
-`MalformedToolCallError` is a **known gap**: ADR-0016 rule 4 wants invalid model output handled
-as a typed `invalid` result inside the repair budget, not as a failed call. The neutral contract
-cannot yet carry a malformed call, so the adapter fails closed rather than inventing arguments
-that might accidentally validate. Closing it belongs to the model-output and repair-budget work
-(plan steps W3.4 / S6.1).
+### Malformed tool calls and the repair/denial bound (W3.4)
+
+Tool-call arguments that do not parse into a JSON object are *model output*, not a provider
+fault (ADR-0016 rule 4). The adapter hands such a call over as a `ToolCallProposal` with
+`malformed=True` and no arguments, and drops the raw text: it is never persisted, logged or
+audited (ADR-0017). The run graph records it as `CALL_INVALID` with the reason
+`arguments: malformed`, and the model gets a typed `invalid` result. When the history is sent
+back, the call is rendered with empty arguments (`{}`).
+
+Invalid proposals (unknown tool, schema-invalid or malformed arguments) count as **repairs**;
+policy denials (a `deny` decision, or TX5's `policy now: deny`) count as **denials**. Human
+rejections and expired approvals count for nothing. The budgets are `TETHER_MAX_REPAIRS` and
+`TETHER_MAX_DENIALS` (PD-15: 3 each, cumulative over the run). The occurrence that exceeds a
+budget ends the run `failed` with `repair_budget_exhausted` or `denial_budget_exhausted`, as a
+terminating result: no further model call, no `CALL_SKIPPED` for the rest of the turn, held in
+`awaiting_reconciliation` while any ledger entry is unresolved, and an active cancel or deadline
+still decides `cancelled`/`timed_out` with the reason at the end of the summary.
 
 ## What is recorded per attempt
 

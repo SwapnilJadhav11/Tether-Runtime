@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from tests.chaos.harness import TARGET, Crash, Env
+from tests.chaos.harness import TARGET, Crash, Env, crash_after_commit
 from tests.chaos.test_chaos_crashes import drive_through_crashes
 
 import tether.runtime.graph as graph_module
@@ -91,6 +91,49 @@ async def test_t10_a_crash_during_a_retry_sequence_resumes_without_governing_twi
             (1, "succeeded"),
         ]
         assert len(rows) == 2 + failed_before_crash
+        await env.assert_reconstructable(run_id)
+        await env.assert_terminal_stable(run_id, worker)
+    finally:
+        await worker.close()
+
+
+# Four invalid proposals (unknown tool, invalid arguments, malformed), the last in a two-call
+# turn: the fourth repair exceeds PD-15's budget of three and ends the run.
+INVALID4 = (
+    "name: invalid4\nturns:\n"
+    "  - tool_calls: [{tool: no_such_tool, arguments: {}}]\n"
+    "  - tool_calls: [{tool: get_service_health, arguments: {}}]\n"
+    "  - tool_calls: [{tool: get_service_health, malformed: true}]\n"
+    "  - tool_calls: [{tool: no_such_tool, arguments: {}},"
+    " {tool: probe_write, arguments: {target: a}}]\n"
+    "  - final: never reached\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("event", "skip"),
+    [("CALL_INVALID", 3), ("RUN_FINISHED", 0)],
+    ids=["after-the-fourth-repair", "after-run-finished"],
+)
+@pytest.mark.asyncio
+async def test_t22_a_crash_right_after_the_bound_is_reached_ends_the_run_once(
+    env: Env, monkeypatch: pytest.MonkeyPatch, event: str, skip: int
+) -> None:
+    (env.tmp_path / "invalid4.yaml").write_text(INVALID4, encoding="utf-8")
+    crash_after_commit(monkeypatch, event, skip=skip)
+    run_id, crashes, worker = await drive_through_crashes(env, None, scenario="invalid4")
+    try:
+        assert crashes == 1
+        assert env.sql("SELECT status, outcome_summary FROM tether.runs WHERE id = %s", run_id) == [
+            ("failed", "repair_budget_exhausted")
+        ]
+        events = env.events(run_id)
+        assert events.count("CALL_INVALID") == 4  # adopted on replay, never re-decided
+        assert "CALL_SKIPPED" not in events
+        assert events.count("RUN_FINISHED") == 1
+        assert env.model_calls(run_id) == 4  # no model call after the bound
+        assert TARGET.sends == 0
+        assert env.ledger(run_id) == []
         await env.assert_reconstructable(run_id)
         await env.assert_terminal_stable(run_id, worker)
     finally:

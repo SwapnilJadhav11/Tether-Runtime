@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tether.core.results import CallOutcome
 
@@ -17,11 +17,24 @@ class _Frozen(BaseModel):
 
 
 class ToolCallProposal(_Frozen):
-    """One tool call proposed by the model. Untrusted: validated and governed before use."""
+    """One tool call proposed by the model. Untrusted: validated and governed before use.
+
+    ``malformed``: the adapter could not parse the call's arguments into a JSON object. Such a
+    call carries no arguments (nothing that might accidentally validate) and never the raw text
+    (ADR-0017); the run graph gives it a typed ``invalid`` result inside the repair budget
+    (ADR-0016 rule 4).
+    """
 
     call_id: str
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    malformed: bool = False
+
+    @model_validator(mode="after")
+    def _malformed_has_no_arguments(self) -> ToolCallProposal:
+        if self.malformed and self.arguments:
+            raise ValueError("a malformed proposal carries no arguments")
+        return self
 
 
 class NeutralMessage(_Frozen):

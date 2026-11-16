@@ -274,10 +274,12 @@ def _proposal(item: Any) -> ToolCallProposal:
     try:
         arguments = json.loads(raw)
     except ValueError:
-        # The offending text is never echoed: it is model output and may carry anything.
-        raise MalformedToolCallError(f"the arguments of {name!r} are not valid JSON") from None
+        arguments = None
     if not isinstance(arguments, dict):
-        raise MalformedToolCallError(f"the arguments of {name!r} are not a JSON object")
+        # Model output, not a provider fault (ADR-0016 rule 4): a malformed proposal that the
+        # run graph answers with a typed `invalid` result. The offending text is dropped here and
+        # never echoed, persisted or logged: it is model output and may carry anything.
+        return ToolCallProposal(call_id=call_id, tool=name, malformed=True)
     return ToolCallProposal(call_id=call_id, tool=name, arguments=arguments)
 
 

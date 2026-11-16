@@ -87,14 +87,13 @@ class ProviderResponseError(ProviderError):
 
 
 class MalformedToolCallError(ProviderError):
-    """The model proposed a tool call that cannot be represented as a neutral proposal.
+    """A proposed tool call that cannot be represented even as a malformed proposal.
 
-    This is *model output*, not a provider fault, and ADR-0016 rule 4 wants it handled as a typed
-    ``invalid`` result inside the repair budget rather than as a failed call. The neutral contract
-    cannot yet carry a malformed call (``ToolCallProposal.arguments`` is a ``dict``), so an
-    adapter fails closed rather than inventing arguments that might accidentally validate.
-    Converting this into a typed ``invalid`` result belongs to the model-output and
-    repair-budget work (plan steps W3.4 / S6.1).
+    Arguments that do not parse into a JSON object are *not* this error: since W3.4 an adapter
+    hands such a call over as ``ToolCallProposal(malformed=True)`` and the run graph answers it
+    with a typed ``invalid`` result inside the repair budget (ADR-0016 rule 4). What remains here
+    is a call with no call id or no tool name, whose result could not be bound back to it, or
+    arguments in a shape the provider's API does not document.
     """
 
     code = "malformed_tool_call"

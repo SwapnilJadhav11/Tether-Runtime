@@ -68,6 +68,14 @@ REPLAY_DIVERGENCE_REASON = "replay_divergence"
 TOOL_VERSION_UNAVAILABLE = "tool version unavailable"
 # The typed terminal reason of a run ended by a read configured with fail_run (ADR-0021 rule 9).
 TOOL_EXHAUSTED_PREFIX = "tool_exhausted:"
+# The typed terminal reasons of the repair/denial bound (W3.4, ADR-0016 rule 4, PD-15).
+REPAIR_BUDGET_EXHAUSTED = "repair_budget_exhausted"
+DENIAL_BUDGET_EXHAUSTED = "denial_budget_exhausted"
+# The invalid reason of a call whose arguments the adapter could not parse. The raw text is
+# never carried, persisted or logged (ADR-0017).
+MALFORMED_ARGUMENTS = "arguments: malformed"
+# TX5's typed result when the current policy now denies a decided call: a policy denial.
+_POLICY_NOW_DENY = "policy now: deny"
 # The pause before a provider retry; a module attribute so tests can observe the delays.
 _sleep = asyncio.sleep
 
@@ -84,6 +92,10 @@ class RunState(TypedDict, total=False):
     divergence: dict[str, Any] | None
     # A terminating result's typed reason (ADR-0012 rule 6), e.g. ``tool_exhausted:<tool>``.
     terminating: str | None
+    # The repair/denial bound's counters (W3.4). Changed only by node return values, so a
+    # replayed node cannot count twice. Absent in checkpoints from before W3.4: read as 0.
+    repairs: int
+    denials: int
     next_step_ordinal: int
     turns: int
     final_text: str | None
@@ -107,6 +119,9 @@ class RunContext:
     policy: PolicyEngine
     # Provider attempts per model turn (W3.3): retryable errors only, PD-13 backoff between.
     provider_max_attempts: int
+    # The repair and denial bound (W3.4, PD-15): one more than this ends the run.
+    max_repairs: int
+    max_denials: int
 
 
 def initial_state(system_prompt: str, task_input: dict[str, Any]) -> RunState:
@@ -124,6 +139,8 @@ def initial_state(system_prompt: str, task_input: dict[str, Any]) -> RunState:
         "approval_id": None,
         "result": None,
         "divergence": None,
+        "repairs": 0,
+        "denials": 0,
         "next_step_ordinal": 0,
         "turns": 0,
         "final_text": None,
@@ -169,6 +186,8 @@ def call_hash_for(
 
 def _resolve(ctx: RunContext, call: dict[str, Any]) -> tuple[ToolDescriptor, BaseModel] | None:
     """The offered descriptor and validated arguments of ``call``, or ``None`` if invalid."""
+    if call.get("malformed"):
+        return None  # no arguments to validate: never resolvable (W3.4)
     descriptor = ctx.registry.offered(call["tool"])
     if descriptor is None:
         return None
@@ -537,11 +556,14 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 if run["stopped"]:
                     return await stopped(uow, run)
                 descriptor = ctx.registry.offered(call["tool"])
-                args: BaseModel | list[str] = (
-                    _validate(descriptor, call["arguments"])
-                    if descriptor is not None
-                    else ["tool is not offered to this agent"]
-                )
+                args: BaseModel | list[str]
+                if call.get("malformed"):
+                    # Unparseable arguments (ADR-0016 rule 4): a typed invalid result, a repair.
+                    args = [MALFORMED_ARGUMENTS]
+                elif descriptor is not None:
+                    args = _validate(descriptor, call["arguments"])
+                else:
+                    args = ["tool is not offered to this agent"]
                 if descriptor is None or isinstance(args, list):
                     payload: dict[str, Any] = {
                         "decision": "invalid",
@@ -785,7 +807,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             if not call_hashes_equal(hashed, decided["call_hash"]):
                 return {"result": _result(CallOutcome.DENIED, "call changed since its decision")}
             if decision.outcome == "deny":
-                return {"result": _result(CallOutcome.DENIED, "policy now: deny")}
+                return {"result": _result(CallOutcome.DENIED, _POLICY_NOW_DENY)}
             if decision.outcome == "require_approval":
                 # TX5 mapping: an approved, unexpired approval bound to this exact call hash.
                 approval = await uow.repository(ApprovalsRepository, ctx.scope).by_ordinal(
@@ -1062,10 +1084,37 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 )
         return None
 
+    def bound(state: RunState, result: dict[str, Any]) -> RunState:
+        """The repair/denial bound (W3.4, ADR-0016 rule 4, PD-15): the counter this result
+        advances, and the terminating reason once a budget is exceeded. Invalid proposals are
+        repairs; policy denials (TX2 ``deny``, TX5 ``policy now: deny``) are denials. Human
+        rejections, expired approvals and every other result count for nothing."""
+        if result["outcome"] == CallOutcome.INVALID:
+            repairs = state.get("repairs", 0) + 1
+            if repairs > ctx.max_repairs:
+                return {"repairs": repairs, "terminating": REPAIR_BUDGET_EXHAUSTED}
+            return {"repairs": repairs}
+        decided = state.get("result") is None
+        if result["outcome"] == CallOutcome.DENIED and (
+            decided or result["content"] == _POLICY_NOW_DENY
+        ):
+            denials = state.get("denials", 0) + 1
+            if denials > ctx.max_denials:
+                return {"denials": denials, "terminating": DENIAL_BUDGET_EXHAUSTED}
+            return {"denials": denials}
+        return {}
+
     async def append_result(state: RunState) -> RunState:
         call = state["current"]
         call = _required(call, "current call")
         result = state.get("result") or _result_from_decision(state["decision"])
+        counted = bound(state, result)
+        if counted.get("terminating"):
+            # A terminating result (ADR-0012 rule 6): no history, no skip events for the rest
+            # of the turn, no further model call. ``drain_terminating`` holds the run while any
+            # ledger entry is unresolved and lets an active stop decide the status.
+            _log.warning("repair or denial budget exhausted", reason=counted["terminating"])
+            return counted
         if result["outcome"] != CallOutcome.APPLIED and state["pending"]:
             ended = await record_skips(call, CallOutcome(result["outcome"]), state["pending"])
             if ended is not None:
@@ -1086,6 +1135,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             history += [_tool_message(p["call_id"], CallOutcome.SKIPPED, skipped) for p in pending]
             pending = []
         return {
+            **counted,
             "history": history,
             "pending": pending,
             "current": None,
@@ -1098,6 +1148,8 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     def after_append(state: RunState) -> str:
         if state.get("divergence"):
             return "record_divergence"
+        if state.get("terminating"):
+            return "drain_terminating"
         return "finalize" if state.get("end_status") else "next_call"
 
     async def finalize(state: RunState) -> RunState:
@@ -1176,7 +1228,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         ["finalize", "append_result", "record_divergence", "drain_terminating"],
     )
     graph.add_conditional_edges(
-        "append_result", after_append, ["next_call", "finalize", "record_divergence"]
+        "append_result",
+        after_append,
+        ["next_call", "finalize", "record_divergence", "drain_terminating"],
     )
     graph.add_edge("record_divergence", "drain_divergence")
     graph.add_edge("drain_divergence", "finalize")

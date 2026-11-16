@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     provider_max_attempts: int = Field(default=3, gt=0)
 
     max_model_turns: int = Field(default=8, gt=0)
+    # The repair and denial bound (W3.4, PD-15): invalid proposals (unknown tool, invalid or
+    # unparseable arguments) and policy denials a run tolerates. One more ends it `failed`.
+    max_repairs: int = Field(default=3, gt=0)
+    max_denials: int = Field(default=3, gt=0)
     # How long an approval request stays decidable (expiry is checked at decision time).
     approval_ttl_seconds: int = Field(default=3600, gt=0)
 
