@@ -2,17 +2,44 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import typer
 from alembic import command
 from alembic.config import Config
 from pydantic import ValidationError
+from typer.core import TyperGroup
 
 from tether.cli import apikey, bootstrap
 from tether.cli import audit as audit_cli
 from tether.runtime.checkpointer import setup_langgraph_schema
-from tether.settings import MigrationSettings
+from tether.settings import MigrationSettings, require_explicit_environment
 
-app = typer.Typer(no_args_is_help=True, add_completion=False, help="Tether administration.")
+# Every command or group that connects to the database. `apikey` only prints a new key.
+DATABASE_COMMANDS = frozenset({"migrate", "bootstrap", "audit"})
+
+
+class _EnvironmentGate(TyperGroup):
+    """W7.1 (D-12): a command that connects to the database needs an explicit, valid TETHER_ENV.
+
+    Checked here, once, before the command is dispatched, so no database command can forget it.
+    Help never connects: ``--help`` (and a bare group, which prints its help) is not gated.
+    """
+
+    def resolve_command(self, ctx: Any, args: list[str]) -> tuple[str | None, Any, list[str]]:
+        name, found, rest = super().resolve_command(ctx, args)
+        shows_help = "--help" in rest or (isinstance(found, TyperGroup) and not rest)
+        if name in DATABASE_COMMANDS and not shows_help:
+            require_explicit_environment()
+        return name, found, rest
+
+
+app = typer.Typer(
+    cls=_EnvironmentGate,
+    no_args_is_help=True,
+    add_completion=False,
+    help="Tether administration.",
+)
 app.add_typer(bootstrap.app, name="bootstrap")
 app.add_typer(apikey.app, name="apikey")
 app.add_typer(audit_cli.app, name="audit")

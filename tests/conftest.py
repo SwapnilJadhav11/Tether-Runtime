@@ -35,6 +35,10 @@ def _random_key() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
 
 
+# The environment is always explicit (W7.1, D-12): `Settings.env` has no default, so the test
+# session states it. Tests of the absent or invalid case remove or override it themselves.
+os.environ.setdefault("TETHER_ENV", "test")
+
 # Per-session random audit and call-binding keys (separate families, never shared material).
 os.environ.setdefault("TETHER_AUDIT_ACTIVE_KEY_ID", "TESTA1")
 os.environ.setdefault("TETHER_AUDIT_KEY_TESTA1", _random_key())

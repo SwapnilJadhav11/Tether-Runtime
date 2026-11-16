@@ -50,8 +50,9 @@ class ScriptedProvider:
     model = "scripted-v1"
 
     def __init__(self, scenarios_dir: Path, *, env: str) -> None:
-        if env == "prod":
-            raise ScenarioError("the scripted provider is for dev and test only")
+        # An allow-list, not "not prod": an unset or misspelled environment is refused too (W7.1).
+        if env not in ("dev", "test"):
+            raise ScenarioError("the scripted provider is for TETHER_ENV=dev or test only")
         self._dir = scenarios_dir
 
     def capabilities(self) -> ProviderCapabilities:

@@ -33,7 +33,7 @@ from tether.observability.logging import bound, get_logger
 from tether.observability.telemetry import setup_telemetry
 from tether.queue import postgres as queue
 from tether.runtime.driver import WorkerRuntime
-from tether.settings import Settings
+from tether.settings import Settings, load_settings
 from tether.storage.engine import create_pool, database_is_reachable
 from tether.worker.handlers import advance_run, execute_tool, timers
 
@@ -286,7 +286,7 @@ async def _serve(settings: Settings) -> None:
 
 def main() -> None:
     """Entrypoint for the ``worker`` process."""
-    settings = Settings()
+    settings = load_settings()
     telemetry = setup_telemetry(settings, service="tether-worker")
     try:
         asyncio.run(_serve(settings))
@@ -296,7 +296,7 @@ def main() -> None:
 
 def healthcheck() -> None:
     """Container healthcheck: exit 0 while the worker heartbeat is fresh."""
-    settings = Settings()
+    settings = load_settings()
     fresh = heartbeat_is_fresh(
         settings.worker_heartbeat_file, max_age_seconds=settings.worker_heartbeat_max_age_seconds
     )

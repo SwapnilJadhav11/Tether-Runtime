@@ -11,7 +11,7 @@ UNREACHABLE_DSN = SecretStr("postgresql://tether_app:x@127.0.0.1:1/tether")
 
 
 def _settings() -> Settings:
-    return Settings(database_url=UNREACHABLE_DSN, readiness_timeout_seconds=0.5)
+    return Settings(database_url=UNREACHABLE_DSN, env="test", readiness_timeout_seconds=0.5)
 
 
 def test_healthz_is_200_without_a_database() -> None:

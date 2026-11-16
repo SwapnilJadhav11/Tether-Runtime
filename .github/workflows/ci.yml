@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+# The environment is always explicit (W7.1, D-12): `TETHER_ENV` has no default, and every job here
+# runs the test suites, which are the `test` environment.
+env:
+  TETHER_ENV: test
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

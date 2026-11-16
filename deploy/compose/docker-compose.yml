@@ -11,6 +11,9 @@ x-tether-image: &tether-image
   build:
     context: ../..
     dockerfile: Dockerfile
+    # The development variant: dev bootstrap file, scenarios and the demo workload. The
+    # production image is `--target prod` and is never built by this file (W7.2).
+    target: dev
   image: tether-runtime:dev
 
 x-app-env: &app-env
