@@ -44,6 +44,9 @@ _INSTRUMENTS: dict[str, Any] = {
     "tether.jobs.dead_lettered": _METER.create_counter(
         "tether.jobs.dead_lettered", unit="{job}", description="Jobs ended by TX12"
     ),
+    "tether.jobs.lease_lost": _METER.create_counter(
+        "tether.jobs.lease_lost", unit="{job}", description="Deliveries aborted on a lost lease"
+    ),
     "tether.tool.duration": _histogram("tether.tool.duration", "One tool send, by outcome"),
     "tether.tool.retries": _METER.create_counter(
         "tether.tool.retries", unit="{retry}", description="Tool sends scheduled again"
@@ -124,6 +127,10 @@ def job_processed(kind: str, outcome: str, duration_seconds: float) -> None:
 
 def job_dead_lettered(kind: str) -> None:
     _emit("tether.jobs.dead_lettered", 1, kind=kind)
+
+
+def job_lease_lost(kind: str) -> None:
+    _emit("tether.jobs.lease_lost", 1, kind=kind)
 
 
 def tool_executed(tool: str, outcome: str, duration_seconds: float) -> None:

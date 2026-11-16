@@ -344,6 +344,8 @@ def crash_after_commit(
 class Env:
     db: Any
     tmp_path: Path
+    # Extra worker settings (e.g. a short lease and heartbeat interval); empty = the defaults.
+    overrides: dict[str, Any] = field(default_factory=dict)
 
     def settings(self) -> Settings:
         bootstrap_file = self.tmp_path / "bootstrap.yaml"
@@ -356,6 +358,7 @@ class Env:
             env="test",
             bootstrap_file=bootstrap_file,
             scenarios_dir=self.tmp_path,
+            **self.overrides,
         )
 
     # -- workers --

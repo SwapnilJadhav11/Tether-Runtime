@@ -7,7 +7,8 @@ scoped to the job's workspace. Every time check uses ``clock_timestamp()`` (inva
 Bounded delivery (§11 AD-08): every lease adds an attempt. A lease that takes ``attempts`` past
 ``max_attempts`` hands the job to the worker's TX12 dead-letter transition instead of its handler;
 that transaction marks the job ``dead``. A retry is a release with a delayed ``run_after``.
-Not yet: lease heartbeats.
+A worker extends the lease of the job it is processing with ``heartbeat`` (W6.1); a stale token
+changes nothing.
 """
 
 from __future__ import annotations
@@ -125,6 +126,26 @@ async def depth(engine: AsyncEngine) -> dict[tuple[str, str], int]:
     async with engine.connect() as connection:
         result = await connection.execute(statement)
         return {(str(kind), str(label)): int(count) for kind, label, count in result}
+
+
+async def heartbeat(engine: AsyncEngine, job: LeasedJob, *, lease_seconds: float) -> bool:
+    """Extend this lease by ``lease_seconds`` from now; ``False`` if it is no longer ours.
+
+    Conditional on the lease token, so a lessee that lost the job changes nothing. It never
+    touches ``attempts``: a heartbeat neither refunds nor adds a delivery.
+    """
+    statement = (
+        update(_JOBS)
+        .where(
+            _JOBS.c.id == job.id,
+            _JOBS.c.state == JobState.LEASED,
+            _JOBS.c.lease_token == job.lease_token,
+        )
+        .values(lease_expires_at=_seconds_from_now(lease_seconds))
+        .returning(_JOBS.c.id)
+    )
+    async with engine.begin() as connection:
+        return (await connection.execute(statement)).first() is not None
 
 
 async def complete(engine: AsyncEngine, job: LeasedJob) -> bool:

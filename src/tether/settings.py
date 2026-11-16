@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: float = 1.0
     # How long a leased job stays invisible to other workers before it can be reclaimed.
     worker_lease_seconds: float = Field(default=60.0, gt=0)
+    # How often a worker extends the lease of the job it is processing (W6.1). Unset: a third of
+    # the lease. Must be below the lease.
+    worker_lease_heartbeat_seconds: float | None = Field(default=None, gt=0)
     worker_heartbeat_file: Path = _default_heartbeat_file()
     worker_heartbeat_max_age_seconds: float = 30.0
 
@@ -81,6 +84,17 @@ class Settings(BaseSettings):
     otel_export_timeout_seconds: float = Field(default=2.0, gt=0)
     # How often metrics are exported (and the worker samples queue depth).
     otel_metric_interval_seconds: float = Field(default=15.0, gt=0)
+
+    @model_validator(mode="after")
+    def _heartbeat_below_lease(self) -> Settings:
+        interval = self.worker_lease_heartbeat_seconds
+        if interval is not None and interval >= self.worker_lease_seconds:
+            raise ValueError("worker_lease_heartbeat_seconds must be below worker_lease_seconds")
+        return self
+
+    @property
+    def lease_heartbeat_interval(self) -> float:
+        return self.worker_lease_heartbeat_seconds or self.worker_lease_seconds / 3
 
 
 class MigrationSettings(BaseSettings):
