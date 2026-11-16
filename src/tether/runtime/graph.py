@@ -66,6 +66,9 @@ REPLAY_DIVERGENCE_REASON = "replay_divergence"
 # The typed not_applied content when a call's pinned version is gone before its ledger row
 # exists (ADR-0011 rule 3, ADR-0021 rule 15).
 TOOL_VERSION_UNAVAILABLE = "tool version unavailable"
+# PD-33: the outcome reason of a write that reported success with output violating its schema.
+# The entry is ``completed``/``applied`` with no payload; the model sees only the marker.
+OUTPUT_INVALID = "applied: output invalid"
 # The typed terminal reason of a run ended by a read configured with fail_run (ADR-0021 rule 9).
 TOOL_EXHAUSTED_PREFIX = "tool_exhausted:"
 # The typed terminal reasons of the repair/denial bound (W3.4, ADR-0016 rule 4, PD-15).
@@ -114,6 +117,7 @@ class RunContext:
     agent_id: str
     generation: int
     max_turns: int
+    # The default approval expiry, for a tool whose policy rule sets none (W4.2).
     approval_ttl_seconds: int
     # The workspace's policy engine (ADR-0020), built from the same loaded configuration.
     policy: PolicyEngine
@@ -298,26 +302,37 @@ def _record_decision(uow: UnitOfWork, current: Any, decision: str, tool: str, st
     uow.on_commit(committed)
 
 
+async def reconciled_outcomes(
+    uow: UnitOfWork, scope: WorkspaceScope, run_id: uuid.UUID
+) -> list[str]:
+    """Every reconciled outcome of the run, for its terminal summary."""
+    entries = await uow.repository(LedgerRepository, scope).for_run(run_id)
+    return [
+        f"{entry['tool']} {entry['resolution']}"
+        for entry in entries
+        if str(entry["resolution"] or "").startswith("reconciled_")
+    ]
+
+
+async def stop_ending(uow: UnitOfWork, scope: WorkspaceScope, run: Any) -> tuple[RunStatus, str]:
+    """How a stopped run ends: ``cancelled`` or ``timed_out`` (ADR-0006), with a summary that
+    names every reconciled outcome, so a reconciled stop is never reported as clean."""
+    status = RunStatus(run["stop_status"])
+    reason = (
+        f"cancelled by {run['cancel_requested_by']}"
+        if status == RunStatus.CANCELLED
+        else "deadline passed"
+    )
+    return status, "; ".join([reason, *await reconciled_outcomes(uow, scope, run["id"])])
+
+
 def build_graph(ctx: RunContext) -> StateGraph[RunState]:
     async def reconciled(uow: UnitOfWork) -> list[str]:
-        """Every reconciled outcome of the run, for its terminal summary."""
-        entries = await uow.repository(LedgerRepository, ctx.scope).for_run(ctx.run_id)
-        return [
-            f"{entry['tool']} {entry['resolution']}"
-            for entry in entries
-            if str(entry["resolution"] or "").startswith("reconciled_")
-        ]
+        return await reconciled_outcomes(uow, ctx.scope, ctx.run_id)
 
     async def stopped(uow: UnitOfWork, run: Any) -> RunState:
-        """A stopped run ends ``cancelled`` or ``timed_out`` (ADR-0006). The summary names every
-        reconciled outcome, so a reconciled stop is never reported as clean."""
-        status = RunStatus(run["stop_status"])
-        reason = (
-            f"cancelled by {run['cancel_requested_by']}"
-            if status == RunStatus.CANCELLED
-            else "deadline passed"
-        )
-        return {"end_status": status, "final_text": "; ".join([reason, *await reconciled(uow)])}
+        status, summary = await stop_ending(uow, ctx.scope, run)
+        return {"end_status": status, "final_text": summary}
 
     async def check_pinned(
         uow: UnitOfWork,
@@ -328,6 +343,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         version: object,
         stored: object,
         path: str,
+        decided: object = None,
     ) -> RunState | None:
         """Hash-checked adoption under the call's pinned version (ADR-0003 rule 4, ADR-0011,
         ADR-0021 rule 14). ``None``: the persisted row is for this exact call.
@@ -335,16 +351,30 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         The pinned ``(tool, version)`` comes from the persisted row, never from what is offered
         now. If that version no longer resolves and no ledger row exists for the call, the call
         gets a typed ``not_applied`` and nothing is sent (ADR-0011 rule 3); it is not a
-        divergence. Once a ledger row exists, a missing version keeps the fail-closed divergence
-        path until W5.2. Any other mismatch is a divergence.
+        divergence. Any other mismatch is a divergence.
+
+        Once a ledger row exists, a version gone is a deployment, not a divergence (ADR-0011 rule
+        5, ADR-0021 rule 15): the ledger entry is authoritative, the worker records its honest
+        outcome and wakes the run, and the run follows that outcome. Without the descriptor the
+        hash cannot be recomputed from the arguments, so the persisted rows must agree instead:
+        the ledger row has this call's tool and pinned version and the same call hash as the
+        adopted row and, when this lineage holds one, as its own decision (``decided``).
         """
         if tool != call["tool"] or not isinstance(version, str):
             return _divergence(call, path=path, stored=stored, recomputed=None)
         descriptor = ctx.registry.resolve(call["tool"], version)
         if descriptor is None:
             ledger = uow.repository(LedgerRepository, ctx.scope)
-            if await ledger.by_ordinal(ctx.run_id, call["step_ordinal"]) is None:
+            entry = await ledger.by_ordinal(ctx.run_id, call["step_ordinal"])
+            if entry is None:
                 return {"result": _result(CallOutcome.NOT_APPLIED, TOOL_VERSION_UNAVAILABLE)}
+            if (
+                entry["tool"] == call["tool"]
+                and entry["tool_version"] == version
+                and call_hashes_equal(entry["call_hash"], stored)
+                and (decided is None or call_hashes_equal(entry["call_hash"], decided))
+            ):
+                return None
             return _divergence(call, path=path, stored=stored, recomputed=None)
         recomputed = _pinned_hash(ctx, run, call, descriptor)
         if _hashes_match(stored, recomputed):
@@ -642,6 +672,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=existing["tool_version"],
                     stored=existing["call_hash"],
                     path="approval",
+                    decided=decided["call_hash"],
                 )
                 return found if found is not None else {"approval_id": str(existing["id"])}
             if run["stopped"]:
@@ -656,9 +687,12 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             approval_id = uuid.uuid4()
             masked = mask(args)
             preconditions = _masked_preconditions(descriptor, args)
-            expiry = func.clock_timestamp() + func.make_interval(
-                0, 0, 0, 0, 0, 0, ctx.approval_ttl_seconds
+            # The tool's own expiry from its policy rule, else the default (W4.2); both were
+            # checked against the maximum at worker startup. Decision-time checks are unchanged.
+            seconds = ctx.workspace.policy.approval_expiry_for(
+                descriptor.name, ctx.approval_ttl_seconds
             )
+            expiry = func.clock_timestamp() + func.make_interval(0, 0, 0, 0, 0, 0, seconds)
             await approvals.add(
                 {
                     "id": approval_id,
@@ -709,6 +743,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         """Wait node: re-read the approval; interrupt while it is pending."""
         call = _required(state["current"], "current call")
         approval_id = uuid.UUID(_required(state["approval_id"], "approval id"))
+        decided_hash = _required(state["decision"], "decision").get("call_hash")
         while True:
             async with UnitOfWork(ctx.engine) as uow:
                 row = await uow.repository(ApprovalsRepository, ctx.scope).get(approval_id)
@@ -728,6 +763,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=approval["tool_version"],
                     stored=approval["call_hash"],
                     path="approval_wait",
+                    decided=decided_hash,
                 )
             if found is not None:
                 return found
@@ -785,6 +821,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=existing["tool_version"],
                     stored=existing["call_hash"],
                     path="ledger",
+                    decided=decided["call_hash"],
                 )
                 return found if found is not None else {"ledger_id": str(existing["id"])}
             if run["stopped"]:
@@ -878,6 +915,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
         call = _required(state["current"], "current call")
         ledger_id = state["ledger_id"]
         ledger_id = _required(ledger_id, "ledger entry id")
+        decided_hash = _required(state["decision"], "decision").get("call_hash")
         while True:
             async with UnitOfWork(ctx.engine) as uow:
                 entry = await uow.repository(LedgerRepository, ctx.scope).get(uuid.UUID(ledger_id))
@@ -898,6 +936,7 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     version=entry["tool_version"],
                     stored=entry["call_hash"],
                     path="ledger_wait",
+                    decided=decided_hash,
                 )
             if found is not None:
                 return found
@@ -906,6 +945,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 if resolution == LedgerResolution.RECONCILED_APPLIED:
                     # A human confirmed the write happened; its real output is unknown.
                     return {"result": _result(CallOutcome.APPLIED, {"resolution": resolution})}
+                if entry["outcome_reason"] == OUTPUT_INVALID:
+                    # PD-33: applied, with a marker and no payload.
+                    return {"result": _result(CallOutcome.APPLIED, {"output_invalid": True})}
                 return {"result": _result(CallOutcome.APPLIED, entry["outcome_payload_masked"])}
             if entry["state"] == "failed":
                 if resolution == LedgerResolution.RECONCILED_NOT_APPLIED:

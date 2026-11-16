@@ -39,7 +39,8 @@ from tether.sdk.tools import PERMISSION
 
 NonEmpty = Field(min_length=1)
 # The built-in evaluator's semantics version; part of every policy version (ADR-0009 rule 4).
-EVALUATOR_VERSION = "builtin-1"
+# builtin-2 (W4.2): a rule may carry approval_expiry_seconds.
+EVALUATOR_VERSION = "builtin-2"
 Permission = Annotated[str, StringConstraints(pattern=f"^{PERMISSION.pattern}$")]
 Name = Annotated[str, StringConstraints(min_length=1)]
 
@@ -59,6 +60,10 @@ class PolicyRule(_Strict):
     decision: Literal["allow", "require_approval", "deny"]
     # Exactly for require_approval: an approver needs one of these roles (never the requester).
     approver_roles: tuple[Name, ...] = ()
+    # Per-tool approval expiry (W4.2, D-8): how long a request for this tool stays decidable.
+    # Only on require_approval; unset means the deployment default (`approval_ttl_seconds`).
+    # Never above `approval_max_ttl_seconds`: such a rule is refused, never clamped.
+    approval_expiry_seconds: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _approver_roles_only_where_needed(self) -> PolicyRule:
@@ -66,6 +71,10 @@ class PolicyRule(_Strict):
             raise ValueError(f"rule for {self.tool}: require_approval needs approver_roles")
         if self.decision != "require_approval" and self.approver_roles:
             raise ValueError(f"rule for {self.tool}: approver_roles only on require_approval")
+        if self.decision != "require_approval" and self.approval_expiry_seconds is not None:
+            raise ValueError(
+                f"rule for {self.tool}: approval_expiry_seconds only on require_approval"
+            )
         return self
 
 
@@ -94,6 +103,13 @@ class PolicyConfig(_Strict):
 
     def rule_for(self, tool: str) -> PolicyRule | None:
         return next((rule for rule in self.rules if rule.tool == tool), None)
+
+    def approval_expiry_for(self, tool: str, default_seconds: int) -> int:
+        """The approval expiry for ``tool`` (W4.2): its rule's value, else the default."""
+        rule = self.rule_for(tool)
+        if rule is None or rule.approval_expiry_seconds is None:
+            return default_seconds
+        return rule.approval_expiry_seconds
 
 
 class AgentConfig(_Strict):
@@ -184,6 +200,31 @@ class BootstrapFile(_Strict):
 
     def workspace(self, workspace_id: str) -> WorkspaceConfig | None:
         return next((ws for ws in self.workspaces if ws.id == workspace_id), None)
+
+
+class ApprovalExpiryError(ValueError):
+    """An approval expiry (the default or a tool's) is above the configured maximum."""
+
+
+def check_approval_expiry(config: BootstrapFile, *, default_seconds: int, max_seconds: int) -> None:
+    """Refuse, never clamp, an approval expiry above the maximum (W4.2, D-8).
+
+    Checked by ``tether bootstrap apply`` and at worker startup, so no approval can be requested
+    with an expiry the deployment's maximum does not allow.
+    """
+    if default_seconds > max_seconds:
+        raise ApprovalExpiryError(
+            f"the default approval expiry ({default_seconds} s) is above the maximum"
+            f" ({max_seconds} s)"
+        )
+    for ws in config.workspaces:
+        for rule in ws.policy.rules:
+            seconds = rule.approval_expiry_seconds
+            if seconds is not None and seconds > max_seconds:
+                raise ApprovalExpiryError(
+                    f"workspace {ws.id}: the rule for {rule.tool} sets approval_expiry_seconds"
+                    f" {seconds}, above the maximum ({max_seconds} s)"
+                )
 
 
 def load_bootstrap(path: Path) -> BootstrapFile:

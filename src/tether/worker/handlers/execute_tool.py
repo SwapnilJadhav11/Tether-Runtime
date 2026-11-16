@@ -33,7 +33,7 @@ from tether.queue import backoff
 from tether.queue.postgres import LeasedJob
 from tether.registry.masking import mask
 from tether.runtime.driver import WorkerRuntime
-from tether.runtime.graph import call_hash_for
+from tether.runtime.graph import OUTPUT_INVALID, call_hash_for
 from tether.sdk import ToolContext, ToolDescriptor, ToolNotApplied
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.ledger import LedgerRepository
@@ -64,13 +64,15 @@ def _unknown_state(entry: RowMapping) -> str:
 
 def _descriptor(
     runtime: WorkerRuntime, scope: WorkspaceScope, run: RowMapping, entry: RowMapping
-) -> ToolDescriptor | None:
+) -> ToolDescriptor | str:
+    """The entry's pinned descriptor, or why this worker cannot resolve it."""
     workspace = runtime.bootstrap.workspace(scope.workspace_id)
     agent = workspace.agent(run["agent_id"]) if workspace else None
     if agent is None:
-        return None
+        return "agent is not configured"  # configuration unavailable (scope delta I-4)
     # Exactly the pinned version, never another one (ADR-0011 rule 1, ADR-0021 rule 14).
-    return runtime.registries[agent.workload].resolve(entry["tool"], entry["tool_version"])
+    found = runtime.registries[agent.workload].resolve(entry["tool"], entry["tool_version"])
+    return found if found is not None else "tool version not resolvable"
 
 
 async def _record(
@@ -135,19 +137,27 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
         state = entry["state"]
         not_applied = OutcomeClass.NOT_APPLIED
         descriptor = _descriptor(runtime, scope, run, entry)
-        if descriptor is None:
-            reason = "not applied: tool version not resolvable"
+        if isinstance(descriptor, str):
             if state == "pending":
-                await _record(
-                    uow,
-                    runtime,
-                    scope,
-                    entry,
-                    expected=state,
-                    new="failed",
-                    outcome_class=not_applied,
-                    reason=reason,
-                )
+                # Nothing has left Tether (ADR-0011 rule 4).
+                new, outcome_class = "failed", not_applied
+                reason = f"not applied: {descriptor}"
+            else:
+                # A re-send is needed but impossible, and the first send may have applied
+                # (ADR-0011 rule 5): the outcome is unknown, never not applied. The run is woken
+                # and holds a write for reconciliation (ADR-0018).
+                new, outcome_class = _unknown_state(entry), OutcomeClass.UNKNOWN
+                reason = f"outcome unknown: {descriptor}; not re-sent"
+            await _record(
+                uow,
+                runtime,
+                scope,
+                entry,
+                expected=state,
+                new=new,
+                outcome_class=outcome_class,
+                reason=reason,
+            )
             return None
         args = descriptor.input_model.model_validate(job.payload.get("arguments", {}))
         hashed = call_hash_for(runtime.keys, run, descriptor, args)
@@ -267,9 +277,17 @@ async def _send(
             # deadline, and a timeout is an unknown outcome (ADR-0021 rule 6).
             async with asyncio.timeout(descriptor.timeout_seconds):
                 result = await descriptor.handler(args, context)
-            output = mask(descriptor.output_model.model_validate(result.model_dump()))
             new = outcome = "completed"
             outcome_class = OutcomeClass.APPLIED
+            try:
+                output = mask(descriptor.output_model.model_validate(result.model_dump()))
+            except ValidationError:
+                if entry["effect"] != "write":
+                    raise  # a read: a typed failure, below
+                # PD-33: the write reported success, so the effect occurred. Its output violates
+                # the schema: it is never persisted, logged or shown to the model, only marked.
+                tracing.event("tool.output_invalid")
+                reason, outcome = OUTPUT_INVALID, "output_invalid"
         except ToolNotApplied as not_applied:
             new, reason, outcome = "failed", f"not applied: {not_applied.reason}", "not_applied"
             outcome_class = OutcomeClass.NOT_APPLIED
@@ -296,8 +314,9 @@ async def _send(
                 new, reason = "failed", "failed: output invalid"
                 outcome_class = OutcomeClass.FAILED
             else:
-                # ADR-0007: a write whose result is unknown is indeterminate, never failed. A
-                # write with invalid output stays unknown until PD-33 (W5.2).
+                # ADR-0007: a write whose result is unknown is indeterminate, never failed. (A
+                # write that returned output violating its schema is applied, PD-33, above; a
+                # validation error raised inside the handler is an ordinary unknown outcome.)
                 new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
                 outcome_class = OutcomeClass.UNKNOWN
         metrics.tool_executed(descriptor.name, outcome, time.monotonic() - started)

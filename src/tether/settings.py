@@ -22,7 +22,24 @@ def _default_heartbeat_file() -> Path:
     return Path(tempfile.gettempdir()) / "tether-worker.heartbeat"
 
 
-class Settings(BaseSettings):
+class ApprovalExpirySettings(BaseSettings):
+    """Approval expiry bounds (W4.2, D-8), also read by ``tether bootstrap apply``.
+
+    The values are proposed and await owner confirmation: the default stays 3600 s and the
+    maximum is 86400 s. A tool's policy rule may set its own expiry; a rule or a default above
+    the maximum is refused, never clamped (``tether.policy.config.check_approval_expiry``).
+    """
+
+    model_config = SettingsConfigDict(env_prefix="TETHER_", extra="ignore", populate_by_name=True)
+
+    # How long an approval request stays decidable when its tool's rule sets no expiry (expiry is
+    # checked at decision time).
+    approval_ttl_seconds: int = Field(default=3600, gt=0)
+    # The largest approval expiry any rule or the default may set.
+    approval_max_ttl_seconds: int = Field(default=86400, gt=0)
+
+
+class Settings(ApprovalExpirySettings):
     """Settings shared by the ``api`` and ``worker`` processes (ADR-0001)."""
 
     # `populate_by_name` keeps every field settable by its own name as well as by its alias:
@@ -73,8 +90,7 @@ class Settings(BaseSettings):
     # unparseable arguments) and policy denials a run tolerates. One more ends it `failed`.
     max_repairs: int = Field(default=3, gt=0)
     max_denials: int = Field(default=3, gt=0)
-    # How long an approval request stays decidable (expiry is checked at decision time).
-    approval_ttl_seconds: int = Field(default=3600, gt=0)
+    # Approval expiry: `approval_ttl_seconds` and `approval_max_ttl_seconds` (inherited).
 
     worker_poll_interval_seconds: float = 1.0
     # How long a leased job stays invisible to other workers before it can be reclaimed.
