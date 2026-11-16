@@ -33,7 +33,7 @@ from tether.queue import backoff
 from tether.queue.postgres import LeasedJob
 from tether.registry.masking import mask
 from tether.runtime.driver import WorkerRuntime
-from tether.runtime.graph import call_hash_for
+from tether.runtime.graph import OUTPUT_INVALID, call_hash_for
 from tether.sdk import ToolContext, ToolDescriptor, ToolNotApplied
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.ledger import LedgerRepository
@@ -277,9 +277,17 @@ async def _send(
             # deadline, and a timeout is an unknown outcome (ADR-0021 rule 6).
             async with asyncio.timeout(descriptor.timeout_seconds):
                 result = await descriptor.handler(args, context)
-            output = mask(descriptor.output_model.model_validate(result.model_dump()))
             new = outcome = "completed"
             outcome_class = OutcomeClass.APPLIED
+            try:
+                output = mask(descriptor.output_model.model_validate(result.model_dump()))
+            except ValidationError:
+                if entry["effect"] != "write":
+                    raise  # a read: a typed failure, below
+                # PD-33: the write reported success, so the effect occurred. Its output violates
+                # the schema: it is never persisted, logged or shown to the model, only marked.
+                tracing.event("tool.output_invalid")
+                reason, outcome = OUTPUT_INVALID, "output_invalid"
         except ToolNotApplied as not_applied:
             new, reason, outcome = "failed", f"not applied: {not_applied.reason}", "not_applied"
             outcome_class = OutcomeClass.NOT_APPLIED
@@ -306,8 +314,9 @@ async def _send(
                 new, reason = "failed", "failed: output invalid"
                 outcome_class = OutcomeClass.FAILED
             else:
-                # ADR-0007: a write whose result is unknown is indeterminate, never failed. A
-                # write with invalid output stays unknown until PD-33 (W5.2).
+                # ADR-0007: a write whose result is unknown is indeterminate, never failed. (A
+                # write that returned output violating its schema is applied, PD-33, above; a
+                # validation error raised inside the handler is an ordinary unknown outcome.)
                 new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
                 outcome_class = OutcomeClass.UNKNOWN
         metrics.tool_executed(descriptor.name, outcome, time.monotonic() - started)

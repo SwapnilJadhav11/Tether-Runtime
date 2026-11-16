@@ -66,6 +66,9 @@ REPLAY_DIVERGENCE_REASON = "replay_divergence"
 # The typed not_applied content when a call's pinned version is gone before its ledger row
 # exists (ADR-0011 rule 3, ADR-0021 rule 15).
 TOOL_VERSION_UNAVAILABLE = "tool version unavailable"
+# PD-33: the outcome reason of a write that reported success with output violating its schema.
+# The entry is ``completed``/``applied`` with no payload; the model sees only the marker.
+OUTPUT_INVALID = "applied: output invalid"
 # The typed terminal reason of a run ended by a read configured with fail_run (ADR-0021 rule 9).
 TOOL_EXHAUSTED_PREFIX = "tool_exhausted:"
 # The typed terminal reasons of the repair/denial bound (W3.4, ADR-0016 rule 4, PD-15).
@@ -938,6 +941,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 if resolution == LedgerResolution.RECONCILED_APPLIED:
                     # A human confirmed the write happened; its real output is unknown.
                     return {"result": _result(CallOutcome.APPLIED, {"resolution": resolution})}
+                if entry["outcome_reason"] == OUTPUT_INVALID:
+                    # PD-33: applied, with a marker and no payload.
+                    return {"result": _result(CallOutcome.APPLIED, {"output_invalid": True})}
                 return {"result": _result(CallOutcome.APPLIED, entry["outcome_payload_masked"])}
             if entry["state"] == "failed":
                 if resolution == LedgerResolution.RECONCILED_NOT_APPLIED:

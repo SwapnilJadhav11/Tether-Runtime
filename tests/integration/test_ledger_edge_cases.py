@@ -61,13 +61,14 @@ class Value(BaseModel):
 
 
 class Wrong(BaseModel):
-    unexpected: int
+    unexpected: str = "s3cr3t-unvalidated-output"
 
 
 @dataclass
 class KvTarget:
     """``script`` decides each send: ``ok``; ``error`` (no answer, nothing applied); ``invalid``
-    (the change is applied, then the answer violates the output schema)."""
+    (the change is applied, then the answer violates the output schema); ``handler_validation``
+    (the handler's own validation raises before any change)."""
 
     store: dict[str, str] = field(default_factory=dict)
     script: list[str] = field(default_factory=list)
@@ -89,15 +90,17 @@ class KvTarget:
     async def get(self, args: KeyIn, ctx: ToolContext) -> BaseModel:
         step = self._step()
         if step == "invalid":
-            return Wrong(unexpected=1)
+            return Wrong()
         return Value(key=args.key, value=self.store.get(args.key, ""))
 
     async def set(self, args: SetIn, ctx: ToolContext) -> BaseModel:
         step = self._step()
+        if step == "handler_validation":  # the handler's own validation fails before any change
+            Value.model_validate({})
         self.store[args.key] = args.value
         self.applies += 1
         if step == "invalid":
-            return Wrong(unexpected=1)
+            return Wrong()
         return Value(key=args.key, value=args.value)
 
 
@@ -668,3 +671,78 @@ async def test_adr0011_a_version_gone_never_excuses_rows_that_disagree(
     await drain(runtime)
     assert run_status(seeded, run_id) == ("failed", "replay_divergence")
     assert model_calls(runtime) == 1
+
+
+# --- PD-33: a write that reports success with schema-invalid output -----------------------------
+
+
+def stored_texts(seeded: Any, run_id: uuid.UUID) -> list[str]:
+    """Every persisted payload of the run, as text."""
+    found = sql(
+        seeded,
+        "SELECT payload_masked::text FROM tether.audit_events WHERE run_id = %s"
+        " UNION ALL SELECT coalesce(outcome_payload_masked::text, '')"
+        " || coalesce(outcome_reason, '') FROM tether.ledger_entries WHERE run_id = %s",
+        run_id,
+        run_id,
+    )
+    return [text for (text,) in found]
+
+
+@pytest.mark.parametrize("name", ["set", "put"], ids=["idempotent", "non-idempotent"])
+@pytest.mark.asyncio
+async def test_pd33_a_write_applied_with_invalid_output_is_completed_with_a_marker_only(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path, name: str
+) -> None:
+    TARGET.script[:] = ["invalid", "invalid", "invalid"]
+    run_id = await submit(seeded, tmp_path, name)
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class, entry.attempts) == ("completed", "applied", 1)
+    assert entry.outcome_reason == "applied: output invalid"
+    assert entry.outcome_payload_masked is None  # the invalid output is never persisted
+    assert (TARGET.sends, TARGET.applies) == (1, 1)  # never re-sent
+    assert tool_results(runtime) == [("applied", json.dumps({"output_invalid": True}))]
+    assert run_status(seeded, run_id) == ("succeeded", f"{name} done")
+    texts = [*stored_texts(seeded, run_id), *(str(c) for _, c in tool_results(runtime))]
+    assert not [text for text in texts if "s3cr3t-unvalidated-output" in text]
+    found = await view(seeded, tmp_path, run_id)
+    [shown] = found["ledger"]
+    assert (shown["state"], shown["outcome"]) == ("completed", None)
+    assert payload(seeded, run_id, f"outcome:{entry.id}") == {
+        "ledger_id": str(entry.id),
+        "state": "completed",
+        "outcome_class": "applied",
+        "reason": "applied: output invalid",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pd33_a_validation_error_inside_a_write_handler_stays_unknown(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    """Only output returned by the handler is PD-33; a handler that raises did not report
+    success, so its outcome is unknown and never re-sent as invalid."""
+    TARGET.script[:] = ["handler_validation"]
+    run_id = await submit(seeded, tmp_path, "set")
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class) == ("indeterminate", "unknown")
+    assert entry.outcome_reason == "outcome unknown: ValidationError"
+    assert (TARGET.sends, TARGET.applies) == (1, 0)
+    assert run_status(seeded, run_id) == ("awaiting_reconciliation", None)
+
+
+@pytest.mark.asyncio
+async def test_pd33_a_read_with_invalid_output_is_still_a_typed_failure(
+    runtime: WorkerRuntime, seeded: Any, tmp_path: Path
+) -> None:
+    TARGET.script[:] = ["invalid"]
+    run_id = await submit(seeded, tmp_path, "get")
+    await drain(runtime)
+    [entry] = ledger(seeded, run_id)
+    assert (entry.state, entry.outcome_class) == ("failed", "failed")
+    assert entry.outcome_payload_masked is None
+    assert TARGET.sends == 1
+    assert tool_results(runtime) == [("failed", "failed: output invalid")]
+    assert not [t for t in stored_texts(seeded, run_id) if "s3cr3t-unvalidated-output" in t]
