@@ -21,6 +21,7 @@ from alembic import command
 from alembic.config import Config
 from psycopg import sql
 from psycopg.types.json import Jsonb
+from tests.support.db_connect import AdminConnection, connect_with_retry
 
 from tether.cli.main import MIGRATIONS_LOCATION, upgrade_to_head
 from tether.runtime.checkpointer import setup_langgraph_schema
@@ -79,30 +80,38 @@ def _rebuild_schema(dsn: str) -> None:
     upgrade_to_head(dsn)
 
 
+# One superuser connection for every clone and drop of the session (not two per test). Kept at
+# module level so every suite that imports ``fresh_db`` and ``template_database`` shares it with
+# no extra fixture to import; ``template_database`` closes it after the last clone is dropped.
+_ADMIN: dict[str, AdminConnection] = {}
+
+
+def _admin(test_db: TestDatabase) -> psycopg.Connection[Any]:
+    dsn = test_db.superuser_dsn()
+    return _ADMIN.setdefault(dsn, AdminConnection(dsn)).get()
+
+
 @pytest.fixture(scope="session")
 def template_database(test_db: TestDatabase) -> Iterator[str]:
     """A fully migrated database (tether schema + LangGraph saver) that tests clone."""
-    with psycopg.connect(test_db.superuser_dsn(), autocommit=True) as admin:
-        _clone(admin, SOURCE_DB, TEMPLATE_DB)
+    _clone(_admin(test_db), SOURCE_DB, TEMPLATE_DB)
     template = replace(test_db, dbname=TEMPLATE_DB)
     _rebuild_schema(template.migrator_dsn)
     setup_langgraph_schema(template.migrator_dsn)
     yield TEMPLATE_DB
-    with psycopg.connect(test_db.superuser_dsn(), autocommit=True) as admin:
-        _drop(admin, TEMPLATE_DB)
+    _drop(_admin(test_db), TEMPLATE_DB)
+    _ADMIN.pop(test_db.superuser_dsn()).close()
 
 
 @pytest.fixture
 def fresh_db(test_db: TestDatabase, template_database: str) -> Iterator[TestDatabase]:
     """A private, migrated database for one test, dropped afterwards."""
     name = f"tether_test_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(test_db.superuser_dsn(), autocommit=True) as admin:
-        _clone(admin, template_database, name)
+    _clone(_admin(test_db), template_database, name)
     try:
         yield replace(test_db, dbname=name)
     finally:
-        with psycopg.connect(test_db.superuser_dsn(), autocommit=True) as admin:
-            _drop(admin, name)
+        _drop(_admin(test_db), name)
 
 
 class Rows:
@@ -212,7 +221,7 @@ class Seeded:
 def seeded(fresh_db: TestDatabase, rows: Rows) -> Seeded:
     """Two workspaces, each with ``agent-1`` and one queued run; ``only-a`` exists in ws-a only."""
     run_a, run_b = uuid.uuid4(), uuid.uuid4()
-    with psycopg.connect(fresh_db.migrator_dsn) as owner:
+    with connect_with_retry(fresh_db.migrator_dsn) as owner:
         for workspace in (WS_A, WS_B):
             rows.insert(owner, "workspaces", {"id": workspace})
             rows.insert(owner, "agents", {"workspace_id": workspace, "agent_id": "agent-1"})

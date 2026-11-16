@@ -345,7 +345,17 @@ async def test_approve_vs_expiry_race_repeated_30_times(env: Env) -> None:
                 await env.drain(worker)
 
             approved, _ = await asyncio.gather(approve(), expire())
-            await asyncio.sleep(0.2)  # past the expiry: the timer is due
+            # Past the expiry: wait until the database clock has passed the approval's expiry
+            # and the timer's due time (the same instants the UPDATEs above set), not a guess.
+            await wait_until(
+                lambda approval=approval_id: env.sql(
+                    "SELECT clock_timestamp() >= a.expires_at AND clock_timestamp() >= COALESCE("
+                    "(SELECT max(run_after) FROM tether.jobs"
+                    " WHERE ref_id = a.id AND kind = 'expire_approval'), a.expires_at)"
+                    " FROM tether.approvals a WHERE a.id = %s",
+                    approval,
+                )[0][0]
+            )
             await env.drain(worker)
             [(approval_status,)] = env.sql(
                 "SELECT status FROM tether.approvals WHERE id = %s", approval_id
