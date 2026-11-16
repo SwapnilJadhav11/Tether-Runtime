@@ -29,6 +29,7 @@ from tether.api.routers.tasks import (
     RunView,
     cancel_as,
 )
+from tether.audit.access_events import record_run_inspection
 from tether.audit.chain import verify_run
 from tether.authz.deps import ops_principal, ops_reader
 from tether.core.ids import WorkspaceId
@@ -196,6 +197,7 @@ async def get_run_for_oversight(
         audit_repo = uow.repository(AuditRepository, scope)
         events = await audit_repo.events(run_id)
         chain_valid = await verify_run(audit_repo, request.app.state.keyring, run_id)
+    record_run_inspection(request.app.state, principal, run_id)
     return RunView(
         **{name: row[name] for name in RunView.model_fields if name in row},
         approvals=[ApprovalView.model_validate(dict(a)) for a in approvals],

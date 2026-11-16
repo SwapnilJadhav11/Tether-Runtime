@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy.engine import RowMapping
 
 from tether.api.routers.tasks import AuditView, LedgerView
+from tether.audit.access_events import record_run_inspection
 from tether.audit.chain import verify_run
 from tether.authz.deps import approvals_principal, approvals_reader
 from tether.core.ids import WorkspaceId
@@ -316,6 +317,7 @@ async def get_run_evidence(
         audit_repo = uow.repository(AuditRepository, reader.scope)
         events = await audit_repo.events(run_id)
         chain_valid = await verify_run(audit_repo, request.app.state.keyring, run_id)
+    record_run_inspection(request.app.state, principal, run_id)
     return ApproverRunView(
         **{name: run[name] for name in ApproverRunView.model_fields if name in run},
         requester=_requester_subject(run["requester_snapshot"]),
