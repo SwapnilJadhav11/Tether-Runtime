@@ -11,12 +11,14 @@ from psycopg.types.json import Jsonb
 from pydantic import ValidationError
 
 from tether.policy.config import (
+    ApprovalExpiryError,
     BootstrapConfigError,
     BootstrapFile,
     WorkspaceConfig,
+    check_approval_expiry,
     load_bootstrap,
 )
-from tether.settings import MigrationSettings
+from tether.settings import ApprovalExpirySettings, MigrationSettings
 
 app = typer.Typer(no_args_is_help=True, help="Apply bootstrap configuration.")
 
@@ -116,6 +118,17 @@ def apply(path: Path) -> None:
         config = load_bootstrap(path)
     except BootstrapConfigError as error:
         typer.echo(f"invalid bootstrap file: {error}", err=True)
+        raise typer.Exit(code=1) from None
+    try:
+        limits = ApprovalExpirySettings()
+        check_approval_expiry(
+            config,
+            default_seconds=limits.approval_ttl_seconds,
+            max_seconds=limits.approval_max_ttl_seconds,
+        )
+    except (ValidationError, ApprovalExpiryError) as error:
+        # Refused, never clamped (W4.2): nothing is written.
+        typer.echo(f"approval expiry refused: {error}", err=True)
         raise typer.Exit(code=1) from None
     apply_bootstrap(settings.migrator_database_url.get_secret_value(), config)
     typer.echo(f"bootstrap applied: {len(config.workspaces)} workspace(s)")

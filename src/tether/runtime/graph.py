@@ -117,6 +117,7 @@ class RunContext:
     agent_id: str
     generation: int
     max_turns: int
+    # The default approval expiry, for a tool whose policy rule sets none (W4.2).
     approval_ttl_seconds: int
     # The workspace's policy engine (ADR-0020), built from the same loaded configuration.
     policy: PolicyEngine
@@ -686,9 +687,12 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             approval_id = uuid.uuid4()
             masked = mask(args)
             preconditions = _masked_preconditions(descriptor, args)
-            expiry = func.clock_timestamp() + func.make_interval(
-                0, 0, 0, 0, 0, 0, ctx.approval_ttl_seconds
+            # The tool's own expiry from its policy rule, else the default (W4.2); both were
+            # checked against the maximum at worker startup. Decision-time checks are unchanged.
+            seconds = ctx.workspace.policy.approval_expiry_for(
+                descriptor.name, ctx.approval_ttl_seconds
             )
+            expiry = func.clock_timestamp() + func.make_interval(0, 0, 0, 0, 0, 0, seconds)
             await approvals.add(
                 {
                     "id": approval_id,

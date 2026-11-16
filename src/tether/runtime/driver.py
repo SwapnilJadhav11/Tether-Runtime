@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tether.core.statuses import RunStatus
 from tether.observability import metrics, tracing
 from tether.observability.logging import get_logger
-from tether.policy.config import BootstrapFile, load_bootstrap
+from tether.policy.config import BootstrapFile, check_approval_expiry, load_bootstrap
 from tether.policy.engine import (
     BuiltinPolicyEngine,
     ToolPolicyMetadata,
@@ -97,6 +97,13 @@ class WorkerRuntime:
                 for tool in registries[agent.workload].workload.tools
             }
             check_tools_against_policy(ws, tools)
+        # Fail closed at startup on an approval expiry above the maximum: refused, never clamped
+        # (W4.2).
+        check_approval_expiry(
+            bootstrap,
+            default_seconds=settings.approval_ttl_seconds,
+            max_seconds=settings.approval_max_ttl_seconds,
+        )
         dsn = settings.database_url.get_secret_value()
         pool = create_saver_pool(dsn, name="tether-worker-langgraph")
         await pool.open(wait=False)
