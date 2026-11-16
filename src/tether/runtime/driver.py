@@ -24,6 +24,7 @@ from tether.policy.engine import (
     ToolPolicyMetadata,
     check_tools_against_policy,
 )
+from tether.providers.factory import build_provider
 from tether.providers.protocol import ModelProvider
 from tether.registry.registry import ToolRegistry, WorkloadLoadError, load_workload
 from tether.runtime.checkpointer import SaverPool, create_checkpointer, create_saver_pool
@@ -37,7 +38,6 @@ from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.runs import NON_TERMINAL, RunsRepository
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
-from tether.testing.scripted import ScriptedProvider
 
 # Opaque, meaningless resume value (§9.3; pinned by the S1.3 contract suite).
 WAKE = "tether:wake"
@@ -113,11 +113,17 @@ class WorkerRuntime:
             checkpointer=create_checkpointer(pool),
             keys=KeyRing(EnvSecretsProvider()),
             bootstrap=bootstrap,
-            provider=provider or ScriptedProvider(settings.scenarios_dir, env=settings.env),
+            # Configuration chooses the provider (ADR-0016 rule 6). Tests may inject one.
+            provider=provider if provider is not None else build_provider(settings),
             registries=registries,
         )
 
     async def close(self) -> None:
+        # A hosted adapter holds a connection pool. The protocol does not require `aclose`,
+        # so a provider that has none (the scripted one) is simply left alone.
+        closer = getattr(self.provider, "aclose", None)
+        if closer is not None:
+            await closer()
         await self.engine.dispose()
         await self.saver_pool.close()
 
@@ -169,6 +175,7 @@ async def drive(
         max_turns=runtime.settings.max_model_turns,
         approval_ttl_seconds=runtime.settings.approval_ttl_seconds,
         policy=BuiltinPolicyEngine(workspace),
+        provider_max_attempts=runtime.settings.provider_max_attempts,
     )
     graph = build_graph(ctx).compile(checkpointer=runtime.checkpointer)
     config: Any = {"configurable": {"thread_id": str(run_id)}}

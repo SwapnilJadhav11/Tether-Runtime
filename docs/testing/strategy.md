@@ -15,16 +15,18 @@
 | LangGraph semantics contract (exact pins) | `tests/contract/langgraph/` (4 files) | `test-contract` | `integration` | implemented |
 | Chaos and races | `tests/chaos/` (3 files, 19 test functions, parametrised and repeated) | `test-chaos` | `chaos` | implemented (hardening baseline) |
 | Compose stack build and health (manual demo path) | `deploy/compose/docker-compose.yml`; `scripts/smoke_submit.py` | `smoke` | manual | implemented |
-| Static checks bundle | — | `ci` (= `lint`, `typecheck`, `contracts`, `test-unit`) | mirrors `static` | implemented |
+| Static checks bundle | — | `ci` (= `lint`, `typecheck`, `contracts`, `test-unit`, `test-provider-contract`) | mirrors `static` | implemented |
 | Authorization matrix (T-24, route inventory) | `tests/authz/` | `test-authz` | — | **planned** (directory empty; W4.4) |
 | Performance and load (P-01–P-03) | `tests/perf/` | `test-perf` | — | **planned** (directory empty; W10.3) |
-| Provider contract, live (T-11 on OpenAI) | `tests/contract/providers/` | `test-live` | manual dispatch | **planned** (W9.1) |
+| Provider contract, deterministic (T-11 on the scripted provider and the OpenAI adapter over a mocked transport) | `tests/contract/providers/` (5 files) | `test-provider-contract` | `static` | implemented |
+| Provider swap, end to end (T-11: one governed task on both providers, selected by configuration; the OpenAI adapter against a local stub) | `tests/integration/test_provider_swap.py` | `test-integration` | `integration` | implemented |
+| Provider contract, live (T-11 against the real OpenAI API) | `tests/contract/providers/test_T11_live_openai.py` (marker `live`) | `test-live` | manual dispatch | **planned**: implemented and skips without a credential; **not yet run against the real API** |
 | GitHub sandbox integration (T-30) | `tests/integration/github/` or marker `credentialed` | `test-live` | manual dispatch | **planned** (W9.2) |
 | Production-build inspection (T-32) | `tests/unit/`, build step | `test-unit` / CI | — | **planned** (W7.1, W7.2) |
 
-Only the tasks in "implemented" rows exist in `pyproject.toml`. The plan previously also named `test-authz`, `test-perf`, `test-live` and `demo`; they are intended, not present. Markers registered: `live`, `chaos`, `perf`.
+Only the tasks in "implemented" rows exist in `pyproject.toml`, plus `test-live`, which exists and skips cleanly without a credential. The plan previously also named `test-authz`, `test-perf` and `demo`; they are intended, not present. Markers registered: `live`, `chaos`, `perf`.
 
-CI (`.github/workflows/ci.yml`) runs on every push and pull request: `static` on Ubuntu and Windows (`lint`, `typecheck`, `contracts`, `test-unit`); `integration` on Ubuntu (`test-integration`, then `test-contract`) and `chaos` on Ubuntu (`test-chaos`), both against `deploy/compose/docker-compose.test.yml` with throwaway credentials generated in the runner.
+CI (`.github/workflows/ci.yml`) runs on every push and pull request: `static` on Ubuntu and Windows (`lint`, `typecheck`, `contracts`, `test-unit`, `test-provider-contract`); `integration` on Ubuntu (`test-integration`, then `test-contract`) and `chaos` on Ubuntu (`test-chaos`), both against `deploy/compose/docker-compose.test.yml` with throwaway credentials generated in the runner.
 
 ## 2. How the database-backed suites run
 
@@ -105,7 +107,7 @@ Behaviour that exists in the code but has no test asserting it. Each item needs 
 
 ## 5. Credentialed and long-running suites (planned)
 
-- **OpenAI contract (T-11, live T-10 retry):** marker `live`; needs `OPENAI_API_KEY` from the operator's environment; manual-dispatch CI job; spend logged. Never run on pull requests.
+- **OpenAI contract (T-11, live T-10 retry):** marker `live`; needs `TETHER_MODEL_PROVIDER=openai`, `TETHER_OPENAI_API_KEY` and `TETHER_OPENAI_MODEL` from the operator's environment; manual-dispatch CI job; spend logged. Never run on pull requests. The key is read through the `SecretsProvider`, which only exposes `TETHER_*` variables, so an unprefixed `OPENAI_API_KEY` is not visible to it. See `docs/operations/model-providers.md`.
 - **GitHub sandbox (T-30):** marker `credentialed`; manual dispatch. Rules (OD-9): a dedicated sandbox/test repository used by nothing else; least-privilege credentials scoped to it; never a personal or production repository; deterministic fixtures where practical; a documented cleanup/reset strategy (tests tag and remove what they create); credentials outside Git, handled under the production secret rules (`SecretsProvider`, CI secrets). *The concrete repository, token scope and cleanup procedure are defined in W9.2.*
 - **Performance (P-01–P-03):** marker `perf`; nightly or pre-release; results published as the measured operating limits (U-006).
 - **Flake gate:** chaos suite repeated 20× before a release claim (plan), not on every push.

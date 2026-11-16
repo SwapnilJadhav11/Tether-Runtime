@@ -33,8 +33,21 @@ class NeutralMessage(_Frozen):
     outcome: CallOutcome | None = None
 
 
+class ModelUsage(_Frozen):
+    """Token usage as the provider reported it (ADR-0016 rule 5).
+
+    Never estimated: a field is ``None`` when the provider did not report it. Dollar cost is
+    deferred (D-7), so no price is derived here.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
 class ModelTurn(_Frozen):
     """A model response: tool calls, or a final answer when there are none."""
 
     text: str = ""
     tool_calls: tuple[ToolCallProposal, ...] = ()
+    # Transient: belongs to the `model_calls` row for this attempt, never to history.
+    usage: ModelUsage | None = None

@@ -8,6 +8,7 @@ Decisions are keyed by step ordinal and adopted on replay, never re-decided.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -39,6 +40,7 @@ from tether.policy.engine import (
 )
 from tether.providers.history import ModelTurn, NeutralMessage
 from tether.providers.protocol import ModelProvider, ProviderError
+from tether.queue import backoff
 from tether.registry.masking import mask
 from tether.registry.registry import ToolRegistry
 from tether.sdk import ToolDescriptor
@@ -66,6 +68,8 @@ REPLAY_DIVERGENCE_REASON = "replay_divergence"
 TOOL_VERSION_UNAVAILABLE = "tool version unavailable"
 # The typed terminal reason of a run ended by a read configured with fail_run (ADR-0021 rule 9).
 TOOL_EXHAUSTED_PREFIX = "tool_exhausted:"
+# The pause before a provider retry; a module attribute so tests can observe the delays.
+_sleep = asyncio.sleep
 
 
 class RunState(TypedDict, total=False):
@@ -101,6 +105,8 @@ class RunContext:
     approval_ttl_seconds: int
     # The workspace's policy engine (ADR-0020), built from the same loaded configuration.
     policy: PolicyEngine
+    # Provider attempts per model turn (W3.3): retryable errors only, PD-13 backoff between.
+    provider_max_attempts: int
 
 
 def initial_state(system_prompt: str, task_input: dict[str, Any]) -> RunState:
@@ -326,8 +332,9 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
             return None
         return _divergence(call, path=path, stored=stored, recomputed=recomputed)
 
-    async def call_model(state: RunState) -> RunState:
-        # G0: the stop predicate before every provider attempt (§9.2).
+    async def before_attempt() -> RunState | None:
+        """G0, fenced: the stop predicate and the divergence gate before every provider attempt
+        (§9.2, ADR-0006). ``None``: the attempt may be made."""
         async with UnitOfWork(ctx.engine) as uow:
             run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
             if run["stopped"]:
@@ -338,24 +345,29 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                 ctx.run_id, "REPLAY_DIVERGENCE"
             ):
                 return {"divergence": {"path": "model_gate", "recorded": True}}
-        if state["turns"] >= ctx.max_turns:
-            return {"end_status": RunStatus.FAILED, "final_text": "model turn budget exhausted"}
-        history = [NeutralMessage.model_validate(m) for m in state["history"]]
+        return None
+
+    async def attempt_model(
+        state: RunState, history: list[NeutralMessage], attempt: int
+    ) -> tuple[ModelTurn | ProviderError, RunState | None]:
+        """One provider attempt and its own ``model_calls`` row (ADR-0016 rule 5, §9.2): the
+        turn or the normalised error, and the stop found right after the response, if any."""
         turn: ModelTurn | None = None
-        failure = ""
+        failed: ProviderError | None = None
         with tracing.span(
             "model.call",
             attributes={
                 "tether.model.provider": ctx.provider.name,
                 "tether.model.name": ctx.provider.model,
                 "tether.model.turn": state["turns"],
+                "tether.model.attempt": attempt,
             },
         ) as current:
             started = time.monotonic()
             try:
                 turn = await ctx.provider.complete(history, ctx.registry.manifest())
             except ProviderError as error:
-                failure = f"model call failed: {error}"
+                failed = error
                 tracing.mark_error(current, type(error).__name__)
             outcome = "failed" if turn is None else "succeeded"
             metrics.model_call(ctx.provider.name, outcome, time.monotonic() - started)
@@ -366,9 +378,19 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "tether.model.tool_calls": 0 if turn is None else len(turn.tool_calls),
                 },
             )
-        if turn is None:
-            _log.warning("model call failed", provider=ctx.provider.name, turn=state["turns"])
+        if failed is not None:
+            _log.warning(
+                "model call failed",
+                provider=ctx.provider.name,
+                turn=state["turns"],
+                attempt=attempt,
+                code=failed.code,
+            )
         async with UnitOfWork(ctx.engine) as uow:
+            # Usage as the provider reported it, or nothing: it is never estimated, and a field
+            # the provider omitted stays null. Dollar cost is deferred (D-7), so `cost_usd` is
+            # left unwritten rather than derived from a price table.
+            usage = turn.usage if turn is not None else None
             await uow.repository(ModelCallsRepository, ctx.scope).add(
                 {
                     "id": uuid.uuid4(),
@@ -377,20 +399,54 @@ def build_graph(ctx: RunContext) -> StateGraph[RunState]:
                     "provider_role": "primary",
                     "provider": ctx.provider.name,
                     "model": ctx.provider.model,
-                    "attempt": 1,
+                    # The attempt within this execution of the node: after a crash the node
+                    # re-runs from attempt 1 and every attempt still gets its own row.
+                    "attempt": attempt,
                     "occurrence_id": uuid.uuid4(),
                     "status": "failed" if turn is None else "succeeded",
+                    "input_tokens": usage.input_tokens if usage is not None else None,
+                    "output_tokens": usage.output_tokens if usage is not None else None,
+                    # The provider's normalised, label-safe code, never its own error prose,
+                    # which can quote the request.
+                    "error_code": failed.code if failed is not None else None,
                     "started_at": func.clock_timestamp(),
                     "finished_at": func.clock_timestamp(),
                 }
             )
             # A stop committed while the request was in flight: the response is recorded for
-            # cost above, and its proposals are never governed (§9.2).
+            # cost above, its proposals are never governed and a failure is not retried (§9.2).
             run = await uow.repository(RunsRepository, ctx.scope).guard(ctx.run_id, ctx.generation)
+            answer: ModelTurn | ProviderError = (
+                turn if turn is not None else _required(failed, "provider error")
+            )
             if run["stopped"]:
-                return await stopped(uow, run)
-        if turn is None:
-            return {"end_status": RunStatus.FAILED, "final_text": failure}
+                return answer, await stopped(uow, run)
+        return answer, None
+
+    async def call_model(state: RunState) -> RunState:
+        gated = await before_attempt()
+        if gated is not None:
+            return gated
+        if state["turns"] >= ctx.max_turns:
+            return {"end_status": RunStatus.FAILED, "final_text": "model turn budget exhausted"}
+        history = [NeutralMessage.model_validate(m) for m in state["history"]]
+        attempt = 1
+        while True:
+            answer, ended = await attempt_model(state, history, attempt)
+            if ended is not None:
+                return ended
+            if isinstance(answer, ModelTurn):
+                turn = answer
+                break
+            # Bounded retry on retryable errors only; no fallback in V1 (ADR-0016 rule 3).
+            if not answer.retryable or attempt >= ctx.provider_max_attempts:
+                failure = f"model call failed: {answer}"
+                return {"end_status": RunStatus.FAILED, "final_text": failure}
+            await _sleep(backoff.tool_backoff_seconds(attempt))  # PD-13
+            attempt += 1
+            gated = await before_attempt()
+            if gated is not None:
+                return gated
         first = state["next_step_ordinal"]
         pending = [
             {"step_ordinal": first + i, **call.model_dump(mode="json")}
