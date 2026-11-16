@@ -19,7 +19,8 @@ Production operation must fail closed. A production process never silently selec
 | `TETHER_BINDING_ACTIVE_KEY_ID`, `TETHER_BINDING_KEY_<ID>` | independent from the audit family | Call-binding HMAC (ADR-0010) |
 | Provider credentials (OpenAI key) | via the secrets mechanism of the host, never in bootstrap files or images | TDR-004 |
 | `TETHER_RUN_MAX_DURATION_SECONDS` | deliberate value (development default 3600) | Run deadline (D-8) |
-| `TETHER_APPROVAL_TTL_SECONDS` | deliberate value within the maximum (per-tool expiry planned, D-8) | Approval expiry |
+| `TETHER_APPROVAL_TTL_SECONDS` | deliberate value within the maximum (development default 3600) | Default approval expiry, used when the tool's `require_approval` policy rule sets no `approval_expiry_seconds` (W4.2, D-8) |
+| `TETHER_APPROVAL_MAX_TTL_SECONDS` | deliberate value (development default 86400; proposed, awaiting owner confirmation) | Upper bound for the default and for every rule's `approval_expiry_seconds`; a value above it is refused, never clamped, by `tether bootstrap apply` (before anything is written) and at worker startup. Each reads both approval settings from its own environment, so give the CLI and the worker the same values |
 | `TETHER_OTEL_ENDPOINT` | collector URL, or unset | Telemetry is best-effort |
 | `TETHER_LOG_LEVEL` | `INFO` or `WARNING` | Logs are JSON with scrubbing |
 
