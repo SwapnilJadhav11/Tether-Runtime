@@ -1,5 +1,6 @@
-"""``/v1/ops`` (audience ``tether-ops``): reconcile an ``indeterminate`` entry (TX8, ADR-0007)
-and cancel any run of the workspace as its ``workspace_admin`` (TX9).
+"""``/v1/ops`` (audience ``tether-ops``): reconcile an ``indeterminate`` entry (TX8, ADR-0007),
+cancel any run of the workspace as its ``workspace_admin`` (TX9), and inspect any run of the
+workspace as its ``auditor`` or ``workspace_admin`` (read-only, masked).
 
 Authorization order (ADR-0013): audience and token, then workspace, then the role from the
 validated token (``reconciler`` or ``workspace_admin``), then, for reconciliation, policy
@@ -20,8 +21,17 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from tether.api.routers.tasks import CancelRequested, cancel_as
-from tether.authz.deps import ops_principal
+from tether.api.routers.tasks import (
+    ApprovalView,
+    AuditView,
+    CancelRequested,
+    LedgerView,
+    RunView,
+    cancel_as,
+)
+from tether.audit.access_events import record_run_inspection
+from tether.audit.chain import verify_run
+from tether.authz.deps import ops_principal, ops_reader
 from tether.core.ids import WorkspaceId
 from tether.core.statuses import (
     TERMINAL_RUN_STATUSES,
@@ -37,6 +47,7 @@ from tether.policy.engine import (
     ReconciliationEligibilityRequest,
     TrustedRequester,
 )
+from tether.storage.repos.approvals import ApprovalsRepository
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.ledger import LedgerRepository
 from tether.storage.repos.runs import JobsRepository, PolicyVersionsRepository, RunsRepository
@@ -48,6 +59,7 @@ _log = get_logger(__name__)
 
 RECONCILER_ROLE = "reconciler"
 WORKSPACE_ADMIN_ROLE = "workspace_admin"
+AUDITOR_ROLE = "auditor"
 
 Outcome = Literal["applied", "not_applied", "abandon"]
 
@@ -159,6 +171,51 @@ async def reconcile_entry(
         outcome=outcome,
     )
     return resolved
+
+
+@router.get("/runs/{run_id}")
+async def get_run_for_oversight(
+    request: Request,
+    run_id: uuid.UUID,
+    principal: Annotated[Principal, Depends(ops_reader)],
+) -> RunView:
+    """The masked run inspection for an ``auditor`` or ``workspace_admin`` (PRD table).
+
+    Any run of the caller's own workspace. A missing role, another workspace and an unknown run
+    are all ``404`` (ADR-0013). The content is exactly what the requester's view returns:
+    authoritative rows, masked payloads, and whether the audit chain verifies (ADR-0017).
+    """
+    if not (principal.has_role(AUDITOR_ROLE) or principal.has_role(WORKSPACE_ADMIN_ROLE)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    scope = WorkspaceScope(WorkspaceId(principal.workspace_id))
+    async with UnitOfWork(request.app.state.db_engine) as uow:
+        row = await uow.repository(RunsRepository, scope).get(run_id)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND)
+        approvals = await uow.repository(ApprovalsRepository, scope).for_run(run_id)
+        ledger = await uow.repository(LedgerRepository, scope).for_run(run_id)
+        audit_repo = uow.repository(AuditRepository, scope)
+        events = await audit_repo.events(run_id)
+        chain_valid = await verify_run(audit_repo, request.app.state.keyring, run_id)
+    record_run_inspection(request.app.state, principal, run_id)
+    return RunView(
+        **{name: row[name] for name in RunView.model_fields if name in row},
+        approvals=[ApprovalView.model_validate(dict(a)) for a in approvals],
+        ledger=[
+            LedgerView(**dict(entry), outcome=entry["outcome_payload_masked"]) for entry in ledger
+        ],
+        audit=[
+            AuditView(
+                seq=event.seq,
+                event_type=event.event_type,
+                actor=event.actor,
+                tool=event.tool,
+                policy_version=event.policy_version,
+            )
+            for event in events
+        ],
+        audit_chain_valid=chain_valid,
+    )
 
 
 @router.post("/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
