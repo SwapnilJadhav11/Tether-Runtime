@@ -164,6 +164,11 @@ async def approvals_reader(request: Request) -> Principal:
     return await _human(request, Audience.APPROVALS, None)
 
 
+async def ops_reader(request: Request) -> Principal:
+    """Read-only ops routes: real credentials only, no dev/test shortcut."""
+    return await _human(request, Audience.OPS, None)
+
+
 async def ops_principal(
     request: Request,
     dev_identity_body: Annotated[DevPerson | None, Body(alias="dev_identity", embed=True)] = None,
