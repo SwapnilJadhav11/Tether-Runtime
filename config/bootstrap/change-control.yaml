@@ -1,0 +1,67 @@
+# Bootstrap for the change-control workload (ADR-0014): applied with `tether bootstrap apply`.
+# Identity holds no secrets (ADR-0013, PD-20): issuer PUBLIC keys and API key hashes only. The
+# keys and hash below are the dev ones from dev.yaml (private halves live in the git-ignored
+# tools/dev_issuer/.keys/); the issuer URLs are scoped to this workspace.
+# The GitHub target and token are runtime environment variables of the worker
+# (CHANGE_CONTROL_GITHUB_REPO, CHANGE_CONTROL_GITHUB_TOKEN), never part of this file.
+workspaces:
+  - id: change-control
+    agents:
+      - id: change-controller
+        workload: change_control
+    issuers:
+      - id: tasks
+        iss: https://dev-issuer.tether.local/change-control/tether-tasks
+        audiences: [tether-tasks]
+        algorithm: EdDSA
+        public_keys:
+          tasks-1: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEAAM3WpgdsEGoGJyjRA3Jb13GyoK3An5htBaIdAJu8JYA=
+            -----END PUBLIC KEY-----
+      - id: approvals
+        iss: https://dev-issuer.tether.local/change-control/tether-approvals
+        audiences: [tether-approvals]
+        algorithm: EdDSA
+        public_keys:
+          approvals-1: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEAR5a1M3GDbdcmivfQyw246b4EsCwovtxtI+rAYBRmjbU=
+            -----END PUBLIC KEY-----
+      - id: ops
+        iss: https://dev-issuer.tether.local/change-control/tether-ops
+        audiences: [tether-ops]
+        algorithm: EdDSA
+        public_keys:
+          ops-1: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEAreypLrJJEqmysidS3xr5D4i9+u0p7hl2mq+GgraC0wg=
+            -----END PUBLIC KEY-----
+    api_keys:
+      - key_id: change-app
+        salt: 8c8349cef8058cc636d14092e01be029
+        secret_hash: ddd193cf234717509779b4731272b3f51d8265fdc29b950caea4fe2a8328f4b2
+        agents: [change-controller]
+    policy:
+      rules:
+        - tool: get_issue
+          decision: allow
+        - tool: list_open_change_issues
+          decision: allow
+        - tool: apply_label
+          decision: allow
+        - tool: create_change_issue
+          decision: require_approval
+          approver_roles: [approver]
+        - tool: close_issue
+          decision: require_approval
+          approver_roles: [approver]
+      # Who may resolve an indeterminate write; never the run's requester.
+      reconciliation:
+        reconciler_roles: [reconciler]
+      # ADR-0020: requester permissions (by role) ∩ agent permissions must cover a tool's
+      # required permissions; approver and reconciler roles grant no tool permissions.
+      role_permissions:
+        operator: [issue:read, issue:create, issue:label, issue:close]
+      agent_permissions:
+        change-controller: [issue:read, issue:create, issue:label, issue:close]

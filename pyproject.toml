@@ -39,6 +39,7 @@ tether-worker-healthcheck = "tether.worker.main:healthcheck"
 # bootstrap configuration (ADR-0002).
 [project.entry-points."tether.workloads"]
 incident_remediation = "workloads.incident_remediation:WORKLOAD"
+change_control = "workloads.change_control:WORKLOAD"
 
 [dependency-groups]
 dev = [
