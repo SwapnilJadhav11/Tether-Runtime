@@ -77,3 +77,50 @@ async def test_tx7_takes_the_run_row_first_so_a_concurrent_stop_cannot_deadlock_
         await env.assert_reconstructable(run_id)
     finally:
         await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_tx_v2_takes_the_run_row_first_so_a_concurrent_stop_cannot_deadlock_it(
+    seeded: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W5.1: the verification outcome (TX-V2) follows the same order as TX7."""
+    from tether.queue import backoff
+
+    monkeypatch.setattr(backoff, "verify_backoff_seconds", lambda declared, attempt, rng=None: 0.0)
+    env = make_env(seeded.db, tmp_path)
+    gate = asyncio.Event()
+    reset_target()
+    TARGET.script[:] = ["drop"]  # applied, the answer lost: indeterminate, then verified
+    TARGET.probe_gate = gate
+    worker = await env.worker()
+    try:
+        run_id = await env.submit("verified")
+        probing = asyncio.create_task(env.drain(worker))
+        await wait_until(lambda: TARGET.probing == 1)  # TX-V1 committed, the probe is in flight
+
+        with (
+            psycopg.connect(seeded.db.app_dsn) as stop,
+            psycopg.connect(seeded.db.superuser_dsn(seeded.db.dbname), autocommit=True) as admin,
+        ):
+            stop_pid = stop.info.backend_pid
+            stop.execute("SELECT id FROM tether.runs WHERE id = %s FOR UPDATE", (run_id,))
+            gate.set()  # the probe answers and TX-V2 starts
+            await wait_until(lambda: _blocked_on_a_lock(admin, seeded.db.dbname, stop_pid))
+            stop.execute("SET LOCAL lock_timeout = '5s'")
+            stop.execute(
+                "SELECT run_id FROM tether.audit_heads WHERE run_id = %s FOR UPDATE", (run_id,)
+            )
+            stop.commit()
+
+        await probing  # TX-V2 then completes: no deadlock, nothing rolled back
+        [(resolution,)] = env.sql(
+            "SELECT resolution FROM tether.ledger_entries WHERE run_id = %s", run_id
+        )
+        assert resolution == "verified_applied"
+        assert env.events(run_id).count("VERIFIED") == 1
+        await env.drain(worker)
+        assert env.status(run_id) == "succeeded"
+        await env.assert_reconstructable(run_id)
+    finally:
+        gate.set()
+        await worker.close()

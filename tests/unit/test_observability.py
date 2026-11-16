@@ -237,6 +237,16 @@ def test_metric_helpers_record_with_bounded_labels(metric_values: Delta) -> None
     assert changed[_key("tether.tool.duration", tool="get_service_health", outcome="completed")]
 
 
+def test_w5_1_verification_metrics_carry_only_the_tool_and_a_bounded_result(
+    metric_values: Delta,
+) -> None:
+    for result in ("confirmed_applied", "inconclusive", "late", "exhausted"):
+        metrics.verification("restart_service", result)
+    changed = metric_values()
+    for result in ("confirmed_applied", "inconclusive", "late", "exhausted"):
+        assert changed[_key("tether.verifications", tool="restart_service", result=result)] == 1
+
+
 def test_the_queue_depth_gauge_reports_the_latest_snapshot(metric_values: Delta) -> None:
     metrics.set_queue_depth({("advance_run", "due"): 3, ("execute_tool", "leased"): 1})
     metrics.set_queue_depth({("advance_run", "due"): 2})
