@@ -8,7 +8,9 @@ not evidence either way -> the error propagates and Tether classifies the outcom
 Idempotency: ``apply_label`` and ``close_issue`` are naturally idempotent on GitHub. GitHub has no
 idempotency key, so ``create_change_issue`` is declared ``unsupported``: Tether sends it at most
 once, and an unknown outcome becomes ``indeterminate`` for a human to reconcile. The hidden marker
-carrying the idempotency key makes that decidable by a safe read (the ``verify`` probe).
+carrying the idempotency key makes that decidable by a safe read (the ``verify`` probe). The
+listing that read uses lags a write by seconds, so the probe never concludes "not applied" from
+one listing (see ``LISTING_SETTLE_SECONDS``).
 
 Issue titles, bodies and labels in a sandbox are not sensitive, so no field is ``Sensitive``.
 Model-supplied text is only ever sent as JSON, never interpolated into a URL or header.
@@ -16,6 +18,7 @@ Model-supplied text is only ever sent as JSON, never interpolated into a URL or 
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Literal
 
@@ -38,6 +41,10 @@ CHANGE_LABEL = "change-control"
 Label = Literal["change-control", "needs-review", "approved", "blocked"]
 # Pages (of 100) a verification probe may read before it reports ``inconclusive``.
 MAX_PAGES = 10
+# GitHub's issue listing is eventually consistent: on the sandbox a created issue took 1.7 to
+# 8.0 s after its ``201`` to appear (measured 2026-11-17; GitHub documents no bound). A listing
+# without the marker therefore proves nothing unless a second one, this much later, agrees.
+LISTING_SETTLE_SECONDS = 15.0
 _MARKER_PREFIX = "<!-- tether:idempotency-key="
 _MARKER = re.compile(r"<!-- tether:idempotency-key=([A-Za-z0-9_-]+) -->")
 _NOT_APPLIED = (404, 410, 422)
@@ -192,8 +199,19 @@ async def _close_issue(args: IssueRef, ctx: ToolContext) -> IssueView:
     return _view(response.json())
 
 
+async def _settle(seconds: float) -> None:
+    """The pause between the two listings of a not-applied verdict (replaced in tests)."""
+    await asyncio.sleep(seconds)
+
+
 async def _verify_create(args: CreateIn, ctx: VerifyContext) -> VerificationResult:
-    """Safe reads only: list issues (not search, which is eventually consistent) for the marker."""
+    """Safe reads only: list issues for the marker.
+
+    The marker in a listing is proof the write applied. Its absence is proof of nothing until the
+    listing has had time to catch up (``LISTING_SETTLE_SECONDS``), so ``confirmed_not_applied``
+    needs two complete listings without the marker, one either side of that pause. If the pause
+    does not fit in the tool's timeout, the probe is cut off and counts as inconclusive.
+    """
     try:
         target = open_target()
     except ConfigurationError as error:
@@ -202,41 +220,55 @@ async def _verify_create(args: CreateIn, ctx: VerifyContext) -> VerificationResu
     scanned = 0
     try:
         async with target.client as http:
-            for page in range(1, MAX_PAGES + 1):
-                response = await http.get(
-                    f"/repos/{target.repo}/issues",
-                    params={
-                        "state": "all",
-                        "labels": CHANGE_LABEL,
-                        "per_page": 100,
-                        "page": page,
-                    },
-                )
-                if response.status_code != 200:
+            for listing in (1, 2):
+                complete = False
+                for page in range(1, MAX_PAGES + 1):
+                    response = await http.get(
+                        f"/repos/{target.repo}/issues",
+                        params={
+                            "state": "all",
+                            "labels": CHANGE_LABEL,
+                            "per_page": 100,
+                            "page": page,
+                        },
+                    )
+                    if response.status_code != 200:
+                        return VerificationResult(
+                            "inconclusive",
+                            VerifyEvidence(
+                                pages_scanned=scanned, reason=f"status {response.status_code}"
+                            ),
+                        )
+                    scanned += 1
+                    for item in response.json():
+                        if "pull_request" not in item and wanted in (item.get("body") or ""):
+                            return VerificationResult(
+                                "confirmed_applied",
+                                VerifyEvidence(
+                                    issue_number=int(item["number"]), pages_scanned=scanned
+                                ),
+                            )
+                    if 'rel="next"' not in response.headers.get("link", ""):
+                        complete = True
+                        break
+                if not complete:
                     return VerificationResult(
                         "inconclusive",
-                        VerifyEvidence(
-                            pages_scanned=scanned, reason=f"status {response.status_code}"
-                        ),
+                        VerifyEvidence(pages_scanned=scanned, reason="listing not complete"),
                     )
-                scanned += 1
-                for item in response.json():
-                    if "pull_request" not in item and wanted in (item.get("body") or ""):
-                        return VerificationResult(
-                            "confirmed_applied",
-                            VerifyEvidence(issue_number=int(item["number"]), pages_scanned=scanned),
-                        )
-                if 'rel="next"' not in response.headers.get("link", ""):
-                    return VerificationResult(
-                        "confirmed_not_applied", VerifyEvidence(pages_scanned=scanned)
-                    )
+                if listing == 1:
+                    await _settle(LISTING_SETTLE_SECONDS)
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
         return VerificationResult(
             "inconclusive",
             VerifyEvidence(pages_scanned=scanned, reason=type(error).__name__),
         )
     return VerificationResult(
-        "inconclusive", VerifyEvidence(pages_scanned=scanned, reason="listing not complete")
+        "confirmed_not_applied",
+        VerifyEvidence(
+            pages_scanned=scanned,
+            reason=f"absent from two complete listings {LISTING_SETTLE_SECONDS:g} s apart",
+        ),
     )
 
 

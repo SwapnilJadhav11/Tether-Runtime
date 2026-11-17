@@ -28,6 +28,11 @@ def github(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeGitHub]:
     monkeypatch.setenv("CHANGE_CONTROL_GITHUB_REPO", REPO)
     monkeypatch.setenv("CHANGE_CONTROL_GITHUB_TOKEN", FAKE_CREDENTIAL)
     monkeypatch.delenv("CHANGE_CONTROL_GITHUB_API_URL", raising=False)
+
+    async def no_wait(seconds: float) -> None:  # the fake's listing is consistent
+        return None
+
+    monkeypatch.setattr(tools, "_settle", no_wait)
     client.set_transport(fake.transport())
     yield fake
     client.set_transport(None)
@@ -306,6 +311,57 @@ async def test_t31_verify_confirms_not_applied_only_from_a_complete_listing(
     result = await run_probe()
     assert result.kind == "confirmed_not_applied"
     assert github.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_t31_verify_does_not_trust_a_listing_that_has_not_caught_up_with_the_write(
+    github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GitHub's issue listing lags a create by seconds (measured on the sandbox, 2026-11-17).
+    An issue missing from the first complete listing is not yet evidence of anything."""
+    waited: list[float] = []
+
+    async def listing_catches_up(seconds: float) -> None:
+        waited.append(seconds)
+        github.add_issue(
+            "Target", body=tools.marker_for("tth_key_one"), labels=(tools.CHANGE_LABEL,)
+        )
+
+    monkeypatch.setattr(tools, "_settle", listing_catches_up)
+    result = await run_probe()
+    assert result.kind == "confirmed_applied"
+    assert waited == [tools.LISTING_SETTLE_SECONDS]
+    assert tools.LISTING_SETTLE_SECONDS >= 15.0  # the measured lag was up to 8 s
+    assert all(s.method == "GET" for s in github.seen)
+
+
+@pytest.mark.asyncio
+async def test_t31_verify_confirms_not_applied_only_after_a_second_listing_past_the_settle_time(
+    github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waited: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waited.append(seconds)
+
+    monkeypatch.setattr(tools, "_settle", record)
+    result = await run_probe()
+    assert result.kind == "confirmed_not_applied"
+    assert waited == [tools.LISTING_SETTLE_SECONDS]  # exactly one pause
+    assert len(github.seen) == 2  # two complete listings, one either side of the pause
+    assert result.evidence.pages_scanned == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_t31_verify_is_inconclusive_when_the_second_listing_fails(
+    github: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def then_github_fails(seconds: float) -> None:
+        github.script[:] = [("GET", "issues", "500")]
+
+    monkeypatch.setattr(tools, "_settle", then_github_fails)
+    result = await run_probe()
+    assert result.kind == "inconclusive"
 
 
 @pytest.mark.asyncio

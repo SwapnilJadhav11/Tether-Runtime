@@ -75,6 +75,11 @@ def github(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeGitHub]:
     # Retries and verification probes are immediate.
     monkeypatch.setattr(backoff, "tool_backoff_seconds", lambda attempt, rng=None: 0.0)
     monkeypatch.setattr(backoff, "verify_backoff_seconds", lambda declared, attempt, rng=None: 0.0)
+
+    async def no_wait(seconds: float) -> None:  # the fake's listing is consistent
+        return None
+
+    monkeypatch.setattr(change_control.tools, "_settle", no_wait)
     github_client.set_transport(fake.transport())
     yield fake
     github_client.set_transport(None)

@@ -15,8 +15,9 @@ title starts with ``[tether-live-test`` (no deletion is possible or attempted).
 from __future__ import annotations
 
 import os
+import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,18 @@ def _issues_with_marker(key: str) -> list[dict[str, Any]]:
     return found
 
 
+def _listing_shows(
+    key: str, ready: Callable[[list[dict[str, Any]]], bool], timeout: float = 60.0
+) -> list[dict[str, Any]]:
+    """Poll the (eventually consistent) listing until ``ready``; return the last listing read."""
+    deadline = time.monotonic() + timeout
+    found = _issues_with_marker(key)
+    while not ready(found) and time.monotonic() < deadline:
+        time.sleep(1.0)
+        found = _issues_with_marker(key)
+    return found
+
+
 @pytest.mark.asyncio
 async def test_t30_a_governed_approved_run_creates_one_real_issue_then_labels_and_closes_it(
     live_runtime: WorkerRuntime, seeded: Any, tmp_path: Path, tag: str
@@ -161,6 +174,10 @@ async def test_t30_a_governed_approved_run_creates_one_real_issue_then_labels_an
     [(key,)] = rows(
         seeded, "SELECT idempotency_key FROM tether.ledger_entries WHERE id = %s", entry[0]
     )
+    # GitHub's listing lags a write by seconds: wait for the issue to appear, then let the listing
+    # settle before counting, so a duplicate would have had time to show as well.
+    _listing_shows(key, lambda found: len(found) >= 1)
+    time.sleep(tools.LISTING_SETTLE_SECONDS)
     [issue] = _issues_with_marker(key)  # exactly one issue carries this run's marker
     assert issue["title"] == title
 
@@ -190,6 +207,13 @@ async def test_t30_a_governed_approved_run_creates_one_real_issue_then_labels_an
     await decide(seeded, tmp_path, close_approval, "approve", APPROVER)
     await drain(live_runtime)
     assert run_status(seeded, close_run) == ("succeeded", "closed.")
-    [after] = _issues_with_marker(key)
+    [after] = _listing_shows(
+        key,
+        lambda found: (
+            len(found) == 1
+            and found[0]["state"] == "closed"
+            and "approved" in [label["name"] for label in found[0]["labels"]]
+        ),
+    )
     assert after["state"] == "closed"
     assert "approved" in [label["name"] for label in after["labels"]]
