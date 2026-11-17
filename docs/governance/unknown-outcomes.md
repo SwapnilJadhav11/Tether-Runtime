@@ -223,7 +223,8 @@ the reconciler's subject or `system:verification`.
 ## While a run waits
 
 The run stays in `awaiting_reconciliation` while any ledger entry is `pending`, `dispatched` or
-`indeterminate`, and it holds no compute: a wake re-checks the entries and pauses again. Run
+`indeterminate`, and it holds no compute: a wake re-checks the entries and pauses again
+([Run lifecycle](../architecture/run-lifecycle.md#the-reconciliation-hold) explains the hold). Run
 inspection shows each `indeterminate` entry with `verification: in_progress` while a probe job is
 pending, and its `verification_attempts`. Once every entry is resolved, the run resumes, or ends if a
 stop is active. With no eligible reconciler, the run waits indefinitely; it does not time out into a
