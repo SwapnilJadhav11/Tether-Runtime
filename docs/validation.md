@@ -6,7 +6,7 @@ tests that prove it is the [evidence map](testing/strategy.md); how to run the s
 [Testing](development/testing.md).
 
 There are two kinds of evidence. Automated suites prove the guarantees under controlled faults; CI
-runs all of them except the load harness and the built production-image test on every push. A
+runs all of them except the load harness on every push. A
 one-off live validation ran the system against a real model provider and a real external API, with
 crashes and load, once, on one development host.
 
@@ -14,7 +14,7 @@ crashes and load, once, on one development host.
 
 On the validated commit, a local run of every suite on one Windows development host passed 1,498
 tests with none failed, 2 skipped and 4 deselected (the live tests). CI then passed on the same
-code. The built production-image test has passed only locally.
+code, including the built production-image test.
 
 | Suite | Tests | What it proves | Task |
 |---|---|---|---|
@@ -49,8 +49,7 @@ The workflow is `.github/workflows/ci.yml`. Each database-backed job starts a fr
 | `integration` | Linux | integration tests, the authorization matrix, LangGraph contract tests |
 | `chaos` | Linux | the chaos and race suite, once |
 
-CI does not run the load harness, the repeated chaos run or any live test, and the built
-production-image test has not yet run there.
+CI does not run the load harness, the repeated chaos run or any live test.
 
 ## The chaos harness
 
@@ -124,7 +123,7 @@ being sent.
 | Target behaviour | What Tether did |
 |---|---|
 | Frozen during the send, then back | The entry became `indeterminate`; the read-back resolved it `verified_applied` |
-| Stopped before the write reached it, then started again | The read-back resolved it `verified_not_applied`. The demo target keeps its record of applied restarts in memory, so this verdict is sound only because the target was stopped before it could apply anything |
+| Stopped during the send, then started again | The read-back resolved it `verified_not_applied`. The demo target keeps its record of applied restarts in memory and loses it on a restart, so this verdict rests on the absence of a record: it is correct only if the target had applied nothing before it stopped, which the validation record does not establish independently |
 | Frozen throughout | Verification was exhausted; the run held in `awaiting_reconciliation` until a reconciler decided |
 
 ### Audit verification

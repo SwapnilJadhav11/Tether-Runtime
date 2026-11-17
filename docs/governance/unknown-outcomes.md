@@ -181,7 +181,7 @@ following must hold, and any failure returns `404`:
 3. Policy eligibility under the active policy version: a role listed in `reconciliation.reconciler_roles`.
 4. The reconciler is not the run's requester.
 
-A stale policy in the API process returns `503`, checked before eligibility. The route is `POST /v1/ops/ledger/{ledger_id}/reconcile`;
+A stale policy in the API process returns `503`; it is checked after the role and workspace conditions and before the policy eligibility and requester conditions. The route is `POST /v1/ops/ledger/{ledger_id}/reconcile`;
 see the [API reference](../reference/api.md).
 
 ### The three outcomes
@@ -247,9 +247,10 @@ target keeps it in memory, so after a target restart `applied: false` is absence
 proof. A production target must persist the record, or the probe must answer `inconclusive`.
 
 In the live validation, a target frozen during the send left the entry `indeterminate`; with the
-target back, the read-back resolved it `verified_applied`. A target stopped before the write reached
-it, then started again, gave `verified_not_applied`, sound only because nothing had been applied
-before the restart. With the target frozen throughout, verification was exhausted, the run held in
+target back, the read-back resolved it `verified_applied`. A target stopped during the send,
+then started again, gave `verified_not_applied`. Because the target's record is in memory, that
+verdict is correct only if nothing had been applied before the stop; the validation record does not
+establish that independently. With the target frozen throughout, verification was exhausted, the run held in
 `awaiting_reconciliation`, and a reconciler decided. Version 1.0.0, which declares no read-back,
 stays registered for calls already pinned to it; its unknown outcomes go straight to a person.
 

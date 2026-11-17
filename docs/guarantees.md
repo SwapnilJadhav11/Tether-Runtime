@@ -86,9 +86,9 @@ See [Side effects and the execution ledger](governance/side-effects-and-ledger.m
 
 **Unknown outcomes are never reported as failure**
 ([G-4](product/tether-v1-guarantees.md#g-4-unknown-outcomes-are-never-reported-as-failure-at-the-baseline-only-a-human-resolves-them)).
-For a write whose tool declares no read-back, the result is `not_applied` only when the tool raises
-`ToolNotApplied`; every other result after dispatch is `unknown`, and the ledger entry becomes
-`indeterminate`. Where a read-back is declared, a `verified_not_applied` result is the read-back's
+After dispatch, a write's result is `not_applied` only when the tool raises `ToolNotApplied`; any
+other result that is not a success is `unknown`, and the ledger entry becomes `indeterminate`. (A
+call refused before anything was sent is also `not_applied`.) Where a read-back is declared, a `verified_not_applied` result is the read-back's
 verdict, which may rest on absence (see the next section) and is not covered by this guarantee.
 The model is never told an unknown write failed. An eligible reconciler (the `reconciler` role, eligible under policy, and not the run's
 requester) resolves the entry with a justification, recorded as an audit event before the run
@@ -269,7 +269,8 @@ the evidence for each.
 | Repair and denial bound | The run ends `failed` (or `cancelled`/`timed_out` if a stop is active), after any unresolved entry resolves, once invalid proposals or denials exceed their budget | |
 | Per-tool approval expiry | Each tool's rule may set its own expiry, bounded by a deployment maximum; a value above the maximum is refused | The default (3600 s) and maximum (86400 s) are proposed values, not yet confirmed |
 | Approval list, detail and approver run view; full authorization matrix | Every route, audience, role and workspace combination behaves as specified, in both directions between two workspaces | Not covered: an approval-detail access event, and the run view for an approver who later lost eligibility |
-| Fail-closed production configuration | Processes refuse to start without an explicit valid `TETHER_ENV`; development components are unavailable in `prod` | The development identity module still ships in the production image, inert; the built-image test has passed locally only |
+| Second, unrelated workload | Repository change control runs on the same core with no core change | Proven over a mocked GitHub transport only |
+| Fail-closed production configuration | Processes refuse to start without an explicit valid `TETHER_ENV`; development components are unavailable in `prod` | The development identity module still ships in the production image, inert |
 
 ### Implemented, proven in CI over mocked transports only, run live once
 
@@ -278,7 +279,7 @@ These are not candidates for a guarantee yet.
 | Behaviour | What the tests show | Known limits |
 |---|---|---|
 | Provider retry and the OpenAI adapter | Bounded, stop-gated provider retry; the same run executes on the scripted provider and on OpenAI by configuration | CI covers the adapter over a mocked transport only; one live run |
-| Second, unrelated workload | Repository change control runs on the same core with no core change | CI covers the GitHub client over a mocked transport only; one live run |
+| Governed write against a real external API (a GitHub sandbox) | Approval, at-most-once send, outcome classification, read-back and audit behave as on the demo target | CI covers the GitHub client over a mocked transport only; one live run |
 
 ## What Tether does not guarantee
 
