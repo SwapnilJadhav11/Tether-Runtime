@@ -47,6 +47,10 @@ a ledger entry is unresolved, otherwise to `failed`
 file no longer configures the run's workspace or agent moves it to `awaiting_reconciliation` or a
 terminal status without invoking the graph ([below](#configuration-unavailable)).
 
+A run moved to `awaiting_reconciliation` by a dead-letter is not failed. When its hold clears it
+resumes normally. If whatever made the job fail persists, the job dead-letters again and, with
+nothing unresolved, the run ends `failed` with `system_error`.
+
 ### Who writes the status
 
 Only the run driver writes `runs.status` ([ADR-0006](../adr/0006-run-lifecycle-single-status-writer.md)).
@@ -54,19 +58,21 @@ The single exception is the `queued` insert at submission. Everything else (a ca
 passed deadline, an approval decision, a reconciliation) writes a *request* or a row of its own and
 enqueues an `advance_run` wake job; the driver reads the new state and changes the status.
 
-Every status change is a conditional update on the expected current status and on the driver's
-fencing token, so a stale driver cannot write ([Execution and
-recovery](execution-and-recovery.md#run-driver-lock-and-fencing-token)). A database trigger
-refuses any change to the status of a run that is already `succeeded`, `failed`, `cancelled`,
-`timed_out` or `abandoned`, whatever code attempts it.
+Each driver invocation starts with a **claim**: under the run's advisory lock, one update
+increments `driver_generation` (the fencing token) and sets the status to `running`, from any
+non-terminal status. The claim is skipped while a run held in `awaiting_reconciliation` still has
+unresolved ledger entries ([below](#the-reconciliation-hold)). Every later status change is
+conditional on the expected status and on that token, so a stale driver cannot write ([Execution
+and recovery](execution-and-recovery.md#run-driver-lock-and-fencing-token)). Terminal statuses
+cannot change at all; a database trigger enforces this ([Data model](data-model.md#constraints-that-carry-meaning)).
 
 Two consequences follow. A cancelled or timed-out run shows its new status only after the driver
 next runs; until then, clients read `cancel_requested_at` or `deadline_exceeded_at` alongside the
 status. And a wake that finds nothing new still claims the run, so a run waiting for an approval
 can show `running` for a moment before it returns to `awaiting_approval`.
 
-Waiting statuses (`running` and `awaiting_*`) are not audited. Every terminal status is recorded
-with a `RUN_FINISHED` audit event in the same transaction.
+Non-terminal statuses (`running` and `awaiting_*`), and the claim, are not audited. Every terminal
+status is recorded with a `RUN_FINISHED` audit event in the same transaction.
 
 ## The run graph
 
@@ -78,7 +84,7 @@ graph has already finished, the delivery does nothing.
 
 ```mermaid
 flowchart TD
-    S([start or wake]) --> CM[call_model]
+    S([start]) --> CM[call_model]
     CM -->|tool calls| NC[next_call]
     CM -->|final answer, stop or bound| F[finalize]
     NC -->|next call of the turn| G[govern_call]
@@ -87,20 +93,31 @@ flowchart TD
     G -->|require_approval| RA[request_approval]
     G -->|deny or invalid| AR[append_result]
     RA --> AA[await_approval]
+    RA -->|tool version unavailable| AR
     AA -->|approved| AU
     AA -->|rejected, expired or closed| AR
     AU --> AT[await_tool]
     AU -->|refused at re-check| AR
     AT -->|outcome| AR
+    AT -->|abandoned| F
+    AT -->|fail_run read| DT[drain_terminating]
+    AR -->|budget exhausted| DT
     AR --> NC
+    DT --> F
 ```
+
+The diagram omits two families of edges. On a stop, `govern_call`, `request_approval`,
+`authorize_call` and `append_result` route straight to `finalize`. On a replay divergence, any node
+that adopts a persisted row routes to `record_divergence`, then `drain_divergence`, then
+`finalize`. A wake does not re-enter at the top: it resumes the interrupted wait node.
 
 Nodes are either **write nodes**, which create authoritative rows and never interrupt, or **wait
 nodes**, which only read authoritative rows and interrupt while the awaited condition does not
-hold ([ADR-0003](../adr/0003-authoritative-tables-checkpoint-progress-cache.md)). Every write
-node share-locks the run row and checks the fencing token in the same transaction as its writes,
-and writes its audit event in that transaction too. A node that creates a decision, an approval or
-a ledger entry first checks the stop predicate.
+hold ([ADR-0003](../adr/0003-authoritative-tables-checkpoint-progress-cache.md)). Every node that
+writes share-locks the run row and checks the fencing token in the same transaction as its
+writes, and writes its audit event in that transaction too. A node that creates a decision, an
+approval or a ledger entry first checks the stop predicate. The two drain nodes only share-lock the
+run row to read the stop predicate; they write nothing.
 
 | Node | Kind | What it does |
 |---|---|---|
@@ -169,19 +186,22 @@ These values are development defaults, not tuned operating limits
 ([Configuration](../operations/configuration.md)).
 
 Each model attempt gets its own `model_calls` row with the provider, model, attempt number, status,
-token usage as the provider reported it, and a normalised error code. No fallback to a second
+token usage as the provider reported it, and a normalised error code. Two kinds of attempt are not
+recorded: one interrupted by a crash before the provider answered, and one made by a driver that
+has since been fenced (its row rolls back with the failed token check). No fallback to a second
 provider exists.
 
 ### Terminating results
 
-An exhausted budget, a read tool declared with `on_exhausted="fail_run"` whose outcome stayed
-unknown, an abandon by a reconciler, a replay divergence and an active stop are **terminating**:
-the remaining calls of the turn are neither governed nor marked skipped, and no further model call
-happens. An abandon ends the run `abandoned` and a stop ends it as described under
-[Stops](#stops). For an exhausted budget, a `fail_run` read and a replay divergence, the run is
-first held in `awaiting_reconciliation` while any of its ledger entries is unresolved. Then an
-active stop decides the status (`cancelled` or `timed_out`, with the reason appended to the
-summary); otherwise the run ends `failed` with the reason.
+An exhausted repair or denial budget, a read tool declared with `on_exhausted="fail_run"` whose
+outcome stayed unknown, an abandon by a reconciler, a replay divergence and an active stop are
+**terminating**: the remaining calls of the turn are neither governed nor marked skipped, and no
+further model call happens. An abandon ends the run `abandoned` and a stop ends it as described
+under [Stops](#stops). For an exhausted repair or denial budget, a `fail_run` read and a replay
+divergence, the run is first held in `awaiting_reconciliation` while any of its ledger entries is
+unresolved. Then an active stop decides the status (`cancelled` or `timed_out`, with the reason
+appended to the summary); otherwise the run ends `failed` with the reason. The model-turn budget
+and a provider failure end the run directly, without the hold.
 
 ## Stops
 
@@ -197,9 +217,10 @@ Stops are recorded, not executed:
   `CANCEL_REQUESTED` and one `APPROVAL_CLOSED` per closed approval, and enqueues a wake. The API
   returns `202` with the recorded request.
 - **Deadline.** The `run_deadline` timer job, due at `deadline_at`, does the same with
-  `deadline_exceeded_at` and `DEADLINE_EXCEEDED`. The timer only makes the stop visible: because
-  the predicate compares the clock with the stored deadline, the deadline is enforced at every
-  gate even if no worker ran the timer.
+  `deadline_exceeded_at` and `DEADLINE_EXCEEDED`. Because the predicate compares the clock with the
+  stored deadline, the deadline is enforced at every gate even if no worker has run the timer yet.
+  But the timer is also what closes pending approvals and wakes the run: without it, a run waiting
+  on an approval ends only when that approval's own expiry timer wakes it.
 
 Both are no-ops on a terminal run or when their flag is already set. Neither writes the status.
 
@@ -210,7 +231,8 @@ later.
 **Where the predicate is checked:**
 
 - before every provider attempt, including retries;
-- as soon as a model response returns: its proposals are recorded for cost and never governed;
+- as soon as a model response returns: its token usage is recorded, and its proposals are
+  discarded without being governed;
 - at the start of each write node, before an approval or ledger entry exists (`govern_call`,
   `request_approval`, `authorize_call`), and before skip events are written;
 - before the first send of a tool call and before every re-send
@@ -270,8 +292,10 @@ about which call this ordinal is. Tether fails closed:
 1. It writes one `REPLAY_DIVERGENCE` audit event with the two hashes and the path where the
    mismatch was found. It writes nothing else: no decision, approval or ledger row is created,
    changed or removed.
-2. From then on, the recorded event blocks every further model call, authorization and send for
-   the run. A `pending` entry is refused before dispatch; a dispatched one is never re-sent.
+2. From then on, the recorded event blocks every further model call, every send and every
+   verification probe for the run. A `pending` entry is refused before dispatch; a dispatched one
+   is never re-sent. No further authorization happens because the diverged run is routed to
+   `drain_divergence` and `finalize`, not through `authorize_call`.
 3. The run is held while any ledger entry is unresolved.
 4. It then ends. An active stop still decides the status (`cancelled` or `timed_out` with
    `replay_divergence` in the summary); otherwise it ends `failed` with summary `replay_divergence`.
@@ -296,7 +320,7 @@ run ends `failed` with summary `configuration_unavailable`, followed by any reco
 | Status | `outcome_summary` |
 |---|---|
 | `succeeded` | The model's final text. |
-| `failed` | `model turn budget exhausted`; `model call failed: ...`; `repair_budget_exhausted`; `denial_budget_exhausted`; `tool_exhausted:<tool>`; `replay_divergence`; `configuration_unavailable`; `system_error` (an exhausted `advance_run` job). After the budget reasons, `tool_exhausted:<tool>` and `configuration_unavailable`, every reconciled or verified outcome of the run is appended. |
+| `failed` | `model turn budget exhausted`; `model call failed: ...`; `repair_budget_exhausted`; `denial_budget_exhausted`; `tool_exhausted:<tool>`; `replay_divergence`; `configuration_unavailable`; `system_error` (an exhausted `advance_run` job). After `repair_budget_exhausted`, `denial_budget_exhausted`, `tool_exhausted:<tool>` and `configuration_unavailable`, every reconciled or verified outcome of the run is appended. `model turn budget exhausted`, `model call failed: ...`, `replay_divergence` and `system_error` are recorded as written. |
 | `cancelled` | `cancelled by <subject>`, plus any terminating reason and every reconciled or verified outcome. |
 | `timed_out` | `deadline passed`, plus the same. |
 | `abandoned` | `<tool> abandoned by reconciliation`. |
