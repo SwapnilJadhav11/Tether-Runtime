@@ -6,7 +6,8 @@ writing tools with read-backs, for operators who reconcile, and for reviewers ch
 never reports something it does not know. The step-by-step operator procedure is in
 [Runbooks](../operations/runbooks.md).
 
-**Tether never guesses.** It does not assume a write failed because the connection dropped, and it
+**Tether itself never guesses;** it relies on the tool's `ToolNotApplied` and read-back being
+truthful (see [Limits](#limits)). It does not assume a write failed because the connection dropped, and it
 does not assume it succeeded because nothing complained. Without positive evidence, the outcome
 stays unknown until a definitive read-back or a person resolves it.
 
@@ -124,22 +125,29 @@ as authority. `evaluate_verification` answers only `allow` or `deny`, and allows
 - the arguments the probe would receive hash to the entry's call hash, so a probe can only ask about
   the exact original call;
 - the active policy version is the one that authorized the write. Requester and agent never change
-  during a run, so the probe can only use permissions the original call had. **Any policy deployment
+  during a run, so under the same policy version the probe draws on the same requester and agent
+  permissions that were in force when the write was authorized. **Any policy deployment
   between the write and its probe refuses the probe** (`policy_changed`), even if the new policy would
   allow it;
 - the tool's rule is not `deny`, and a rule exists;
 - the requester's role permissions intersected with the agent's cover the read-back's own
   `required_permissions`.
 
-No second human approval is needed, because the probe is strictly smaller than the action that was
-already approved: the same people, agent, arguments and policy version, a read-only operation, and no
-more permissions. A policy refusal is not a model action and does not count toward the denial
+No second human approval is required ([ADR-0022](../adr/0022-verify-operation-policy-mapping.md)):
+the probe is authorized as a separate read-purpose action for the same requester and agent, on the
+same arguments, under the policy version that authorized the write, and needs its own declared
+permissions, which both must hold. Those permissions need not be a subset of the write's: in the
+reference workloads the read-backs need `service:read` and `issue:read`, while the writes need
+`service:restart` and `issue:create`. That the probe only reads is the tool author's contract, not
+something Tether proves. A policy refusal is not a model action and does not count toward the denial
 budget. The evaluator's reasons, such as `policy_changed` or `target_mismatch`, are recorded in the
 `VERIFICATION_EXHAUSTED` event. See [Policy](policy.md).
 
 ### Bounds
 
-- **Probes per entry:** the declaration's `max_attempts`, default 3.
+- **Probes per entry:** the declaration's `max_attempts` (default 3), and never more than the
+  `verify_outcome` job's delivery bound (5), since every probe and every redelivery after a crash
+  spends one delivery.
 - **Delay between probes:** the declaration's `backoff`, by default uniform between zero and a
   ceiling of 1 second doubling per probe, capped at 30 seconds.
 - **One probe:** bounded by the tool's `timeout_seconds`.
@@ -165,14 +173,15 @@ while verification is still in progress.
 
 ### Who may reconcile
 
-All must hold; any failure returns `404`:
+A missing, invalid or wrong-audience token is `401`. With a valid `tether-ops` token, all of the
+following must hold, and any failure returns `404`:
 
-1. A valid token for the `tether-ops` audience, in the entry's workspace.
+1. The entry is in the token's workspace.
 2. The core `reconciler` role in that token.
 3. Policy eligibility under the active policy version: a role listed in `reconciliation.reconciler_roles`.
 4. The reconciler is not the run's requester.
 
-A stale policy in the API process returns `503`. The route is `POST /v1/ops/ledger/{ledger_id}/reconcile`;
+A stale policy in the API process returns `503`, checked before eligibility. The route is `POST /v1/ops/ledger/{ledger_id}/reconcile`;
 see the [API reference](../reference/api.md).
 
 ### The three outcomes
@@ -188,22 +197,25 @@ subject.
 | `abandon` | `abandoned` | `reconciled_abandon` | The run ends `abandoned`, with no further model call |
 
 Reconciliation records the outcome, the audit event and the wake in one transaction. It never calls
-the tool. Repeating the same outcome is a no-op returning `200`. A different outcome on an entry that
-is already resolved, including one resolved by verification, is `409`, as is reconciling an entry of
-a terminal run or one that is not `indeterminate`.
+the tool. Only repeating the same human outcome is a no-op returning `200`. A different outcome on an
+entry a person already resolved is `409`. Once verification has resolved an entry, any reconcile
+request for it is `409`, whatever outcome it states. Reconciling an entry of a terminal run, or one
+that is not `indeterminate`, is also `409`.
 
-If the run was stopped, reconciliation only records the outcome and ends the run `cancelled` or
-`timed_out`, with the reconciled outcome named in its summary.
+If the run was stopped, an `applied` or `not_applied` reconciliation records the outcome and the run
+then ends `cancelled` or `timed_out`, with the reconciled outcome named in its summary. An `abandon`
+ends the run `abandoned`.
 
-### The human wins
+### Whoever commits first wins; a late probe never overrides a person
 
 A person and a probe can race. Both resolve the entry with a conditional update that succeeds only
-while the entry is still `indeterminate` and unresolved, so exactly one wins:
+while the entry is still `indeterminate` and unresolved, so exactly one wins. A probe never overrides
+a person's decision. A probe that commits first stands.
 
 - If the person commits first, a later probe answer is recorded as `VERIFICATION_LATE` evidence and
   changes nothing. Auditors can see both.
-- If the probe commits first, the person's different outcome gets `409`, and the entry shows the
-  `verified_*` resolution and its evidence.
+- If the probe commits first, the person's request gets `409` whatever outcome it states. The
+  `verified_*` resolution stands, with its evidence, and there is no API to correct it.
 
 The `resolution` value always shows which of the two settled the entry, and `resolved_by` is either
 the reconciler's subject or `system:verification`.
@@ -229,11 +241,15 @@ every applied restart under it. Version 1.1.0 declares a read-back that asks
 - `200` with `applied: false` → `confirmed_not_applied`;
 - any other status or shape → `inconclusive`.
 
-In the live validation, a target frozen during the send made three sends time out and the entry
-`indeterminate`. With the target back, the read-back resolved it `verified_applied`: one restart for
-three sends. With the target stopped, it resolved `verified_not_applied`. With the target frozen
-throughout, three probes were inconclusive, the run held in `awaiting_reconciliation`, and a
-separate reconciler resolved it with a justification. Version 1.0.0, which declares no read-back,
+`applied: false` is definitive only while the target keeps its record of applied keys. The demo
+target keeps it in memory, so after a target restart `applied: false` is absence of a record, not
+proof. A production target must persist the record, or the probe must answer `inconclusive`.
+
+In the live validation, a target frozen during the send left the entry `indeterminate`; with the
+target back, the read-back resolved it `verified_applied`. A target stopped before the write reached
+it, then started again, gave `verified_not_applied`, sound only because nothing had been applied
+before the restart. With the target frozen throughout, verification was exhausted, the run held in
+`awaiting_reconciliation`, and a reconciler decided. Version 1.0.0, which declares no read-back,
 stays registered for calls already pinned to it; its unknown outcomes go straight to a person.
 
 ### Issue creation: read-back by marker
@@ -263,7 +279,11 @@ a probe cut off by the timeout is inconclusive and the entry goes to a person.
   applied" for a write that did apply invites a duplicate on re-proposal; tool authors must return
   `inconclusive` unless absence is definitive.
 - Any policy deployment between a write and its probe sends the entry to a person.
-- The GitHub read-back runs in CI only against a mocked transport.
+- A person cannot override a `verified_*` resolution.
+- The GitHub read-back runs in CI only against a mocked transport. A repository with more than
+  1,000 labelled issues cannot be confirmed not applied, and an issue whose label or marker was
+  removed is wrongly reported not applied.
+- The demo target's read-back is definitive only while the target keeps its in-memory record.
 - A run with no eligible reconciler waits without limit.
 
 ## Related

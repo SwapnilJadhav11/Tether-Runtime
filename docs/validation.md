@@ -5,17 +5,20 @@ deciding how much to trust the [guarantees](guarantees.md). The full map from ea
 tests that prove it is the [evidence map](testing/strategy.md); how to run the suites is in
 [Testing](development/testing.md).
 
-There are two kinds of evidence. Automated suites run on every push and prove the guarantees under
-controlled faults. A one-off live validation ran the system against a real model provider and a
-real external API, with crashes and load, once, on one development host.
+There are two kinds of evidence. Automated suites prove the guarantees under controlled faults; CI
+runs all of them except the load harness and the built production-image test on every push. A
+one-off live validation ran the system against a real model provider and a real external API, with
+crashes and load, once, on one development host.
 
 ## Automated suites
 
-On the final validated commit, 1,498 tests passed and none failed.
+On the validated commit, a local run of every suite on one Windows development host passed 1,498
+tests with none failed, 2 skipped and 4 deselected (the live tests). CI then passed on the same
+code. The built production-image test has passed only locally.
 
 | Suite | Tests | What it proves | Task |
 |---|---|---|---|
-| Static checks | — | Lint, strict type checking, import contracts, and architecture tests that keep the core independent of any workload | `lint`, `typecheck`, `contracts` |
+| Static checks | 65 (architecture and import-contract tests) | Lint, strict type checking, import contracts, and architecture tests that keep the core independent of any workload | `lint`, `typecheck`, `contracts` |
 | Unit | 588 | Pure logic: canonical JSON and call hashes against known-answer vectors, idempotency keys, policy evaluation, masking, token and API-key validation, audit MACs, retry budgets, the tool contract's validation rules | `test-unit` |
 | Provider contract | 89 | The scripted provider and the OpenAI adapter behave the same at the provider boundary, over a mocked transport: no network, no database | `test-provider-contract` |
 | Integration | 535 | The governed flow against a real PostgreSQL: every transaction, its audit events and its failure branches; retries, dead-letter, cancellation and deadlines, approvals, reconciliation, verification, replay divergence, masking in every sink, both reference workloads | `test-integration` |
@@ -24,8 +27,11 @@ On the final validated commit, 1,498 tests passed and none failed.
 | Chaos and races | 129 | Crashes at every critical commit, competing workers, forced lease expiry, repeated races and real process kills (below) | `test-chaos` |
 | Load harness | 23 | In-process load and worker-kill scenarios with zero duplicate effects, stuck runs or dead jobs, and the campaign script that drives a running stack | `test-perf` |
 
-Two further tests are live-only: they call the real OpenAI API and skip without credentials.
-`test-live` runs them by hand; they never run in CI.
+Six further tests are live-only and never run in CI: four provider contract tests and one governed
+run against the real OpenAI API (`test-live`), and one test against a GitHub sandbox repository
+(run directly with `pytest -m live tests/integration/test_change_control_live.py`). Without
+credentials they are skipped or deselected; in the 1,498-test run, 2 were skipped and 4
+deselected.
 
 Integration scenarios check the run's audit chain through run inspection when they finish, and
 every chaos scenario checks it again (below). A checker that cannot fail proves nothing, so the
@@ -43,7 +49,8 @@ The workflow is `.github/workflows/ci.yml`. Each database-backed job starts a fr
 | `integration` | Linux | integration tests, the authorization matrix, LangGraph contract tests |
 | `chaos` | Linux | the chaos and race suite, once |
 
-CI does not run the load harness, the repeated chaos run or any live test.
+CI does not run the load harness, the repeated chaos run or any live test, and the built
+production-image test has not yet run there.
 
 ## The chaos harness
 
@@ -69,29 +76,22 @@ hard-kills them mid-run and restarts them, three cycles of three runs. The harne
 ## Live validation
 
 The following was run once, on one development host, in November 2026. None of it runs in CI, and
-none of it is an operating limit.
+none of it is an operating limit. The logs are kept outside the repository; the
+[evidence map](testing/strategy.md) holds the validation record.
 
 ### Real model provider
 
 The live provider tests passed against the real OpenAI API with model `gpt-4o-mini`: four
-provider contract tests and one governed run. Then, on the full Compose stack with three worker
-processes and real JWT and API-key credentials, the incident workflow ran end to end:
-
-| Check | Result |
-|---|---|
-| Model behaviour | Proposed a read, then a restart |
-| Approval gate | The restart waited for approval; the target was untouched until then |
-| Approver discovery | The approver found the request through the approval list endpoint |
-| Separation of duties | The requester's own token was refused on the approval route |
-| Binding | The approved call hash equalled the ledger entry's call hash |
-| Effect | One restart applied |
-| Audit | The chain verified |
+provider contract tests and one governed run. Then the incident workflow ran on the full Compose
+stack with real JWT and API-key credentials: a read, then an approval-gated restart applied once,
+with the approval's call hash equal to the ledger entry's, and a valid audit chain.
 
 ### Real external write
 
-A credentialed test against a private GitHub sandbox repository passed. On the full stack, a run
-with the real model created exactly one issue, after its approval. The ledger recorded the same
-issue number GitHub assigned, and the audit chain verified.
+A credentialed test against a private GitHub sandbox repository failed on its first run (the second
+defect below) and passed after the repair. The run used a personal login, not a least-privilege
+token scoped to the sandbox, as a one-time exception. On the full stack, a run with the real model
+then created one issue, after its approval, matching the ledger.
 
 ### Crashes around live calls
 
@@ -99,21 +99,22 @@ Every worker process was hard-killed and then restarted at each point.
 
 | Where the crash happened | Cases | Result |
 |---|---|---|
-| Around model calls: before the first call; between the first call and its read; during the final call | 3 | Every run finished, with one approval and one applied write each |
-| Around the external write: before dispatch; twice while the write was in flight | 3 | One issue each. The non-idempotent create was never sent twice. The two interrupted writes were resolved by the tool's read-back as applied, with the issue number as evidence |
+| Around model calls: before the first call; between the first call and its read; during the final call | 3 | Every run finished, with one approval and one restart each; chains valid |
+| Around the external write: before dispatch; twice while the write was in flight | 3 | One issue each. The non-idempotent create was never sent twice. The two interrupted writes were resolved by the tool's read-back as `verified_applied` |
 
 ### Load on the Compose stack
 
 Three worker processes. Runs were submitted all at once and timed until the whole batch had
 drained, so the times are batch drain times, not per-run latency.
 
-| Batch | Result | Time | Effects on the target |
-|---|---|---|---|
-| 300 scripted runs | All succeeded | 37 s (8.1 runs/s) | Exactly 300 |
-| 300 scripted runs, every worker killed and restarted nine times | All succeeded; one approval and two ledger entries per run | — | Exactly 300 |
-| 30 runs on the real model | All succeeded; no retries | 33 s (0.9 runs/s) | 30 |
+| Batch | Result | Time |
+|---|---|---|
+| 300 scripted runs | 300 of 300 succeeded | 37 s (8.1 runs/s) |
+| 300 scripted runs, with nine kill-all-workers events | 300 of 300 succeeded | — |
+| 30 runs on the real model | 30 of 30 succeeded | 33 s (0.9 runs/s) |
 
-No run was stuck, no job was dead-lettered, and no effect was duplicated.
+In every batch the effects on the target equalled the approved writes, no run was stuck and no job
+was dead-lettered.
 
 ### Unknown outcomes on the live stack
 
@@ -122,14 +123,14 @@ being sent.
 
 | Target behaviour | What Tether did |
 |---|---|
-| Frozen during the send, then back | Three sends timed out and the entry became `indeterminate`; the read-back resolved it `verified_applied`: one restart for three sends |
-| Stopped | The read-back resolved it `verified_not_applied` |
-| Frozen throughout | Verification stopped after three inconclusive probes; the run held in `awaiting_reconciliation`; a separate reconciler identity resolved it with a justification |
+| Frozen during the send, then back | The entry became `indeterminate`; the read-back resolved it `verified_applied` |
+| Stopped before the write reached it, then started again | The read-back resolved it `verified_not_applied`. The demo target keeps its record of applied restarts in memory, so this verdict is sound only because the target was stopped before it could apply anything |
+| Frozen throughout | Verification was exhausted; the run held in `awaiting_reconciliation` until a reconciler decided |
 
 ### Audit verification
 
-`tether audit verify` reported `VALID` for every run of the validation, 1,120 runs, across both
-MAC versions.
+`tether audit verify` reported `VALID` for every run in the validation database: the runs above and
+older runs already in it, across both MAC versions.
 
 ## Defects the validation found
 
