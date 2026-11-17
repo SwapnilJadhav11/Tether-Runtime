@@ -24,13 +24,13 @@ This page documents every route of the Tether API: who may call it, what it acce
 | Code | Meaning |
 |---|---|
 | `200`, `201`, `202` | Success. `201` for a created run, `202` for an accepted cancel request. |
-| `401` | Credentials are missing or invalid: no token, a malformed or expired token, a wrong audience, an unknown issuer or key, a missing or mismatched API key. Raised before the handler runs, so nothing is evaluated or written. The body is `{"detail": "invalid or missing credentials"}`, with `WWW-Authenticate: Bearer`. |
+| `401` | Credentials are missing or invalid: no token, a malformed or expired token, a wrong audience, an unknown issuer or key, a missing or mismatched API key. Credential failures are `401`, raised before the handler runs. A malformed `dev_identity`, `agent_id` or `dev_workspace_id` value can yield `422` first. Either way nothing is evaluated or written. The body is `{"detail": "invalid or missing credentials"}`, with `WWW-Authenticate: Bearer`. |
 | `404` | The resource does not exist, belongs to another workspace, or the caller is not allowed to act on it (wrong role, not the requester, ineligible approver). Indistinguishable by design. |
 | `409` | The resource is no longer in a state that allows the action. |
 | `422` | The request is malformed: a missing or invalid field, or an ambiguous agent. |
 | `503` | The active policy version does not match the one this API process loaded (`policy is reloading`). Nothing was changed; retry after the configuration is applied everywhere. |
 
-**Errors** are JSON: `{"detail": "..."}`. Validation errors (`422`) carry FastAPI's list of `{loc, msg, type}` entries.
+**Errors** are JSON: `{"detail": "..."}`. Validation errors (`422`) carry FastAPI's default list of `{type, loc, msg, input, ...}` entries. They can echo the submitted values back to the caller, so do not log a `422` body from a request that carried secrets.
 
 **Development identity shortcut.** When `TETHER_ENV` is `dev` or `test`, a request that carries **no** `Authorization` header may state its own identity in the body (or, for reads, in a query parameter). This exists so a first run needs no credentials. It is refused in `prod` (`401`), and it never applies to the read routes under `/v1/approvals/approvals` and `/v1/approvals/runs`, or to `GET /v1/ops/runs/{run_id}`. Each route below says which body object it takes. Do not use it in an application.
 
@@ -48,7 +48,7 @@ Submit a run. The run row, its first audit event and its first job are written i
 | Body | `task_input` (object, required): the task. If it has a string `message`, the model sees that text; otherwise the whole object as JSON. `agent_id` (string, optional): which agent to run. |
 | Development shortcut | `dev_identity`: `{"workspace_id", "agent_id", "requester": {"sub", "roles"}}`. |
 
-The workspace and the agent come from the credentials, never from `task_input`. With a key bound to exactly one agent, omit `agent_id`. If the key is bound to several agents, `agent_id` is required (`422` without it), and it must be one of them (`401` otherwise).
+The workspace and the agent come from the credentials, never from `task_input`. With a key bound to exactly one agent, omit `agent_id`. If the key is bound to any other number of agents and no `agent_id` is given, the response is `422`. A named `agent_id` must be one the key is bound to (`401` otherwise).
 
 Response `201`:
 
@@ -67,12 +67,12 @@ Example:
 
 ```bash
 curl -s -X POST http://localhost:8080/v1/tasks/runs \
-  -H "Authorization: Bearer $REQUESTER_TOKEN" -H "X-API-Key: $TETHER_API_KEY" \
+  -H "Authorization: Bearer $REQUESTER_TOKEN" -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"task_input": {"message": "checkout is down"}}'
 ```
 
-A run starts with a deadline (`TETHER_RUN_MAX_DURATION_SECONDS`, default 3600). Submitting the same task twice creates two runs; the API has no client-supplied deduplication key.
+A run starts with a deadline (`TETHER_RUN_MAX_DURATION_SECONDS`, default 3600). Submission is not idempotent: the API has no client-supplied idempotency key, so a client that retries after a lost response creates a second run. Record the `run_id` as soon as you have it, and check for an existing run before resubmitting.
 
 ### `GET /v1/tasks/runs/{run_id}`
 
@@ -97,7 +97,7 @@ Response `200` (a `RunView`):
 | `approvals` | list | `{id, step_ordinal, tool, status, arguments_masked, decided_by, expires_at}`. Status is `pending`, `approved`, `rejected`, `expired` or `closed`. |
 | `ledger` | list | One entry per tool call; see below. |
 | `audit` | list | `{seq, event_type, actor, tool, policy_version}`, in order. Payloads are not included. |
-| `audit_chain_valid` | boolean | Whether the run's audit chain verifies when this response is built. |
+| `audit_chain_valid` | boolean | Whether the run's events chain and MACs verify when this response is built. It does not check the persisted head; use `tether audit verify` for that. If an audit key is missing, the inspection routes fail with a server error. |
 
 A ledger entry has `step_ordinal`, `tool`, `effect` (`read` or `write`), `state` (`pending`, `dispatched`, `completed`, `failed`, `indeterminate`, `abandoned`), `attempts`, `outcome` (the masked result, or null), `outcome_reason`, `resolution`, `resolved_by`, `verification_attempts`, `verification` (`"in_progress"` while an automatic read-back is pending, otherwise null) and `verification_evidence` (masked, once a read-back resolved the entry). All payloads are masked: a field marked sensitive never appears.
 

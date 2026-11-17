@@ -22,7 +22,7 @@ class ModelProvider(Protocol):
 
 `complete` takes Tether's history and the tool manifest, makes **one** model call, and returns one `ModelTurn`. The manifest is a list of `{name, description, input_schema}` rendered from the agent's tools.
 
-Behind this line, and only there: the vendor's SDK and HTTP client, its wire format, its error shapes, its credential and its name. A test, `tests/contract/providers/test_provider_boundary.py`, keeps it true. It scans the core and fails if a vendor name, the vendor SDK or an HTTP client import appears outside the adapter and the factory, or if the run graph or driver imports anything but the protocol. The guard lists the permitted files by path, so a new adapter means extending that list, and the pattern for its vendor name, in the same reviewed change. Do not loosen the guard to make a leak pass.
+Behind this line, and only there: the vendor's SDK and HTTP client, its wire format, its error shapes, its credential and its name. A test, `tests/contract/providers/test_provider_boundary.py`, keeps it true. It scans the core with three separate path allow-lists. The vendor's name may appear only in the adapter, the factory and `settings.py`. The vendor SDK import and the HTTP-client import may appear only in the adapter, not even in the factory. In addition, the run graph and driver must not mention the concrete adapter module and must import the protocol. A new provider therefore extends the vendor-name pattern (the test matches `openai` only), and adds its adapter to the SDK and HTTP-client allow-lists, in the same reviewed change. Do not loosen the guard to make a leak pass.
 
 ## The neutral types
 
@@ -118,7 +118,7 @@ class ProviderCase:
 To prove a new adapter:
 
 1. Add a `<vendor>_case()` to `harness.py` that builds the real adapter against a mocked transport, as `openai_case()` does with `httpx2.MockTransport`.
-2. Add it to the `params` of the `case` fixture.
+2. Add its name to the `params` of the `case` fixture **and** a matching branch in the fixture body. The body is a two-way conditional (scripted, otherwise OpenAI), so a new name added to `params` alone would silently run the OpenAI case. Make an unknown name raise instead of falling through.
 3. Write adapter-specific tests in the style of `test_openai_adapter.py`: the request on the wire, every error mapping, no SDK retries, no secret in any message or log line.
 
 Run the suite. It needs no network and no database:

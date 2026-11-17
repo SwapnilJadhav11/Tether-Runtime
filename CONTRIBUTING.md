@@ -24,7 +24,7 @@ This page is for anyone who wants to change Tether: how the repository is laid o
 - **Core, SDK, workloads.** The core never imports a workload. A workload imports only `tether.sdk` from Tether. Both are checked by import contracts and by `tests/architecture/` ([ADR-0002](docs/adr/0002-core-sdk-workload-layering.md)).
 - **Nothing workload-specific in `src/tether/`.** No incident, runbook or demo tool names, in code, comments, strings or file names. A test scans for them.
 - **A new top-level `tether.<module>`** must be added to the workload `forbidden_modules` list in `pyproject.toml`. Never add `ignore_imports` or allow indirect imports to get a check to pass.
-- **Provider code stays behind the adapter.** Model-vendor names, SDKs and HTTP clients live in `src/tether/providers/` only.
+- **Provider code stays behind the adapter.** Model-vendor SDKs and HTTP clients live in the adapter module only; a vendor's name may appear in the adapter, the provider factory and `settings.py`.
 - **Fail closed.** Policy, approval, dispatch and production authentication deny when in doubt. A development or test shortcut stays in its isolated module and works only when `TETHER_ENV` is `dev` or `test`.
 - **No admin HTTP API.** Platform administration is the bootstrap file and the CLI ([ADR-0014](docs/adr/0014-bootstrap-config-no-admin-api.md)).
 

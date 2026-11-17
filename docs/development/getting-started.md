@@ -21,6 +21,8 @@ uv sync --locked
 
 `uv run poe` lists every task the project defines.
 
+**Shell.** Commands on this page are written for bash (Linux, macOS, WSL or Git Bash). In PowerShell, set variables with `$env:NAME = "value"` instead of `export NAME=value`, call `curl.exe` (plain `curl` is an alias for another command), and continue a line with a backtick instead of a backslash. Variables you set this way are read as `$env:NAME` rather than `$NAME`.
+
 ## Create the environment file
 
 The Compose stack reads `deploy/compose/.env`, which is git-ignored. Start from the example and replace every value:
@@ -33,10 +35,10 @@ The values you must set:
 
 | Variable | What it is | How to generate it |
 |---|---|---|
-| `TETHER_POSTGRES_PASSWORD` | PostgreSQL superuser password, used only to initialise the database | `python -c "import secrets; print(secrets.token_urlsafe(24))"` |
+| `TETHER_POSTGRES_PASSWORD` | PostgreSQL superuser password, used only to initialise the database | `uv run python -c "import secrets; print(secrets.token_urlsafe(24))"` |
 | `TETHER_MIGRATOR_DB_PASSWORD` | Password of the role that owns the schema; used only by the `migrate` service | same command |
 | `TETHER_APP_DB_PASSWORD` | Password of the least-privilege role used by `api` and `worker` | same command |
-| `TETHER_AUDIT_KEY_DEV1` | Key for the audit chain | `python -c "import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"` |
+| `TETHER_AUDIT_KEY_DEV1` | Key for the audit chain | `uv run python -c "import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"` |
 | `TETHER_BINDING_KEY_DEV1` | Key that binds an approval to an exact call | same command, run again |
 
 Passwords are embedded in database URLs, so use only letters, digits, `-` and `_`. The two key values must be different: audit keys and call-binding keys are separate families and never share material ([ADR-0010](../adr/0010-keyed-canonical-call-hash.md)). Leave `TETHER_AUDIT_ACTIVE_KEY_ID` and `TETHER_BINDING_ACTIVE_KEY_ID` at `DEV1`; they name which key signs new records.
@@ -99,7 +101,7 @@ The first command creates one Ed25519 key per audience (`tether-tasks`, `tether-
 Edit `config/bootstrap/dev.yaml` in two places:
 
 - replace the workspace's `issuers:` block with the printed one;
-- replace the `api_keys:` entry with the printed bootstrap entry.
+- replace the `api_keys:` entry with the printed bootstrap entry. The command prints it at a two-space indent, so re-indent it to sit under `api_keys:` in the file (as in the existing entry). A misaligned entry makes `tether bootstrap apply` fail with `invalid bootstrap file`.
 
 Do not commit this edit: the committed values belong to keys you do not hold. The dev image copies `config/` at build time, so rebuild and re-apply:
 
@@ -116,7 +118,7 @@ Each route group accepts only tokens for its own audience. Mint one token per pe
 ```bash
 export REQUESTER_TOKEN=$(uv run python tools/dev_issuer/mint.py alice --aud tether-tasks --role operator)
 export APPROVER_TOKEN=$(uv run python tools/dev_issuer/mint.py bob --aud tether-approvals --role approver)
-export TETHER_API_KEY=<the raw key printed by tether apikey new>
+export API_KEY=<the raw key printed by tether apikey new>
 ```
 
 A token lives 900 seconds by default (`--ttl` changes it). `alice` has the `operator` role, which `dev.yaml` maps to the permissions the incident tools require. `bob` has the `approver` role, which the policy rule for `restart_service` names. Mint again when a token expires.
@@ -128,7 +130,7 @@ Run `keys.py` before `mint.py`. If `mint.py` finds no key it creates one, and th
 ```bash
 curl -s -X POST http://localhost:8080/v1/tasks/runs \
   -H "Authorization: Bearer $REQUESTER_TOKEN" \
-  -H "X-API-Key: $TETHER_API_KEY" \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"task_input": {"message": "checkout is down #scenario=restart_checkout"}}'
 ```
@@ -151,7 +153,7 @@ Poll the run until its status is `awaiting_approval` (a few seconds):
 
 ```bash
 curl -s http://localhost:8080/v1/tasks/runs/$RUN_ID \
-  -H "Authorization: Bearer $REQUESTER_TOKEN" -H "X-API-Key: $TETHER_API_KEY"
+  -H "Authorization: Bearer $REQUESTER_TOKEN" -H "X-API-Key: $API_KEY"
 ```
 
 Only the requester can read this view. Then, as the approver, list what you may decide:
