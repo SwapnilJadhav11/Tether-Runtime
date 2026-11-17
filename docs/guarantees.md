@@ -67,7 +67,8 @@ unknown outcome becomes `indeterminate`.
 - *Depends on:* the tool author's declaration. A write declares `idempotency="unsupported"`, and
   Tether trusts it. What the handler does inside one invocation is the tool's responsibility.
 - *Limit:* worker death, lease expiry or a dropped connection after dispatch leaves the outcome
-  unknown; the run then waits for its resolution.
+  unknown; the run then waits for its resolution. This includes a crash after the dispatch record
+  commits but before the request leaves: the entry is `indeterminate` although nothing was sent.
 
 **Idempotent writes are re-sent only with the same key, within a bound, and never after a stop**
 ([G-3](product/tether-v1-guarantees.md#g-3-idempotent-writes-are-re-sent-only-with-the-same-key-within-a-bound-and-never-after-a-stop)).
@@ -85,9 +86,11 @@ See [Side effects and the execution ledger](governance/side-effects-and-ledger.m
 
 **Unknown outcomes are never reported as failure**
 ([G-4](product/tether-v1-guarantees.md#g-4-unknown-outcomes-are-never-reported-as-failure-at-the-baseline-only-a-human-resolves-them)).
-A write's result is `not_applied` only with positive evidence; every other result after dispatch
-is `unknown`, and the ledger entry becomes `indeterminate`. The model is never told such a write
-failed. An eligible reconciler (the `reconciler` role, eligible under policy, and not the run's
+For a write whose tool declares no read-back, the result is `not_applied` only when the tool raises
+`ToolNotApplied`; every other result after dispatch is `unknown`, and the ledger entry becomes
+`indeterminate`. Where a read-back is declared, a `verified_not_applied` result is the read-back's
+verdict, which may rest on absence (see the next section) and is not covered by this guarantee.
+The model is never told an unknown write failed. An eligible reconciler (the `reconciler` role, eligible under policy, and not the run's
 requester) resolves the entry with a justification, recorded as an audit event before the run
 resumes or ends.
 
@@ -105,7 +108,8 @@ a dispatched read a typed failure; a run with an unresolved entry is held for re
 otherwise it ends `failed`. A wake is always enqueued.
 
 - *Limit:* a timer job is only marked dead with a wake; its condition is still enforced when the
-  next decision is made. The delivery counts are development defaults.
+  next decision is made. The delivery counts are development defaults. A dispatched entry whose
+  tool version can no longer be resolved is outside this guarantee.
 
 See [Unknown outcomes](governance/unknown-outcomes.md) and
 [Execution and recovery](architecture/execution-and-recovery.md).
@@ -155,29 +159,35 @@ that lost its lock cannot write, and a contended job is requeued without consumi
 
 ### Crash safety
 
-**A crash loses no run and duplicates no idempotent write**
+**A crash after a critical commit, during a model call or with a write in flight loses no run and
+duplicates no idempotent write**
 ([G-9](product/tether-v1-guarantees.md#g-9-a-crash-after-any-critical-commit-during-a-model-call-or-with-a-write-in-flight-loses-no-run-and-duplicates-no-idempotent-write)).
-A crash of the API or a worker right after any critical transaction commits, during a model call,
-or while an idempotent write is in flight leaves a run that resumes to the same outcome, with no
+A crash of the API or a worker right after any of the critical transactions from submission to the
+final status commits, during a model call, or while an idempotent write is in flight leaves a run that resumes to the same outcome, with no
 duplicate ledger entries and one applied effect per idempotent write at a target that honours the
 key. Hard-killing and restarting the real processes mid-run has the same result.
 
 - *Depends on:* idempotent writes against key-honouring targets. A non-idempotent write in flight
   during a crash becomes `indeterminate` instead.
 - *Limit:* the chaos suite runs once per push in CI. Repeated 20 times in a row, it passed 19
-  iterations; the failing one spanned a host suspend. That is not a clean 20 of 20. The crash points are a test harness;
-  production processes carry none.
+  iterations; the failing one spanned a host suspend. That is not a clean 20 of 20. The crash
+  points are a test harness; production processes carry none. Reconciliation, cancellation,
+  deadline, dead-letter and verification transactions are not among the crash points this entry
+  covers.
 
 ### Identity and workspace isolation
 
 **Invalid credentials fail before any state change; out-of-scope resources do not exist**
 ([G-11](product/tether-v1-guarantees.md#g-11-invalid-credentials-fail-before-any-state-change-out-of-scope-resources-do-not-exist)).
-Every credential failure returns `401` before any audit, policy or job activity. The expected
-token audience comes from the route, never from the token. A resource outside the caller's
-workspace or authorization returns `404`, never `403`.
+On the submit, read, cancel, approve, reject, reconcile and admin-cancel routes, every credential
+failure returns `401` before any audit, policy or job activity. The expected token audience comes
+from the route, never from the token. A resource outside the caller's workspace or authorization
+returns `404`, never `403`.
 
 - *Depends on:* the development identity shortcut being inert. It works only when `TETHER_ENV` is
   `dev` or `test` and the request has no `Authorization` header.
+- *Limit:* the same behaviour on the approval list and detail and the run views is tested but
+  listed in the next section.
 
 **Every request-path query after authentication is workspace-scoped**
 ([G-16](product/tether-v1-guarantees.md#g-16-every-request-path-query-after-authentication-is-workspace-scoped)).
@@ -214,12 +224,15 @@ Every policy decision, skipped call, approval request and decision, dispatch, to
 reconciliation, stop, approval closure or expiry, replay divergence, dead-letter and terminal
 status change is appended in the same transaction as the state it describes; if the append fails,
 the change does not happen. Each run's events form an HMAC-SHA-256 chain keyed outside the
-database, and in-place modification of an event is detected. `tether audit verify` recomputes a
-run's chain and also checks the persisted head.
+database, and in-place modification of an event is detected by anyone verifying with the audit key,
+unless the modifier also holds that key. Run inspection (`audit_chain_valid`) recomputes the chain
+only; `tether audit verify` also compares the persisted head.
 
-- *Limit:* the chain is per run. Deleting a run's tail together with its head, or deleting a whole
-  run, is not detected. Events written with MAC version 1 do not cover their timestamp. The audit
-  log is not WORM storage.
+- *Limit:* the chain is per run. Removing a run's last events is invisible to run inspection.
+  `tether audit verify` exposes it only while the persisted head is left alone; a database
+  administrator who also rewrites the head (no key needed), or removes a whole run, is not
+  detected. A holder of the audit key can rewrite a chain that verifies. Events written with MAC
+  version 1 do not cover their timestamp. The audit log is not WORM storage.
 
 See [Audit](governance/audit.md).
 
@@ -234,8 +247,9 @@ credential shapes are scrubbed from log lines, tracebacks carry no local variabl
 state, job payloads, task input and tool arguments never reach logs, spans or metric labels.
 
 - *Depends on:* the tool author marking sensitive fields. An unmarked field is not masked.
-- *Limit:* unmasked arguments exist in LangGraph checkpoints and job payloads. Output sent to a
-  hosted model provider leaves the deployment.
+- *Limit:* unmasked arguments exist in LangGraph checkpoints and job payloads. Non-sensitive
+  (masked) tool output placed in model context leaves the deployment when a hosted provider is
+  used.
 
 See [Secrets and data handling](security/secrets-and-data-handling.md).
 
@@ -248,14 +262,21 @@ the evidence for each.
 | Behaviour | What the tests show | Known limits |
 |---|---|---|
 | Automatic verification of unknown outcomes | An `indeterminate` write whose tool declares a read-back is resolved only after a committed gate that observed no stop and a policy `allow`; the probe never re-sends the write; a person's decision wins over a late probe | That a third-party probe only reads cannot be proven by Tether; any policy change between a write and its probe sends the entry to a person. See [Unknown outcomes](governance/unknown-outcomes.md) |
-| Pre-dispatch re-check | A call whose policy now denies it, whose hash changed, or whose approval is missing, bound to another hash or lapsed is refused with no ledger entry and nothing sent | The refusal writes no audit event of its own |
-| End-to-end masking of `Sensitive` fields | Masked in the ledger, the approval, the audit payloads, run inspection and every approval view; a sink scan finds the output value nowhere | Arguments remain unmasked where described under G-14 |
-| Configuration loss never hides an unresolved effect | A worker that lacks a run's agent makes no model call, authorization or send, and holds the run while any entry is unresolved | |
+| Pre-dispatch re-check | A call whose policy now denies it, whose hash changed, or whose approval is missing, bound to another hash or lapsed is refused with no ledger entry and nothing sent | The refusal writes no audit event of its own; the changed-call and no-matching-approval cases are reached through test-only wrappers |
+| End-to-end masking of `Sensitive` fields | Masked in the ledger, the approval, the audit payloads, run inspection and every approval view; a sink scan finds the output value nowhere | Proven with a test-only `Sensitive` tool; the reference workloads declare no `Sensitive` field. Arguments remain unmasked where described under G-14 |
+| Configuration loss or a pinned version removed after dispatch never hides an unresolved effect | A worker that lacks a run's agent makes no model call, authorization or send, and holds the run while any entry is unresolved; a dispatched entry whose pinned version is gone is recorded unknown and never re-sent | |
 | Lease heartbeats | A healthy tool call longer than the lease is neither redelivered nor made `indeterminate` | A synchronous, blocking handler starves the heartbeat and loses its lease |
-| Repair and denial bound | The run ends `failed` after more invalid proposals or denials than its budget allows | |
+| Repair and denial bound | The run ends `failed` (or `cancelled`/`timed_out` if a stop is active), after any unresolved entry resolves, once invalid proposals or denials exceed their budget | |
 | Per-tool approval expiry | Each tool's rule may set its own expiry, bounded by a deployment maximum; a value above the maximum is refused | The default (3600 s) and maximum (86400 s) are proposed values, not yet confirmed |
-| Approval list, detail and approver run view; full authorization matrix | Every route, audience, role and workspace combination behaves as specified, in both directions between two workspaces | |
-| Fail-closed production configuration | Processes refuse to start without an explicit valid `TETHER_ENV`; development components are unavailable in `prod` | The development identity module still ships in the production image, inert |
+| Approval list, detail and approver run view; full authorization matrix | Every route, audience, role and workspace combination behaves as specified, in both directions between two workspaces | Not covered: an approval-detail access event, and the run view for an approver who later lost eligibility |
+| Fail-closed production configuration | Processes refuse to start without an explicit valid `TETHER_ENV`; development components are unavailable in `prod` | The development identity module still ships in the production image, inert; the built-image test has passed locally only |
+
+### Implemented, proven in CI over mocked transports only, run live once
+
+These are not candidates for a guarantee yet.
+
+| Behaviour | What the tests show | Known limits |
+|---|---|---|
 | Provider retry and the OpenAI adapter | Bounded, stop-gated provider retry; the same run executes on the scripted provider and on OpenAI by configuration | CI covers the adapter over a mocked transport only; one live run |
 | Second, unrelated workload | Repository change control runs on the same core with no core change | CI covers the GitHub client over a mocked transport only; one live run |
 
@@ -268,15 +289,20 @@ the evidence for each.
   above.
 - **That a read-back only reads.** This is the tool author's contract. It is tested against the
   two reference targets only.
-- **Tamper-proof audit storage.** The chain detects modification and reordering within a run. It
-  does not detect deletion of a chain's tail with its head, or of a whole run, and it is not WORM
-  storage or a compliance product. No cross-run audit query exists.
+- **Tamper-proof audit storage.** The chain detects modification and reordering within a run by a
+  party without the audit key. It does not detect deletion of a chain's tail with its head, or of
+  a whole run, and it is not WORM storage or a compliance product. No cross-run audit query exists.
+- **Deduplication of submissions.** A run submission carries no client idempotency key. A caller
+  that retries a submission whose response was lost creates a second run, which may repeat the same
+  side effects.
 - **Mid-run revocation.** Removing a requester's access during a run is not guaranteed to stop it;
   exposure is bounded by approval expiry and the run deadline.
 - **Operating limits.** No concurrency, latency, throughput or tool-duration limit is published.
   The measurements in [Validation](validation.md) are single-host figures, not limits.
 - **Database recovery objectives.** PostgreSQL is a single point of failure. While it is down
-  nothing progresses and nothing is lost; recovery point and time objectives are not set.
+  nothing progresses and no committed state is lost. A write in flight when the database goes away
+  can end `indeterminate`, and buffered access events can be lost. This has no integration test
+  against a real outage. Recovery point and time objectives are not set.
 - **Production service identities.** Production runs require a human end-user token. There are no
   production service principals and no OIDC or JWKS discovery.
 - **Protection against prompt injection, or a sandbox for tool code.** Tether governs what a tool
