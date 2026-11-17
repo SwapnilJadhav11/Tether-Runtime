@@ -11,9 +11,9 @@ Production operation must fail closed. A production process never silently selec
 | Setting | Required value in production | Purpose |
 |---|---|---|
 | `TETHER_ENV` | `prod`, **explicit** | Selects the production startup path. Absent or invalid → `tether-api`, `tether-worker`, `tether-worker-healthcheck` and every database-connecting `tether` command (`migrate`, `bootstrap`, `audit`) refuse to start with exit code 2 and a message that names `TETHER_ENV` and the three valid values, never a credential. `tether --help` and `tether apikey new` need no environment. |
-| `TETHER_DATABASE_URL` | `postgresql://tether_app:…@…/tether` | Least-privilege application role (no DDL, no DELETE, append-only audit) |
+| `TETHER_DATABASE_URL` | `postgresql://tether_app:…@…/tether` | Least-privilege application role: no DDL, no `DELETE` on the `tether` schema tables, append-only audit. The development init script's default privileges also give it `DELETE` and `UPDATE` on the `langgraph` checkpoint schema; remove `DELETE` there in production. Require TLS to PostgreSQL (for example `?sslmode=verify-full`) unless the link is a trusted local network |
 | `TETHER_MIGRATOR_DATABASE_URL` | `tether_migrator` role, used only by `tether migrate` and `tether bootstrap apply` | Separates schema and configuration writes from runtime |
-| `TETHER_BOOTSTRAP_FILE` | path to the reviewed, version-controlled bootstrap YAML | Workspaces, issuers (public keys only), API-key hashes, agents, policy ([ADR-0014](../adr/0014-bootstrap-config-no-admin-api.md)) |
+| `TETHER_BOOTSTRAP_FILE` | path to the reviewed, version-controlled bootstrap YAML | Workspaces, issuers (public keys only), API-key hashes, agents, policy ([ADR-0014](../adr/0014-bootstrap-config-no-admin-api.md)). Not enforced at startup: without it the API and worker run with an empty configuration, and the human routes return `404` |
 | `TETHER_AUDIT_ACTIVE_KEY_ID`, `TETHER_AUDIT_KEY_<ID>` | 32-byte random secrets, independent per key ID | Audit HMAC chain ([ADR-0015](../adr/0015-per-run-hmac-audit-and-authoritative-reconstruction.md)) |
 | `TETHER_BINDING_ACTIVE_KEY_ID`, `TETHER_BINDING_KEY_<ID>` | independent from the audit family | Call-binding HMAC ([ADR-0010](../adr/0010-keyed-canonical-call-hash.md)) |
 | `TETHER_MODEL_PROVIDER`, `TETHER_OPENAI_MODEL`, `TETHER_OPENAI_API_KEY` | `openai`, a model name, the provider key | The scripted provider is refused in production. The key comes from the host's secrets mechanism, never from bootstrap files or images |
@@ -23,7 +23,9 @@ Production operation must fail closed. A production process never silently selec
 | `TETHER_OTEL_ENDPOINT` | collector URL, or unset | Telemetry is best-effort ([observability](observability.md)) |
 | `TETHER_LOG_LEVEL` | `INFO` or `WARNING` | Logs are JSON with scrubbing |
 
-Settings that must **not** be set or must have no effect in production: `TETHER_SCENARIOS_DIR` (scripted provider scenarios), any dev identity body or query parameter.
+Leave `TETHER_SCENARIOS_DIR` (scripted provider scenarios) unset in production, and send no dev identity body or query parameter. Neither is enforced at startup: the `prod` image holds no scenarios, the OpenAI provider ignores the variable, and the identity shortcut is `401` in `prod`. Treat the variable as a checklist item.
+
+The API listens on `0.0.0.0:8080` over plain HTTP. Terminate TLS in front of it.
 
 ## 3. Controls that separate development and test from production
 
@@ -64,12 +66,13 @@ What the production image still contains, deliberately: the core, including `src
 
 - [ ] Running the `prod` image target (`docker build --target prod`), not the default (dev) image
 - [ ] `TETHER_ENV=prod` set explicitly; `TETHER_MODEL_PROVIDER=openai` and `TETHER_OPENAI_MODEL` set
-- [ ] Database roles created by the init script; `tether migrate` and `tether bootstrap apply` run by the migrator role before `api`/`worker`
+- [ ] `tether_migrator` and `tether_app` roles created as in `deploy/compose/postgres/init.sh` (a development script), then `DELETE` taken away from `tether_app` on the `langgraph` schema with no default `DELETE` privilege set, and the result checked with psql's privilege listing; TLS to PostgreSQL required unless the link is a trusted local network
+- [ ] `tether migrate` and `tether bootstrap apply` run by the migrator role before `api`/`worker`
 - [ ] Bootstrap file reviewed: public keys only, API-key hashes only, one policy per workspace
 - [ ] Audit and binding keys present for every key ID referenced by non-terminal runs
 - [ ] Provider credential present through the host's secret mechanism
 - [ ] No `TETHER_SCENARIOS_DIR`, no demo target in the stack
-- [ ] `/readyz` ready; worker heartbeat fresh
+- [ ] TLS terminated in front of the API; `/readyz` ready; worker heartbeat fresh (and its max age above your longest single job)
 - [ ] Backup and restore procedure in place ([PostgreSQL recovery](postgres-recovery.md))
 - [ ] Application and schema versions match; no process older than the schema is running (§6)
 

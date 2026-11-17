@@ -18,7 +18,7 @@ Examples use synthetic values (`ws-example`, `<run-id>`). Hosts, tokens and keys
 | `401` | Missing, expired or wrongly addressed credential | [Credential and authorization failures](#credential-and-authorization-failures) |
 | `503` with `policy is reloading` | The active policy version differs from the one loaded | [503 from approval or reconciliation routes](#503-from-approval-or-reconciliation-routes) |
 | Worker exits at start-up, or the container is unhealthy | Missing environment, bad bootstrap file, high-risk tool allowed | [A worker that will not start](#a-worker-that-will-not-start) |
-| `audit_chain_valid` is `false`, or `tether audit verify` prints `INVALID` | Stored audit data fail verification | [Verifying a run's audit chain](#verifying-a-runs-audit-chain) |
+| `audit_chain_valid` is `false`, or `tether audit verify` prints `INVALID` | Stored audit data fail verification, or the key material for a key ID changed | [Verifying a run's audit chain](#verifying-a-runs-audit-chain) |
 
 ## Inspecting a run
 
@@ -81,7 +81,7 @@ A run is held in this state while any of its ledger entries is `pending`, `dispa
 1. Inspect the run. Find the entry with state `indeterminate`.
    - `verification: in_progress`: automatic verification is still probing the target, each probe after a backoff. Wait. A person's resolution would win over a late probe, but there is usually no need.
    - No verification in progress and no resolution: verification ended without an answer (inconclusive probes used up, the tool declares none, or policy did not allow the probe). A person must resolve it.
-   - Entry is `pending` or `dispatched` instead: the run is held because a job was dead-lettered. See [a dead job](#a-dead-job).
+   - Entry is `pending` or `dispatched` instead: the run is held while that entry is unresolved. This is usually a dead-lettered job (see [a dead job](#a-dead-job)). It can also follow missing configuration for the run's agent, a replay divergence, or an exhausted repair or denial budget. Reconciliation applies only to `indeterminate` entries; a `pending` or `dispatched` one resolves through its own job or the dead-letter transition.
 2. **Find the ledger entry id.** The HTTP views do not return it. Read it from the database with a role that can read the `tether` schema:
 
    ```sql
@@ -119,14 +119,14 @@ The reconciliation is audited (`RECONCILED`, with your subject and justification
 
 ## A dead job
 
-A job is delivered a bounded number of times: 8 for `advance_run`, 5 for `execute_tool` and `verify_outcome`, 10 for the two timers. A delivery that would exceed the bound ends the job as `dead` instead of running it, and the same transaction records what that means for the run. You see `tether.jobs.dead_lettered`, a `run dead-lettered` log line and a `DEAD_LETTERED` audit event.
+A job is delivered a bounded number of times: 8 for `advance_run`, 5 for `execute_tool` and `verify_outcome`, 10 for the two timers. A delivery that would exceed the bound ends the job as `dead` instead of running it, and the same transaction records what that means for the run. What you can see depends on the kind. Every dead letter increments `tether.jobs.dead_lettered`; the rest is per kind.
 
-| Dead job | What happened to the run |
-|---|---|
-| `advance_run` | The run becomes `awaiting_reconciliation` if a ledger entry is unresolved, otherwise `failed` with `system_error` |
-| `execute_tool` | A `pending` entry becomes `failed` (nothing was sent). A `dispatched` write becomes `indeterminate`. A `dispatched` read becomes a typed failure. The run is then woken |
-| `verify_outcome` | Verification ends; the entry stays `indeterminate` for a person |
-| `run_deadline`, `expire_approval` | The job is marked dead and the run is woken. The condition is still enforced at decision time |
+| Dead job | Signals | What happened to the run |
+|---|---|---|
+| `advance_run` | `run dead-lettered` log line, `DEAD_LETTERED` audit event | The run becomes `awaiting_reconciliation` if a ledger entry is unresolved, otherwise `failed` with `system_error` |
+| `execute_tool` | `job dead-lettered` log line, the ledger outcome in a `TOOL_OUTCOME` audit event; no `DEAD_LETTERED` event | A `pending` entry becomes `failed` (nothing was sent). A `dispatched` write becomes `indeterminate`. A `dispatched` read becomes a typed failure. The run is then woken |
+| `verify_outcome` | The counter only | Verification ends; the entry stays `indeterminate` for a person |
+| `run_deadline`, `expire_approval` | The counter only | The job is marked dead and the run is woken. The condition is still enforced at decision time |
 
 Procedure:
 
@@ -159,7 +159,7 @@ tether audit verify --workspace ws-example --run <run-id>
 
 `reason` is one of `sequence_mismatch` (an event is not at the next sequence number), `prev_mac_mismatch` (it does not link to its predecessor), `mac_mismatch` (a recomputed MAC differs), `unsupported_mac_version`, or `head_mismatch` (the stored head disagrees with the events). `failed_seq` names the first failing event.
 
-What `INVALID` means: stored audit data were modified, reordered or removed, or the key used does not match. Before treating it as tampering, rule out an operational cause: exit code `3` is never reported as `INVALID`, but a retired audit key still referenced by old events can make verification fail. Check that every key ID the run's events used is still configured ([key lifecycle](key-lifecycle.md)). Preserve the database state, restore from a backup if you need to compare ([PostgreSQL recovery](postgres-recovery.md)), and treat it as a security incident if the cause is not operational. The chain detects modification and reordering within a run. It does not detect deletion of a chain's tail together with its head, or deletion of a whole run, and it is not write-once storage. See [guarantees](../guarantees.md).
+What `INVALID` means: stored audit data were modified, reordered or removed, or the key used does not match. Before treating it as tampering, rule out an operational cause. A missing audit key is not reported as `INVALID`: the CLI exits `3` ("audit key unavailable"), and the inspection routes fail with an unhandled server error instead of returning `audit_chain_valid`. Wrong key material under an existing key ID, for example a key replaced in the environment, does report `mac_mismatch` and `INVALID`. Check that every key ID the run's events used is still configured with its original material ([key lifecycle](key-lifecycle.md)). Preserve the database state, restore from a backup if you need to compare ([PostgreSQL recovery](postgres-recovery.md)), and treat it as a security incident if the cause is not operational. The chain detects modification and reordering within a run. It does not detect deletion of a chain's tail together with its head, or deletion of a whole run, and it is not write-once storage. See [guarantees](../guarantees.md).
 
 ## Cancelling a run
 
@@ -179,7 +179,7 @@ A cancel is a request. It closes pending approvals and wakes the run, and the ru
 
 ## A worker that will not start
 
-A worker exits when it cannot start safely. Read its first log lines.
+A worker exits when it cannot start safely. Read its first log lines. Only settings validation exits with code 2 and a short message. The other refusals below are uncaught errors: a traceback and exit code 1, in the worker only.
 
 | Message or symptom | Cause | Fix |
 |---|---|---|
@@ -189,10 +189,11 @@ A worker exits when it cannot start safely. Read its first log lines.
 | `policy allows high-risk tool <tool>` | A rule sets `allow` on a high-risk tool | Change the rule to `require_approval` or `deny`, apply, restart |
 | `the default approval expiry ... is above the maximum`, or a rule's expiry above it | `TETHER_APPROVAL_TTL_SECONDS` or a rule's `approval_expiry_seconds` exceeds `TETHER_APPROVAL_MAX_TTL_SECONDS` | Lower the value or raise the maximum. Refused, never clamped |
 | `TETHER_SETTINGS is invalid` under `tether: invalid configuration` | Among other things, `TETHER_WORKER_LEASE_HEARTBEAT_SECONDS` is not below `TETHER_WORKER_LEASE_SECONDS` | Lower the heartbeat interval or raise the lease |
-| A provider configuration error naming `TETHER_OPENAI_MODEL` or the API key | `TETHER_MODEL_PROVIDER=openai` without a model or key, or `scripted` in `prod` | Set them; `prod` requires `openai` |
-| Container unhealthy, process running | The heartbeat file is stale: the database is unreachable | See [deployment](deployment.md#when-postgresql-is-unavailable) |
+| A provider configuration error naming `TETHER_OPENAI_MODEL` or the API key | `TETHER_MODEL_PROVIDER=openai` without a model or key | Set them |
+| A scripted-provider refusal that names neither the model variable nor the key | `TETHER_MODEL_PROVIDER=scripted` (the default) with `TETHER_ENV=prod` | Set `TETHER_MODEL_PROVIDER=openai`, the model and the key. The API does not build a provider, so it starts anyway; only the worker refuses |
+| Container unhealthy, process running | The heartbeat file is stale: the database is unreachable, **or** a single job has run longer than `TETHER_WORKER_HEARTBEAT_MAX_AGE_SECONDS` (default 30 s) | Check the database ([deployment](deployment.md#when-postgresql-is-unavailable)); if it is healthy and a long model call or tool is running, raise the max age above your longest job |
 
-The settings errors name variables, never values. A bootstrap file that is unreadable or invalid stops both `tether-api` and `tether-worker`. See [configuration](configuration.md).
+The settings errors name variables, never values. A bootstrap file that is unreadable or invalid stops both `tether-api` and `tether-worker`; the workload, high-risk-tool, approval-expiry and provider checks run in the worker only. See [configuration](configuration.md).
 
 A worker that **starts** but whose loaded policy is not the active version decides nothing. That is the next section.
 
