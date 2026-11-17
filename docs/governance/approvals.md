@@ -96,17 +96,19 @@ rejection is a new call with a new approval.
 
 ## Who may decide
 
-All of these must hold, checked in this order; any failure returns `404`, so a caller cannot tell an
-approval they may not see from one that does not exist
+A missing or invalid credential returns `401`. With a valid token for the `tether-approvals`
+audience, all of the following must hold, checked in this order. A failure of any of them returns
+`404`, so a caller cannot tell an approval they may not see from one that does not exist
 ([ADR-0013](../adr/0013-identity-trust-boundary-workspace-isolation.md)):
 
-1. A valid token for the `tether-approvals` audience, for the approval's workspace.
+1. The approval is in the token's workspace.
 2. The core `approver` role in that token.
 3. Policy eligibility under the active policy version: a role named in the tool's `approver_roles`.
 4. The approver is not the run's requester. This holds whatever roles the requester has.
 
 Roles come from the validated token only; roles supplied in a request body are ignored. A stale
-policy in the API process returns `503` with nothing changed.
+policy in the API process returns `503` with nothing changed; it is checked before policy
+eligibility.
 
 The decision itself is refused with `409` if the approval is no longer `pending`, has expired by
 database time, or its run is stopped or terminal. Two approvers racing get one `200` and one `409`.
@@ -159,8 +161,10 @@ re-checks the call in the transaction that would create its ledger entry, under 
 |---|---|
 | The call's hash, recomputed now, equals the hash that was decided | Refused as `denied` ("call changed since its decision") |
 | Current policy does not deny the call | Refused as `denied` ("policy now: deny") |
-| An approval for this call exists, is `approved` and carries the same hash | Refused as `denied` ("no matching approval") |
-| That approval has not expired | Refused as `expired` ("approval lapsed") |
+| If current policy answers `require_approval`: an approval for this call exists, is `approved` and carries the same hash | Refused as `denied` ("no matching approval") |
+| If current policy answers `require_approval`: that approval has not expired | Refused as `expired` ("approval lapsed") |
+
+If current policy now answers `allow` for the call, no approval is consulted.
 
 A `deny` from current policy overrides an approval: a permission revoked after the approval was given
 stops the call. A refused call gets no ledger entry and nothing is sent. Once the ledger entry exists,
