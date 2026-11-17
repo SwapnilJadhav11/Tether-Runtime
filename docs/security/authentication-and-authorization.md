@@ -200,7 +200,7 @@ workspaces:
   - id: ws-example
     agents:
       - id: agent-example
-        workload: incident_remediation
+        workload: change_control
     issuers:
       - id: tasks
         iss: https://issuer.example.com/ws-example/tether-tasks
