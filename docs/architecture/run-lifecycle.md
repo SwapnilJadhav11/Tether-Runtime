@@ -236,7 +236,7 @@ later.
 - at the start of each write node, before an approval or ledger entry exists (`govern_call`,
   `request_approval`, `authorize_call`), and before skip events are written;
 - before the first send of a tool call and before every re-send
-  ([Execution and recovery](execution-and-recovery.md#what-is-retried));
+  ([Execution and recovery](execution-and-recovery.md#executing-a-tool-call));
 - before every automatic verification probe ([Unknown outcomes](../governance/unknown-outcomes.md)).
 
 **What a stop never does.** It never recalls or interrupts a write that has been dispatched. Once a

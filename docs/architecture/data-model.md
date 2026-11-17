@@ -67,12 +67,14 @@ active one ([Policy](../governance/policy.md)).
 The audit chain, its events and its verification are explained in [Audit](../governance/audit.md);
 ledger states and outcome classes in [Side effects and the ledger](../governance/side-effects-and-ledger.md).
 
-Two places hold unmasked call arguments by design: the `execute_tool` and `verify_outcome` job
-payloads, which the worker needs to send the call, and the LangGraph checkpoint, which holds the
-model's proposals. Tool outputs are masked before they are persisted anywhere
+Unmasked data is held by design in three places: the `execute_tool` and `verify_outcome` job
+payloads, which hold the call arguments the worker needs to send the call; the LangGraph
+checkpoint, which holds the model's proposals; and `runs.task_input`, which stores the submitted
+task as received. Tool outputs are masked before they are persisted anywhere
 ([Secrets and data handling](../security/secrets-and-data-handling.md)).
 
-Nothing is deleted. No retention policy exists yet; every run, event and job stays.
+Nothing is deleted. No retention policy exists yet; every run, event and job stays, so `jobs` and
+`audit_events` grow without bound, and lease and heartbeat updates churn the rows of `jobs`.
 
 ### Constraints that carry meaning
 
@@ -109,10 +111,14 @@ Two database roles are used. The **migrator** role owns both schemas and is used
 | `runs`, `approvals`, `ledger_entries`, `model_calls`, `audit_heads`, `jobs` | Read, insert, update. |
 | `audit_events`, `access_events` | Read and insert only: append-only. |
 
-The application role has **no `DELETE`** on any table in the `tether` schema. Runtime code moves rows
-between states and never removes them. In the `langgraph` schema it holds the default table
-privileges the checkpoint saver uses, including `DELETE`; the append-only rules above do not apply
-to checkpoints.
+The application role has **no `DELETE`** on any table in the `tether` schema. It can update runs,
+approvals, ledger entries, model calls, audit heads and jobs; only audit events and access events
+are insert-only. Runtime code moves rows between states and never removes them.
+
+The `langgraph` schema is different. In the development stack, the database init script
+(`deploy/compose/postgres/init.sh`) gives the application role default privileges there, including
+`UPDATE` and `DELETE`, which the checkpoint saver uses. None of the append-only rules above apply to
+checkpoints.
 
 ## Workspace scoping
 
@@ -128,8 +134,9 @@ In code, a repository cannot be built without a `WorkspaceScope`. Every read it 
 that workspace, and every write is stamped with it; a write for another workspace raises an error.
 A row in another workspace is therefore simply not found, which the API returns as `404`. The API
 builds the scope from the authenticated principal; the worker builds it from the job after checking
-that the job and its run name the same workspace. The only unscoped queries are the credential
-lookups that establish the workspace and the worker's lease query. Identity and isolation are
+that the job and its run name the same workspace. The unscoped queries are the credential lookups
+that establish the workspace and the queue functions (lease, heartbeat, complete, release and the
+queue-depth sample), which act by job id across workspaces. Identity and isolation are
 explained in [Authentication and authorization](../security/authentication-and-authorization.md).
 
 ## The unit of work
@@ -149,8 +156,10 @@ transaction.
 run's `audit_heads` row, returns the existing event if its dedupe key is already present, and
 otherwise reads the database clock, computes the MAC and inserts the next event. If the append
 fails, the whole transaction rolls back and the state change does not happen. If the transaction
-rolls back for any other reason, the event goes with it. There is no window in which a state change
-exists without its audit event, or the reverse.
+rolls back for any other reason, the event goes with it. For every transaction in the table below
+that writes an audit event, the event and the state change commit together or not at all. The
+transactions that write no event (the driver's claim, waiting statuses, model attempts, refusals
+at the re-check before execution, and queue operations) are listed as such.
 
 ## Transactions
 
@@ -160,7 +169,9 @@ transaction that changes something a run is waiting for also enqueues its own `a
 | Transaction | Process | Commits atomically |
 |---|---|---|
 | Submit a run | `api` | Run row (`queued`, fixed deadline, binding key id), `RUN_SUBMITTED`, an `advance_run` job, a `run_deadline` job. |
-| Record a model attempt | `worker` | One `model_calls` row, written after the provider responds, with a fencing-token check in the same transaction. |
+| Lease, heartbeat, complete or release a job | `worker` | One update of the job row, conditional on its lease token. Not audited. |
+| Claim the run | `worker` | Under the run's advisory lock: `driver_generation` + 1 and status → `running`, from any non-terminal status; skipped while a held run has unresolved entries. Not audited. |
+| Record a model attempt | `worker` | One `model_calls` row, written after the provider responds, with a fencing-token check in the same transaction. Not audited. |
 | Decide on a proposal | `worker` | `POLICY_DECISION` (with call hash and pinned version) or `CALL_INVALID`. The event is the decision record. |
 | Request approval | `worker` | Approval row, `APPROVAL_REQUESTED`, an `expire_approval` job. |
 | Decide an approval | `api` | Approval `pending → approved` or `rejected` (only while unexpired, and only if the run is neither stopped nor terminal), `APPROVAL_DECIDED`, a wake. |
@@ -192,7 +203,7 @@ Transactions that lock more than one row take their locks in one global order:
 
 **run row → approval or ledger row → active policy version → audit head → jobs**
 
-A consistent order means two transactions never wait on each other in a cycle. Inserting a row whose
+Following this order prevents two transactions from waiting on each other in a cycle. Inserting a row whose
 foreign key references the run locks the run row implicitly, so transactions that
 append audit events or enqueue jobs take the run row explicitly first. The outcome commit, for
 example, share-locks the run row before it touches the ledger and the audit head; without that, it
@@ -211,10 +222,12 @@ The lock modes on the run row express who may proceed concurrently:
 - **Approval decisions and reconciliations** take the run row `FOR SHARE` and their own approval or
   ledger row `FOR UPDATE`, then check that the row is still in the state they expect.
 
-The dispatch gate is the one transaction that takes its rows the other way round: it locks the
-ledger entry `FOR UPDATE` first and then share-locks the run row. If PostgreSQL ever detects a
-deadlock, it aborts one of the transactions, which rolls back completely; a worker transaction is
-then retried by redelivery, and an API request fails and can be repeated.
+The dispatch gate is the one exception: it locks the ledger entry `FOR UPDATE` first and then
+share-locks the run row. It cannot form a cycle: every transaction that locks a ledger row holds
+the run row only `FOR SHARE`, and the transactions that take the run row `FOR UPDATE` (cancel,
+deadline, approval expiry) never lock a ledger row. If PostgreSQL ever detects a deadlock anyway,
+it aborts one of the transactions, which rolls back completely; a worker transaction is then
+retried by redelivery, and an API request fails and can be repeated.
 
 Time comparisons use `clock_timestamp()`, the database clock at the moment of the statement, not
 the transaction start time and not a process clock.
@@ -229,9 +242,10 @@ LangGraph thread, keyed by the run's id.
 
 The graph is invoked with `durability="sync"`, so each step's checkpoint is durable before the next
 node runs. The checkpoint records where the graph is: the message history, the remaining proposals
-of the turn, step ordinals and counters. It never decides what happened in the world. If the
-checkpoint and the `tether` tables disagree, the tables win, and a replay that would adopt a row for
-a different call fails closed ([Run lifecycle](run-lifecycle.md#replay-and-replay-divergence)). The
+of the turn, step ordinals and counters. It supplies only the graph's position and the model's
+proposals. Whether a decision, approval or ledger entry exists, and what it says, is read from the
+`tether` tables, and every reuse of a persisted row is checked against the hash of the
+checkpoint's call. A replay that would adopt a row for a different call fails closed ([Run lifecycle](run-lifecycle.md#replay-and-replay-divergence)). The
 checkpoint save is not part of any Tether transaction and is not fenced; that is why every adoption
 of persisted state is hash-checked.
 
