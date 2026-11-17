@@ -27,7 +27,7 @@ side effect. Each item below is a mechanism, not a promise of good behaviour.
 - **Exact-call approvals.** An approval is bound to one call by an HMAC over the RFC 8785
   canonical form of that call: workspace, run, agent, tool, pinned version and validated
   arguments. The approver is never the requester, and current policy is checked again before
-  execution.
+  execution (implemented and tested; not yet a stated guarantee).
 - **Honest unknown outcomes.** A write whose result is unknown becomes `indeterminate`, never
   "failed". A bounded, policy-authorized read-back or a person with a justification resolves it.
 - **Crash-safe execution.** A PostgreSQL job queue with leases, a per-run advisory lock and
@@ -55,12 +55,13 @@ flowchart LR
     L --> S[Dispatch committed, then send]
     S --> O{Outcome}
     O -->|applied or not_applied| R
-    O -->|unknown| I[indeterminate]
+    O -->|unknown write| I[indeterminate]
     I --> V[Read-back or a person resolves it]
     V --> R
 ```
 
-- Each step that changes state commits in one PostgreSQL transaction together with its audit event.
+- Each critical state change (decision, approval, authorization, dispatch, outcome, stop, final
+  status) commits in one PostgreSQL transaction together with its audit event.
 - The send happens only after the dispatch commit; jobs in the same database carry the work.
 - The model only ever receives typed results; it never reaches a tool directly.
 
@@ -69,7 +70,9 @@ See the [architecture overview](docs/architecture/overview.md).
 ## The lifecycle of a governed action
 
 1. A calling application submits a run with a workspace API key and the requester's token. The
-   workspace and agent come from the credentials, never from the request body.
+   workspace comes from the API key and the requester from the token; the agent is one the key
+   is bound to (named in the request only when the key is bound to several). Nothing in the
+   request body identifies a person.
 2. A worker leases the run's job, takes the run's advisory lock and fencing token, and asks the
    model for its next step through a provider adapter.
 3. Each proposed tool call is validated against the tool's schema and decided by deny-by-default
@@ -78,10 +81,12 @@ See the [architecture overview](docs/architecture/overview.md).
    the requester, approves the exact call.
 5. Current policy and the approval are checked again. A ledger entry with a deterministic
    idempotency key is created, and the dispatch is committed before the tool is called.
-6. The outcome is classified `applied`, `not_applied` or `unknown`. An unknown write becomes
-   `indeterminate` until a read-back or a reconciler settles it.
-7. Every decision, approval, dispatch and outcome is in the run's audit chain, written in the
-   same transaction as the change it records.
+6. The outcome is classified `applied`, `not_applied`, `unknown` or (for a read) `failed`. An
+   unknown write becomes `indeterminate`, after any bounded same-key retry of an idempotent write,
+   until a read-back or a reconciler settles it.
+7. Every policy decision, approval request and decision, authorization, dispatch and outcome is
+   in the run's audit chain, written in the same transaction as the change it records. The one
+   exception is a refusal at the re-check just before execution (see Known limitations).
 
 ## Guarantees
 
@@ -93,7 +98,9 @@ guarantee card it links to is authoritative. The most important, proven by autom
 - A non-idempotent write is sent at most once. Idempotent writes are re-sent only with the same
   key, within a bound, and never after a cancellation or deadline.
 - An unknown outcome is never reported as a failure: the entry is `indeterminate`, and an
-  eligible reconciler, never the requester, resolves it with a justification.
+  eligible reconciler, never the requester, resolves it with a justification. (An automatic
+  read-back may resolve the entry first; that verdict is implemented and tested but not part of
+  this guarantee.)
 - An approval is bound to exactly the call it was given and decided only by an eligible approver
   who is not the requester, once, before it expires.
 - A crash right after a critical commit, during a model call, or with an idempotent write in
@@ -108,14 +115,14 @@ guarantees yet.
 
 ## Validation
 
-Each live proof below ran once, on one development host. None is part of CI, and no operating
-limit is published. Details are in [validation](docs/validation.md).
+The live proofs below each ran once, on one development host, and are not part of CI. The
+repeated chaos run was also a local run. No operating limit is published. Details are in [validation](docs/validation.md).
 
 | Evidence | Result |
 |---|---|
 | Automated suites | 1,498 tests passed in a local run on one development host (2 skipped and 4 deselected: the live tests, never run in CI). CI then passed on the same code. |
 | Live model run | The incident workflow ran end to end on the real OpenAI API (`gpt-4o-mini`) with real credentials: one approval-gated restart, applied once, with the approved call hash equal to the ledger's. |
-| Live external write | Against a private GitHub sandbox repository, a real-model run created exactly one issue after its approval. The test failed once first, exposing a defect that was then fixed. |
+| Live external write | Against a private GitHub sandbox repository, a real-model run created exactly one issue after its approval. The test failed once first, exposing a defect that was then fixed. It used a personal login rather than a least-privilege token, as a one-time exception. |
 | Crashes around live calls | Every worker hard-killed and restarted in three cases around model calls and three around the external write. Every model-call case finished with one approval and one restart; every write case produced one issue. The non-idempotent create was never sent twice; the two interrupted creates were resolved by the tool's read-back. |
 | Load, three workers | 300 scripted runs: all succeeded in 37 s. 300 scripted runs while every worker was killed and restarted nine times: all succeeded. 30 real-model runs: all succeeded in 33 s. No stuck run, dead job or duplicate effect. |
 | Audit verification | `tether audit verify` reported `VALID` for every run of the validation, across both MAC versions. |
@@ -188,6 +195,6 @@ DISPATCHED, TOOL_OUTCOME, RUN_FINISHED
 
 Python 3.12, FastAPI, Pydantic, LangGraph, PostgreSQL, OpenTelemetry and Docker.
 
-Tether is at its first functional version. No licence has been selected yet, so no rights to use
+Tether is at its first functional version and is pre-release (the package version is 0.0.0). No licence has been selected yet, so no rights to use
 or redistribute the code are granted. To report a vulnerability, see the
 [security policy](SECURITY.md).

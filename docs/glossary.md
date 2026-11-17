@@ -66,7 +66,8 @@ progress cache that says where the graph is, never the record of what happened. 
 [Data model](architecture/data-model.md#checkpoints).
 
 **Dead-letter.** The transition that ends a job delivered past its maximum attempts: the job
-becomes `dead` in the same transaction as a domain outcome for its work and a wake job. See
+becomes `dead` in the same transaction as a wake job and, for `execute_tool`, `advance_run` and
+`verify_outcome`, a domain outcome for its work; timer jobs are only marked dead with a wake. See
 [Execution and recovery](architecture/execution-and-recovery.md#dead-letter).
 
 **Development identity shortcut.** In `dev` and `test` only, a request with no `Authorization`
@@ -78,7 +79,8 @@ and the scripted model provider. It is not a production deployment. See
 [Getting started](development/getting-started.md).
 
 **Dispatch.** The committed transition of a ledger entry from `pending` to `dispatched`, written
-with a `DISPATCHED` audit event before the tool is called. See
+with a `DISPATCHED` audit event before the tool is called. A permitted re-send records
+`REDISPATCHED`. See
 [Side effects and the execution ledger](governance/side-effects-and-ledger.md#three-commits-around-every-send).
 
 **Effect.** Whether a tool is a `read` or a `write`, declared on its descriptor. A read may be
