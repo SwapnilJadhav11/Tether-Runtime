@@ -24,9 +24,9 @@ a vendor, so switching provider changes no code.
 `dev` or `test` (an allow-list; `prod`, unset and misspelt values are refused), and `TETHER_ENV`
 itself has no default.
 
-**Not yet run against the real API (2026-11-16).** The adapter is proven against a mocked
-transport and a local stub only. The live tests (`uv run poe test-live`) skip without credentials
-and have never been run; paid calls wait for the owner's confirmation of the model and a spend
+**Run against the real API once (2026-11-17).** With the owner's confirmation (model `gpt-4o-mini`, a 5 USD ceiling) `uv run poe test-live` passed and governed runs completed on the compose stack. In CI the adapter is still exercised only against a mocked
+transport and a local stub; the live tests (`uv run poe test-live`) skip without credentials
+and stay manual; any further paid call needs the owner's confirmation of the model and a spend
 limit.
 
 The compose stack (`deploy/compose/docker-compose.yml`) passes `TETHER_MODEL_PROVIDER`,

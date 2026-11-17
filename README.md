@@ -8,7 +8,7 @@ Tether runs the agent loop, but that is not what it is for. Its job is the integ
 
 Every consequential action passes along one governed path: identity → policy → exact-action human approval when required → authorization → dispatch → execution → outcome classification → retry/idempotency decision → verification or human reconciliation when the outcome is unknown → audit and reconstruction. Tether is self-hostable, built on LangGraph for graph mechanics and PostgreSQL as its only stateful dependency.
 
-> **Status (2026-11-16):** V1 is in progress. The baseline commit `ec35254` was hardened and CI-green; most of the remaining V1 implementation has since landed with automated tests (listed below), but none of it has been proven against the real OpenAI or GitHub APIs, under a real-stack load campaign, by the 20× flake gate or by a PostgreSQL restore drill. This README separates **what the guarantee card proves**, **what is implemented and tested but not yet accepted as a guarantee**, **what V1 still requires**, and **what is deferred**. Nothing in the "still requires" or "deferred" lists is current behaviour.
+> **Status (2026-11-17):** V1 is in progress. The baseline commit `ec35254` was hardened and CI-green; most of the remaining V1 implementation has since landed with automated tests (listed below), and on 2026-11-17 a final validation pass ran a governed workflow on the real OpenAI API, a governed write against a private GitHub sandbox, crash cases around both and a load campaign on the compose stack, once, on one development host (guarantee card §2; `docs/testing/strategy.md` §5.1). Still not done: a PostgreSQL restore drill, published operating limits, and a clean 20× flake gate (the one run passed 19 of 20 iterations; the failure spanned a host suspend). This README separates **what the guarantee card proves**, **what is implemented and tested but not yet accepted as a guarantee**, **what V1 still requires**, and **what is deferred**. Nothing in the "still requires" or "deferred" lists is current behaviour.
 
 ## What Tether guarantees today
 
@@ -32,16 +32,16 @@ These have code and passing automated tests; each enters the card's §1 only whe
 - bounded **automatic verification** of unknown outcomes through a tool-declared safe read-back, with human reconciliation as the fallback and the human winning on conflict ([ADR-0019](docs/adr/0019-automatic-verification-of-unknown-outcomes.md), authorized per [ADR-0022](docs/adr/0022-verify-operation-policy-mapping.md); P-4);
 - **lease heartbeats** (P-5); a small explicit **repair/denial bound** (P-7); **per-tool approval expiry** with a default and a maximum, values awaiting owner confirmation (P-8);
 - the **approval operational API** (list, detail with masked arguments, approve, reject, approver run evidence), the auditor/admin run view, access events, `tether audit verify`, and the T-24 authorization matrix with a second workspace (P-9, P-10);
-- provider choice by configuration, bounded stop-gated provider retry and an **OpenAI** adapter, tested against a mocked transport only (P-11);
-- a **second, unrelated workload** (repository change control) on the same kernel, tested against a mocked GitHub transport only (P-13);
+- provider choice by configuration, bounded stop-gated provider retry and an **OpenAI** adapter, tested in CI against a mocked transport and run live once on 2026-11-17 (P-11);
+- a **second, unrelated workload** (repository change control) on the same kernel, tested in CI against a mocked GitHub transport and run live once against a sandbox on 2026-11-17 (P-12, P-13);
 - fail-closed production configuration: explicit `TETHER_ENV`, a `prod` image target without demo or dev components (P-14).
 
-Known limits (see guarantee card §3): audit events written before migration `0003` keep timestamps outside their MAC; operating limits are not measured; the OpenAI and GitHub integrations have never run against the real services. Migrations `0003` and `0005` must not be rolled out alongside older writers, and downgrading below them is not a production rollback ([production configuration](docs/operations/production-configuration.md) §6).
+Known limits (see guarantee card §3): audit events written before migration `0003` keep timestamps outside their MAC; no operating limit is published (the campaign figures from one development host are not limits); the OpenAI and GitHub integrations have run against the real services only in the 2026-11-17 validation pass, never in CI; the change-control read-back relies on a measured, not guaranteed, settle time for GitHub's issue listing. Migrations `0003` and `0005` must not be rolled out alongside older writers, and downgrading below them is not a production rollback ([production configuration](docs/operations/production-configuration.md) §6).
 
 ## What V1 still requires (not yet done)
 
 - A governed run on the **real OpenAI API** and a governed write against a **real GitHub sandbox repository** (both await owner gates).
-- **Measured operating limits** from a campaign on a real stack, the 20× chaos flake gate, PostgreSQL recovery objectives with a performed restore drill, and a LangGraph/Temporal/custom-glue comparison.
+- **Published operating limits** (the 2026-11-17 campaign figures await the owner's approval, U-006), a clean 20× chaos flake gate, PostgreSQL recovery objectives with a performed restore drill, and a LangGraph/Temporal/custom-glue comparison.
 - The owner decisions listed in the [scope delta](docs/product/tether-v1-scope-delta.md) §3.5.
 
 Full dispositions and owner decisions: [scope delta](docs/product/tether-v1-scope-delta.md). Plan: [`.claude/plans/tether-runtime.plan.md`](.claude/plans/tether-runtime.plan.md) §0.
@@ -93,7 +93,7 @@ Real JWTs for the dev workspace are minted with `tools/dev_issuer/mint.py` (keys
 
 ## Operating limits
 
-Tether V1 targets production-shaped correctness at a modest, measured scale on a single PostgreSQL instance. Limits (concurrency, latency, tool duration, lease and heartbeat behaviour) are not yet measured; the development defaults are listed in the guarantee card §3. While PostgreSQL is unavailable nothing progresses and nothing is lost; backup, restore and failover effects are described in [`docs/operations/postgres-recovery.md`](docs/operations/postgres-recovery.md). Tether does not claim hyperscale, multi-region operation, high availability, or exactly-once execution for APIs outside its idempotency contract.
+Tether V1 targets production-shaped correctness at a modest, measured scale on a single PostgreSQL instance. Limits (concurrency, latency, tool duration, lease and heartbeat behaviour) are not yet published; the development defaults are listed in the guarantee card §3. While PostgreSQL is unavailable nothing progresses and nothing is lost; backup, restore and failover effects are described in [`docs/operations/postgres-recovery.md`](docs/operations/postgres-recovery.md). Tether does not claim hyperscale, multi-region operation, high availability, or exactly-once execution for APIs outside its idempotency contract.
 
 ## Technical stack
 
