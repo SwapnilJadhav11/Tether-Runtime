@@ -24,7 +24,7 @@ It registers through the `tether.workloads` entry-point group, in the package's 
 flag_admin = "workloads.flag_admin:WORKLOAD"
 ```
 
-The entry-point name must equal `Workload.name`, and a bootstrap agent names the workload by that name (`agents: [{id: ..., workload: flag_admin}]`). The worker loads each workload an agent names at startup, and refuses to start if one is missing or does not provide a matching `Workload`. The API process does not load workloads. The workload must therefore be installed in the image that runs the worker.
+The entry-point name must equal `Workload.name`, and a bootstrap agent names the workload by that name (`agents: [{id: ..., workload: flag_admin}]`). Entry points are read from the installed package metadata, so after editing `pyproject.toml` run `uv sync` and rebuild the development image; the entry point must resolve to a module attribute named `WORKLOAD` (or whatever name you give after the colon) that is a `Workload`. The worker loads each workload an agent names at startup, and refuses to start if one is missing or does not provide a matching `Workload`. The API process does not load workloads. The workload must therefore be installed in the image that runs the worker.
 
 `Workload` rejects duplicate tool names, an agent that offers an unknown tool, and a `(name, version)` pair declared twice.
 
@@ -84,7 +84,7 @@ class RotateIn(BaseModel):
     new_token: Annotated[str, Sensitive]
 ```
 
-The handler receives the real value, and the call hash covers it. Everywhere else it is replaced with a mask before it is stored, audited, logged, or shown to an approver or the model: approvals, ledger outputs, audit payloads and inspection views. Masking happens at one choke point ([ADR-0017](../adr/0017-sensitive-data-masking-choke-point.md)). Tool authors mark fields; they do not mask by hand.
+The handler receives the real value, and the call hash covers it. Everywhere else it is replaced with a mask before it is stored, audited, logged, or shown to an approver or the model: approvals, ledger outputs, audit payloads and inspection views. Masking happens at one choke point ([ADR-0017](../adr/0017-sensitive-data-masking-choke-point.md)). Tool authors mark fields; they do not mask by hand. `Sensitive` must annotate the field itself, for example `Annotated[str | None, Sensitive]`. A `Sensitive` marker on an element type (`list[Annotated[str, Sensitive]]`) or inside one member of a union is not detected, and that value would not be masked.
 
 **`preconditions`.** For a write whose correctness depends on the state it was decided against. Name the input fields that carry that expectation (they must be required and have no default). Their names and values are bound into the approval, so the approver sees what the write assumes. **The target must enforce them atomically with the write**, and apply nothing on a mismatch. Tether never reads the target's current state. A read-then-write inside the handler is not a precondition. See `update_service_config` in `workloads/incident_remediation/tools.py`, which sends `expected_config_version` and treats the target's `409` as not applied.
 
@@ -144,7 +144,8 @@ Rules for a probe:
 - **Ask about this call.** Find the effect by the idempotency key or an equivalent marker, not by "something like it exists".
 - **Absence is weak evidence.** A target that is eventually consistent can fail to show a change that has applied. The change-control probe finds its marker in an issue listing as proof of `applied`, but concludes `not_applied` only after two complete listings 15 seconds apart both lack it. An incomplete listing, a non-`200` status, a configuration problem or any exception is `inconclusive`. When in doubt, answer `inconclusive`: a person resolves it, and a wrong `confirmed_not_applied` would let the run act on a write that did happen.
 - **It runs under policy.** The probe runs only if current policy allows the verify operation: the tool must not be `deny`, and the requester's and agent's permissions must cover the declaration's `required_permissions`. A probe needs read permissions only. The approval that authorized the write is not authority for it ([ADR-0022](../adr/0022-verify-operation-policy-mapping.md)).
-- **A person overrides.** If a person reconciles an entry while a probe is running, the person's decision wins.
+- **Persisted evidence only.** `confirmed_not_applied` must rest on a record the target keeps. Absence in a target that lost its state, or in an eventually consistent listing, is not proof: answer `inconclusive`.
+- **A verdict is final.** If a person reconciles an entry while a probe is running, the person's decision wins. Once a probe has resolved the entry, a person cannot override it afterwards: a later reconciliation is refused (`409`). A wrong `confirmed_*` answer therefore cannot be corrected through the API.
 
 A probe is bound by the tool's `timeout_seconds`; one that outlives it counts as inconclusive. The design is in [ADR-0019](../adr/0019-automatic-verification-of-unknown-outcomes.md).
 
@@ -263,7 +264,13 @@ async def _verify_set_flag(args: SetFlagIn, ctx: VerifyContext) -> VerificationR
     """Reads only: did a change with this key apply?"""
     async with _client() as http:
         response = await http.get(f"/flags/{args.flag}/changes/{ctx.idempotency_key}")
-    applied = response.json().get("applied") if response.status_code == 200 else None
+    applied = None
+    if response.status_code == 200:
+        try:
+            body = response.json()
+        except ValueError:  # not JSON: no evidence either way
+            body = None
+        applied = body.get("applied") if isinstance(body, dict) else None
     if not isinstance(applied, bool):
         return VerificationResult("inconclusive", FlagCheck(flag=args.flag, applied=None))
     evidence = FlagCheck(flag=args.flag, applied=applied)
@@ -351,7 +358,7 @@ async def test_the_idempotency_key_is_forwarded() -> None:
 
 Cover each row of the outcome table, the forwarded key, input rejection (unknown fields, bad patterns), and every answer the probe can give, including a non-`200` and a malformed body, both of which must be `inconclusive`. Reset the transport after each test (`set_transport(None)`) in a fixture.
 
-**2. Descriptor validation.** Assert that an invalid combination fails at construction (a write without `idempotency`, a precondition on a read, a `high`-risk tool offered under an `allow` rule), and that the workload loads by entry-point name.
+**2. Descriptor validation.** Assert that an invalid combination fails at construction (a write without `idempotency`, a precondition on a read), and that the workload loads by entry-point name. A `high`-risk tool under an `allow` rule is not a construction error: the worker's startup policy check refuses it, so test that against the bootstrap file with the startup check (see `test_t31_the_shipped_bootstrap_passes_the_worker_startup_checks` in `tests/integration/test_change_control_runs.py`).
 
 **3. A governed run.** `tests/integration/test_change_control_runs.py` shows the pattern: load the real bootstrap file, run a scripted scenario through a real `WorkerRuntime` on a test database, approve through the API, and assert on the ledger, the audit events and the number of requests the fake saw ("exactly one send"). It also shows the failure cases that matter for a write tool: a timeout leaves an `indeterminate` entry after exactly one request; a crash after dispatch sends no second request; a target rejection is a definite `not_applied`; a read-back resolves an unknown outcome without a person. [Testing](testing.md) covers how these suites run.
 

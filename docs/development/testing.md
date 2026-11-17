@@ -51,7 +51,9 @@ Never satisfy these by adding `ignore_imports` or by allowing indirect imports.
 cp deploy/compose/.env.example deploy/compose/.env
 ```
 
-The test database needs only three variables from that file: `TETHER_POSTGRES_PASSWORD`, `TETHER_MIGRATOR_DB_PASSWORD` and `TETHER_APP_DB_PASSWORD`. Any values will do. The test session sets `TETHER_ENV=test` and generates random audit and binding keys itself. `TETHER_TEST_PG_HOST` and `TETHER_TEST_PG_PORT` override the host and port (defaults `127.0.0.1` and `55432`).
+Commands on this page are written for bash. In PowerShell, use `Copy-Item deploy/compose/.env.example deploy/compose/.env`, `$env:NAME = "value"` to set a variable, and a backtick to continue a line.
+
+The test database needs only three variables from that file: `TETHER_POSTGRES_PASSWORD`, `TETHER_MIGRATOR_DB_PASSWORD` and `TETHER_APP_DB_PASSWORD`. Any values will do. The test session defaults `TETHER_ENV` to `test` (an existing value wins) and generates random audit and binding keys itself. `TETHER_TEST_PG_HOST` and `TETHER_TEST_PG_PORT` override the host and port (defaults `127.0.0.1` and `55432`).
 
 How a test gets its database:
 
@@ -108,7 +110,7 @@ To add a case:
 
 New guarantees add cases here. Do not replace the harness. Races such as an approval against a cancellation are repeated many times in one test (`test_chaos_races.py`) so a rare interleaving shows up.
 
-`uv run poe test-flake-gate` runs the chaos suite repeatedly (20 times by default) and reports every failing test; arguments pass through to `scripts/flake_gate.py`, for example `uv run python scripts/flake_gate.py -n 2 -t tests/chaos/test_chaos_heartbeats.py`. It is manual and not part of CI. The caller must hold the shared test database, as above.
+`uv run poe test-flake-gate` runs the chaos suite repeatedly (20 times by default) and reports every failing test. To choose the count or the target, run the script directly, for example `uv run python scripts/flake_gate.py -n 2 -t tests/chaos/test_chaos_heartbeats.py`. It is manual and not part of CI. The caller must hold the shared test database, as above.
 
 ## Load and kill harness
 
