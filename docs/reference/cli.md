@@ -187,11 +187,11 @@ Runs the HTTP API with uvicorn on `TETHER_API_HOST` and `TETHER_API_PORT` (defau
 
 ### `tether-worker`
 
-Runs the worker: it leases jobs, drives runs and executes tools. It takes the same variables as the API, and at startup it also loads every workload named by an agent in the bootstrap file and builds the configured model provider. It **refuses to start** when a configured workload is missing or broken, when a policy allows a high-risk tool, when an approval expiry is above the maximum, or when the provider is misconfigured (for example, `openai` without `TETHER_OPENAI_MODEL`). Invalid settings exit `2`. It stops cleanly on `SIGINT` and `SIGTERM`. While it is healthy it refreshes a heartbeat file on every poll.
+Runs the worker: it leases jobs, drives runs and executes tools. It takes the same variables as the API, and at startup it also loads every workload named by an agent in the bootstrap file and builds the configured model provider. It **refuses to start** when a configured workload is missing or broken, when a policy allows a high-risk tool, when an approval expiry is above the maximum, or when the provider is misconfigured (for example, `openai` without `TETHER_OPENAI_MODEL`). Invalid settings exit `2`. It stops cleanly on `SIGINT` and `SIGTERM`. While it can reach the database it refreshes a heartbeat file once per poll, between jobs.
 
 ### `tether-worker-healthcheck`
 
-A container healthcheck. It exits `0` if the worker's heartbeat file (`TETHER_WORKER_HEARTBEAT_FILE`) was updated within `TETHER_WORKER_HEARTBEAT_MAX_AGE_SECONDS` (default 30 seconds), and `1` otherwise. It loads the same settings as the worker, so it needs the same environment, and exits `2` if they are invalid. The file is touched only while the worker can reach the database, so a worker that has lost its database reports unhealthy.
+A container healthcheck. It exits `0` if the worker's heartbeat file (`TETHER_WORKER_HEARTBEAT_FILE`) was updated within `TETHER_WORKER_HEARTBEAT_MAX_AGE_SECONDS` (default 30 seconds), and `1` otherwise. It loads the same settings as the worker, so it needs the same environment, and exits `2` if they are invalid. The file is touched only between jobs and only while the worker can reach the database, so a worker that has lost its database reports unhealthy, and so does a healthy worker whose current job has run longer than the max age ([runbooks](../operations/runbooks.md#a-worker-that-will-not-start)).
 
 ## Related
 

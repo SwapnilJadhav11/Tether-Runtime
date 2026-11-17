@@ -89,11 +89,14 @@ Every outcome write records an **outcome class** alongside the state:
 | `unknown` | Tether cannot tell | None: everything after a dispatch that is neither of the above |
 | `failed` | A read returned output that violates its schema | Nothing can have changed at the target |
 
-**Only positive evidence is `not_applied`.** A timeout, a dropped connection, a `5xx`, a crash, an
+**When a send records its outcome, only positive evidence is `not_applied`.** A timeout, a dropped connection, a `5xx`, a crash, an
 unexpected status, an exception of any kind after dispatch: each is `unknown`, never `not_applied`
 and never "failed" in the sense of "did not happen". A tool raises `ToolNotApplied` only when the
 target has told it, with certainty, that nothing was applied, for example a `404` for an unknown
-service or a `409` from an atomic precondition check. Tether trusts that declaration.
+service or a `409` from an atomic precondition check. Tether trusts that declaration. A tool's
+declared read-back can later resolve an `indeterminate` entry as `verified_not_applied`; that
+verdict is the read-back's, may rest on absence, and is the tool author's responsibility
+([Unknown outcomes](unknown-outcomes.md#limits)).
 
 The model sees `applied` with the masked output, `not_applied` with the reason, or a typed `failed`
 result for a read that failed. It never sees a write whose outcome is unknown reported as failed: the
@@ -133,8 +136,9 @@ An unknown outcome is sent again only when that cannot duplicate an effect:
 | No replay divergence is recorded for the run | Yes |
 | The failure was not a schema-invalid output | Yes |
 
-A retry waits for a backoff delay first: uniform between zero and a ceiling of 0.5 seconds doubling
-per send, capped at 5 seconds. The job is released with that delay and picked up again. Before the
+A retry waits for a jittered backoff delay first
+([Execution and recovery](../architecture/execution-and-recovery.md#attempts-and-backoff)): the job
+is released with that delay and picked up again. Before the
 re-send, a committed `REDISPATCHED` record re-checks the stop, the budget and the replay divergence;
 the send happens only after that record commits.
 
