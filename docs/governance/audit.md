@@ -67,7 +67,7 @@ no arguments at all: `CALL_SKIPPED` records identifiers and the cause only, and 
 is recorded by its type, not its message. Some content is stored as given: free text supplied by
 people (an approval reason, a reconciliation justification); the requester's subject and roles in
 `RUN_SUBMITTED`; and, in `RUN_FINISHED`, the model's final text or, for a failed run, a summary that
-can include a model provider's error text. See
+can include Tether's message for a provider error (never the provider's response body). See
 [Secrets and data handling](../security/secrets-and-data-handling.md).
 
 ## The per-run HMAC chain

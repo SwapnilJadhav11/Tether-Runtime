@@ -268,7 +268,7 @@ Then recreate the containers with `uv run poe smoke`. There is no default model:
 
 - Logs: `docker compose -f deploy/compose/docker-compose.yml logs api worker`. They are JSON, one record per line.
 - Traces: open `http://localhost:16686`. A run is one trace across the API and the worker.
-- Metrics: `docker compose -f deploy/compose/docker-compose.yml logs otel-collector`. V1 prints metrics to the collector log and ships no dashboard.
+- Metrics: `docker compose -f deploy/compose/docker-compose.yml logs otel-collector`. The development stack prints metrics to the collector log and ships no dashboard.
 
 ## Stop the stack
 

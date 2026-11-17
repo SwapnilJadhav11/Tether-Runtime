@@ -1,100 +1,193 @@
 # Tether
 
-**A model-agnostic production agent harness for safely executing consequential actions against real systems.**
+Tether is a self-hostable, model-agnostic agent harness for executing consequential actions
+against real systems safely. Its thesis: **models are swappable; the runtime is the product.**
 
-Tether runs the agent loop, but that is not what it is for. Its job is the integrity boundary between an agent's intent and a real-world side effect:
+The model decides what it wants to do. Tether decides whether, how and under what guarantees that
+action may change the world.
 
-> The model decides what it wants to do. Tether decides whether, how, and under what guarantees that action is allowed to change the real world.
+## The problem
 
-Every consequential action passes along one governed path: identity → policy → exact-action human approval when required → authorization → dispatch → execution → outcome classification → retry/idempotency decision → verification or human reconciliation when the outcome is unknown → audit and reconstruction. Tether is self-hostable, built on LangGraph for graph mechanics and PostgreSQL as its only stateful dependency.
+An agent that only talks can be wrong cheaply. An agent that calls tools which restart services,
+create tickets or move money fails in ways an ordinary agent loop does not handle. A request
+times out and the loop retries it, so a non-idempotent write happens twice. A person approves
+"restart checkout", and the approval is used for a call with different arguments. A timeout is
+reported to the model as a failure, the model tries again, and the first attempt had in fact
+succeeded. A worker crashes between deciding to act and recording that it acted, and nobody can
+say afterwards whether the effect happened. Tether is built around these failures.
 
-> **Status (2026-11-17):** V1 is in progress. The baseline commit `ec35254` was hardened and CI-green; most of the remaining V1 implementation has since landed with automated tests (listed below), and on 2026-11-17 a final validation pass ran a governed workflow on the real OpenAI API, a governed write against a private GitHub sandbox, crash cases around both and a load campaign on the compose stack, once, on one development host (guarantee card §2; `docs/testing/strategy.md` §5.1). Still not done: a PostgreSQL restore drill, published operating limits, and a clean 20× flake gate (the one run passed 19 of 20 iterations; the failure spanned a host suspend). This README separates **what the guarantee card proves**, **what is implemented and tested but not yet accepted as a guarantee**, **what V1 still requires**, and **what is deferred**. Nothing in the "still requires" or "deferred" lists is current behaviour.
+## What makes it different
 
-## What Tether guarantees today
+Tether runs the agent loop, but its purpose is the boundary between an agent's intent and a
+side effect. Each item below is a mechanism, not a promise of good behaviour.
 
-The [guarantee card](docs/product/tether-v1-guarantees.md) is the authoritative list, with implementation points, tests and limitations for each entry. In short, at the baseline Tether proves with automated tests that:
+- **Ledger-first dispatch.** Before any byte leaves for a target, a ledger entry for that exact
+  call exists and its dispatch record has committed. Every send carries a deterministic
+  idempotency key; a non-idempotent write is never re-sent.
+- **Exact-call approvals.** An approval is bound to one call by an HMAC over the RFC 8785
+  canonical form of that call: workspace, run, agent, tool, pinned version and validated
+  arguments. The approver is never the requester, and current policy is checked again before
+  execution.
+- **Honest unknown outcomes.** A write whose result is unknown becomes `indeterminate`, never
+  "failed". A bounded, policy-authorized read-back or a person with a justification resolves it.
+- **Crash-safe execution.** A PostgreSQL job queue with leases, a per-run advisory lock and
+  fencing token, and audit events written in the same transaction as the state they describe.
+  The LangGraph checkpoint is only a progress cache, and every replay is hash-checked.
+- **A verifiable record.** Each run's audit events form an HMAC chain that `tether audit verify`
+  recomputes, and every run can be reconstructed from PostgreSQL alone.
 
-- no tool executes without a committed, current-policy authorization record and a committed dispatch record, in that order (G-1);
-- a non-idempotent write is sent at most once; an unknown outcome becomes `indeterminate`, is never reported as a failure, and is resolved by an eligible human with a justification, or (since W5.1, for a tool that declares a read-back) by an authorized, stop-gated verification that never re-sends the write (G-2, G-4; the verification part is P-4, below);
-- idempotent writes are re-sent only with the same deterministic key, within a bound, and never after a cancellation or deadline (G-3);
-- after a stop, no model call starts and no proposal is governed; a dispatched write is never recalled and an unknown outcome is never hidden behind a clean terminal status (G-5, G-6);
-- terminal run statuses never change (database-enforced), and at most one fenced run driver changes a run at a time (G-7, G-8);
-- a crash of the API or a worker right after any critical transaction commits, during a model call or with an idempotent write in flight loses no run and duplicates no idempotent write against a key-honouring target; hard-killing the real processes mid-run has the same result (G-9);
-- invalid credentials fail before any state change; out-of-scope resources return `404`; an approval binds the exact call through a keyed canonical hash, can be decided only by an eligible approver who is not the requester, once, while unexpired, and the worker dispatches only arguments whose hash equals the ledger's (G-11, G-12);
-- a replay never adopts a persisted decision, approval or ledger row recorded for a different call: the mismatch is audited as `REPLAY_DIVERGENCE` and the run fails closed after unresolved work drains (G-1, G-8);
-- critical audit events (decisions, skipped calls, approvals, dispatches, outcomes, reconciliations, stops, replay divergences, dead-letters and terminal status changes) are written inside the state-changing transaction and chained per run with HMAC, and every event written since migration `0003` also covers its timestamp; tool output and approval arguments pass through one masking function before they are persisted or audited, and secrets, payloads and arguments never reach logs, spans or metric labels (G-13, G-14).
+Tether is not a replacement for LangGraph or Temporal, a hosted service, a no-code builder, a
+multi-agent framework, a prompt-injection detector or a sandbox for untrusted tool code.
 
-## Implemented and tested, not yet in the guarantee card's §1 (2026-11-16)
+## Architecture at a glance
 
-These have code and passing automated tests; each enters the card's §1 only when the owner approves its wording (guarantee card §2 and §2.1):
+One image runs two processes, `api` and `worker`. PostgreSQL is the only stateful dependency.
+LangGraph provides graph mechanics; Tether's own tables are the record. One proposed tool call
+travels this path:
 
-- the TX5 re-check that refuses a changed call, a policy that now denies, or a lapsed approval before dispatch (P-16), and `Sensitive`-field masking through the ledger, approvals, audit, inspection and every other sink (P-17);
-- bounded **automatic verification** of unknown outcomes through a tool-declared safe read-back, with human reconciliation as the fallback and the human winning on conflict ([ADR-0019](docs/adr/0019-automatic-verification-of-unknown-outcomes.md), authorized per [ADR-0022](docs/adr/0022-verify-operation-policy-mapping.md); P-4);
-- **lease heartbeats** (P-5); a small explicit **repair/denial bound** (P-7); **per-tool approval expiry** with a default and a maximum, values awaiting owner confirmation (P-8);
-- the **approval operational API** (list, detail with masked arguments, approve, reject, approver run evidence), the auditor/admin run view, access events, `tether audit verify`, and the T-24 authorization matrix with a second workspace (P-9, P-10);
-- provider choice by configuration, bounded stop-gated provider retry and an **OpenAI** adapter, tested in CI against a mocked transport and run live once on 2026-11-17 (P-11);
-- a **second, unrelated workload** (repository change control) on the same kernel, tested in CI against a mocked GitHub transport and run live once against a sandbox on 2026-11-17 (P-12, P-13);
-- fail-closed production configuration: explicit `TETHER_ENV`, a `prod` image target without demo or dev components (P-14).
-
-Known limits (see guarantee card §3): audit events written before migration `0003` keep timestamps outside their MAC; no operating limit is published (the campaign figures from one development host are not limits); the OpenAI and GitHub integrations have run against the real services only in the 2026-11-17 validation pass, never in CI; the change-control read-back relies on a measured, not guaranteed, settle time for GitHub's issue listing. Migrations `0003` and `0005` must not be rolled out alongside older writers, and downgrading below them is not a production rollback ([production configuration](docs/operations/production-configuration.md) §6).
-
-## What V1 still requires (not yet done)
-
-- A governed run on the **real OpenAI API** and a governed write against a **real GitHub sandbox repository** (both await owner gates).
-- **Published operating limits** (the 2026-11-17 campaign figures await the owner's approval, U-006), a clean 20× chaos flake gate, PostgreSQL recovery objectives with a performed restore drill, and a LangGraph/Temporal/custom-glue comparison.
-- The owner decisions listed in the [scope delta](docs/product/tether-v1-scope-delta.md) §3.5.
-
-Full dispositions and owner decisions: [scope delta](docs/product/tether-v1-scope-delta.md). Plan: [`.claude/plans/tether-runtime.plan.md`](.claude/plans/tether-runtime.plan.md) §0.
-
-## Deferred and removed
-
-Deferred past V1: Ollama and automatic live provider failover (the design is kept in ADR-0016), dollar-cost estimates, an approval UI, per-workspace budgets, multi-workspace UX, a cross-run audit-query product, key-lifecycle automation, OIDC/JWKS, production service principals, Cedar/OPA, MCP, Kubernetes. Removed from V1: cross-workspace tool sharing, inline human override. Tether is not a RAG, memory, prompt-management, multi-agent or no-code product.
-
-## How a governed run works
-
-1. A calling app submits a task with a workspace API key and the end user's JWT. Identity is validated before anything else; the agent is resolved server-side from the key's bindings.
-2. The run driver asks the model for its next step through a provider-neutral boundary. Tool proposals are validated and evaluated by a deny-by-default policy under the workspace's active policy version: `allow`, `deny` or `require_approval`.
-3. `require_approval` pauses the run without holding compute. An eligible approver (never the requester) decides through the approvals API; the approval is bound to the exact call via a keyed canonical hash and expires.
-4. Before execution, current policy is re-evaluated; a deny overrides an approval. A ledger entry with a deterministic idempotency key is created, then `dispatched` is committed, then the worker calls the tool.
-5. The outcome is `applied`, `not_applied` (positive evidence only) or `unknown`. Unknown becomes `indeterminate`: never a false failure, never a blind re-send of a non-idempotent write. When the tool declares a safe read-back, a bounded, policy-authorized verification may resolve it first; otherwise, or when verification cannot establish the truth, a human reconciles it.
-6. Cancellation and deadlines stop new actions but never recall a dispatched write. Every step, decision, approval and outcome is reconstructable from PostgreSQL and the per-run HMAC audit chain.
-
-## Quick start (development stack)
-
-The Compose stack is a **development environment** (`TETHER_ENV=dev`): it uses the deterministic scripted model provider and a dev-only identity shortcut, neither of which is available in production.
-
-```bash
-# 1. Secrets for the dev stack live in the git-ignored deploy/compose/.env. Generate your own values; never commit them.
-#    Required keys: TETHER_POSTGRES_PASSWORD, TETHER_MIGRATOR_DB_PASSWORD, TETHER_APP_DB_PASSWORD,
-#                   TETHER_AUDIT_ACTIVE_KEY_ID, TETHER_AUDIT_KEY_<ID>, TETHER_BINDING_ACTIVE_KEY_ID, TETHER_BINDING_KEY_<ID>
-
-# 2. Build and start everything, wait until healthy
-uv run poe smoke
-
-# 3. Submit a scripted run and poll it to completion (human-started flow with the dev identity shortcut)
-uv run python scripts/smoke_submit.py
+```mermaid
+flowchart LR
+    P[Model proposes a tool call] --> D{Policy}
+    D -->|deny| R[Typed result to the model]
+    D -->|require_approval| A[Person approves the exact call]
+    D -->|allow| L[Re-check, then ledger entry]
+    A --> L
+    L --> S[Dispatch committed, then send]
+    S --> O{Outcome}
+    O -->|applied or not_applied| R
+    O -->|unknown| I[indeterminate]
+    I --> V[Read-back or a person resolves it]
+    V --> R
 ```
 
-Real JWTs for the dev workspace are minted with `tools/dev_issuer/mint.py` (keys live in the git-ignored `tools/dev_issuer/.keys/`); `config/bootstrap/dev.yaml` holds only public keys and API-key hashes. An automated, simulated flow is what the integration, authorization and chaos suites run: `uv run poe test-integration`, `uv run poe test-authz`, `uv run poe test-chaos` (Docker required). The production configuration guide, including the `prod` image target, is in [`docs/operations/production-configuration.md`](docs/operations/production-configuration.md). An OpenAI-driven run is selected with `TETHER_MODEL_PROVIDER=openai` ([model providers](docs/operations/model-providers.md)); it has not yet been run against the real API.
+- Each step that changes state commits in one PostgreSQL transaction together with its audit event.
+- The send happens only after the dispatch commit; jobs in the same database carry the work.
+- The model only ever receives typed results; it never reaches a tool directly.
+
+See the [architecture overview](docs/architecture/overview.md).
+
+## The lifecycle of a governed action
+
+1. A calling application submits a run with a workspace API key and the requester's token. The
+   workspace and agent come from the credentials, never from the request body.
+2. A worker leases the run's job, takes the run's advisory lock and fencing token, and asks the
+   model for its next step through a provider adapter.
+3. Each proposed tool call is validated against the tool's schema and decided by deny-by-default
+   policy from trusted inputs only: `allow`, `deny` or `require_approval`.
+4. For `require_approval`, the run waits without holding a process. An eligible approver, never
+   the requester, approves the exact call.
+5. Current policy and the approval are checked again. A ledger entry with a deterministic
+   idempotency key is created, and the dispatch is committed before the tool is called.
+6. The outcome is classified `applied`, `not_applied` or `unknown`. An unknown write becomes
+   `indeterminate` until a read-back or a reconciler settles it.
+7. Every decision, approval, dispatch and outcome is in the run's audit chain, written in the
+   same transaction as the change it records.
+
+## Guarantees
+
+The [guarantees page](docs/guarantees.md) states each one with its conditions and limits; the
+guarantee card it links to is authoritative. The most important, proven by automated tests:
+
+- No tool runs without a committed authorization record under the workspace's active policy
+  version and a committed dispatch record, in that order.
+- A non-idempotent write is sent at most once. Idempotent writes are re-sent only with the same
+  key, within a bound, and never after a cancellation or deadline.
+- An unknown outcome is never reported as a failure: the entry is `indeterminate`, and an
+  eligible reconciler, never the requester, resolves it with a justification.
+- An approval is bound to exactly the call it was given and decided only by an eligible approver
+  who is not the requester, once, before it expires.
+- A crash right after a critical commit, during a model call, or with an idempotent write in
+  flight loses no run and duplicates no idempotent write at a target that honours the key.
+- Critical audit events are written inside the state-changing transaction and HMAC-chained per
+  run; terminal run statuses never change.
+
+Some behaviour is implemented and tested but not yet stated as a guarantee: automatic
+verification of unknown outcomes, the policy re-check just before execution, lease heartbeats,
+end-to-end masking of sensitive fields, and the OpenAI adapter. Do not rely on those as
+guarantees yet.
+
+## Validation
+
+Each live proof below ran once, on one development host. None is part of CI, and no operating
+limit is published. Details are in [validation](docs/validation.md).
+
+| Evidence | Result |
+|---|---|
+| Automated suites | 1,498 tests passed in a local run on one development host (2 skipped and 4 deselected: the live tests, never run in CI). CI then passed on the same code. |
+| Live model run | The incident workflow ran end to end on the real OpenAI API (`gpt-4o-mini`) with real credentials: one approval-gated restart, applied once, with the approved call hash equal to the ledger's. |
+| Live external write | Against a private GitHub sandbox repository, a real-model run created exactly one issue after its approval. The test failed once first, exposing a defect that was then fixed. |
+| Crashes around live calls | Every worker hard-killed and restarted in three cases around model calls and three around the external write. Every model-call case finished with one approval and one restart; every write case produced one issue. The non-idempotent create was never sent twice; the two interrupted creates were resolved by the tool's read-back. |
+| Load, three workers | 300 scripted runs: all succeeded in 37 s. 300 scripted runs while every worker was killed and restarted nine times: all succeeded. 30 real-model runs: all succeeded in 33 s. No stuck run, dead job or duplicate effect. |
+| Audit verification | `tether audit verify` reported `VALID` for every run of the validation, across both MAC versions. |
+| Repeated chaos suite | 19 of 20 consecutive repetitions passed; the failure coincided with a host suspend. Not a clean 20 of 20. |
+
+Load times are batch drain times on one host, not per-run latency and not limits. No PostgreSQL
+restore drill has been performed.
+
+## Quick start
+
+You need Python 3.12, [uv](https://docs.astral.sh/uv/) and Docker with Compose v2.
+
+```bash
+uv sync --locked
+cp deploy/compose/.env.example deploy/compose/.env   # replace every value; never commit it
+uv run poe smoke                                     # build and start the development stack
+uv run python scripts/smoke_submit.py                # submit a run, approve it, print the result
+```
+
+The development stack runs with `TETHER_ENV=dev`, the scripted model provider and a development
+identity shortcut, none of which production accepts. [Getting started](docs/development/getting-started.md)
+explains each value in `.env` and repeats the run with real tokens and an API key.
+
+## An example workflow
+
+The incident-remediation reference workload asks the agent to fix a failing `checkout` service.
+The model reads the service's health (`get_service_health`, allowed by policy), then proposes
+`restart_service`, which policy sends for approval. The run waits in `awaiting_approval`. An
+approver lists pending approvals, sees the masked arguments and the call hash, and approves. The
+worker re-checks policy and the approval, records the ledger entry and the dispatch, and sends
+the restart once with its idempotency key. The run's audit chain then reads:
+
+```text
+RUN_SUBMITTED, POLICY_DECISION, EXECUTION_AUTHORIZED, DISPATCHED, TOOL_OUTCOME,
+POLICY_DECISION, APPROVAL_REQUESTED, APPROVAL_DECIDED, EXECUTION_AUTHORIZED,
+DISPATCHED, TOOL_OUTCOME, RUN_FINISHED
+```
+
+## Known limitations
+
+- Each live proof ran once, on one host, and is not part of CI; CI exercises the OpenAI adapter
+  and the GitHub client against mocked transports only.
+- No operating limit (concurrency, latency, throughput, tool duration) is published.
+- PostgreSQL is a single point of failure. No restore drill has been performed and recovery
+  objectives are not set.
+- Exactly-once is not claimed for arbitrary APIs. Idempotent re-sends rely on the target
+  honouring the idempotency key. Run submission itself is not deduplicated.
+- The audit chain detects modification and reordering within a run. It does not detect deletion
+  of a chain's tail together with its head, or of a whole run, and it is not WORM storage. Events
+  written before the MAC-version migration do not cover their timestamps.
+- Production runs require a human end-user token. There are no production service principals and
+  no OIDC or JWKS discovery.
+- A refusal at the re-check just before execution writes no audit event of its own.
+- Provider failover, Ollama, cost estimates, an approval UI, budgets, cross-run audit queries and
+  key-lifecycle automation are not implemented.
 
 ## Documentation
 
-| Topic | Where |
+| If you want to | Read |
 |---|---|
-| Product direction (accepted) | [`docs/product/tether-v1-direction-2026-11.md`](docs/product/tether-v1-direction-2026-11.md) |
-| Scope delta, traceability, owner decisions | [`docs/product/tether-v1-scope-delta.md`](docs/product/tether-v1-scope-delta.md) |
-| Guarantee card (proven vs planned) | [`docs/product/tether-v1-guarantees.md`](docs/product/tether-v1-guarantees.md) |
-| Requirements (PRD, revised 2026-11-09) | [`.claude/PRPs/prds/tether-runtime.prd.md`](.claude/PRPs/prds/tether-runtime.prd.md) |
-| Architecture decisions | [`docs/adr/README.md`](docs/adr/README.md) |
-| Architecture | [`docs/architecture/tether-v1-architecture.md`](docs/architecture/tether-v1-architecture.md) |
-| Implementation plan | [`.claude/plans/tether-runtime.plan.md`](.claude/plans/tether-runtime.plan.md) |
-| Test strategy and guarantee-to-test matrix | [`docs/testing/strategy.md`](docs/testing/strategy.md) |
-| Operations: PostgreSQL recovery, production configuration, key lifecycle | [`docs/operations/`](docs/operations/) |
+| Find your way around | [Documentation index](docs/README.md) |
+| Understand the design | [Architecture overview](docs/architecture/overview.md) |
+| Know what is guaranteed | [Guarantees](docs/guarantees.md) and [validation](docs/validation.md) |
+| Run and operate it | [Deployment](docs/operations/deployment.md) and [runbooks](docs/operations/runbooks.md) |
+| Write a tool | [Writing a tool](docs/development/writing-a-tool.md) |
+| Review its security | [Security model](docs/security/security-model.md) |
+| Contribute | [Contributing](CONTRIBUTING.md) |
 
-## Operating limits
+## Technology, status and licence
 
-Tether V1 targets production-shaped correctness at a modest, measured scale on a single PostgreSQL instance. Limits (concurrency, latency, tool duration, lease and heartbeat behaviour) are not yet published; the development defaults are listed in the guarantee card §3. While PostgreSQL is unavailable nothing progresses and nothing is lost; backup, restore and failover effects are described in [`docs/operations/postgres-recovery.md`](docs/operations/postgres-recovery.md). Tether does not claim hyperscale, multi-region operation, high availability, or exactly-once execution for APIs outside its idempotency contract.
+Python 3.12, FastAPI, Pydantic, LangGraph, PostgreSQL, OpenTelemetry and Docker.
 
-## Technical stack
-
-Python 3.12 · Pydantic v2 · FastAPI · LangGraph (exact pins; `durability="sync"`) · PostgreSQL 16 (state, ledger, audit chain, job queue, checkpoints) · OpenTelemetry · one image with `api` and `worker` entrypoints · Docker Compose for development.
+Tether is at its first functional version. No licence has been selected yet, so no rights to use
+or redistribute the code are granted. To report a vulnerability, see the
+[security policy](SECURITY.md).

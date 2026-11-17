@@ -40,7 +40,7 @@ This page documents every route of the Tether API: who may call it, what it acce
 
 ### `POST /v1/tasks/runs`
 
-Submit a run. The run row, its first audit event and its first job are written in one transaction; the response means the run is durably queued.
+Submit a run. The run row, its first audit event, its first `advance_run` job and its `run_deadline` timer job are written in one transaction; the response means the run is durably queued.
 
 | | |
 |---|---|

@@ -102,7 +102,7 @@ Do not run old and new writers across this migration at the same time. If an old
 
 - Events written before `0003` are version 1: valid as written, never re-MACed, and **their timestamps remain cryptographically uncovered**. There is no retroactive protection.
 - Deletion or truncation of a chain's tail, or of a whole run, remains outside the HMAC guarantee ([ADR-0015](../adr/0015-per-run-hmac-audit-and-authoritative-reconstruction.md) rule 8).
-- `tether audit verify --workspace <ws> --run <run-id>` recomputes one run's chain from the database (needs `TETHER_DATABASE_URL` and the audit keys in the environment; read-only). Exit codes: `0` VALID, `1` INVALID (stable reason code and first failing `seq`), `2` usage or configuration, `3` operational (database or audit key unavailable; never reported as INVALID), `4` NOT_FOUND (an unknown run and a run in another workspace look identical). It also checks that the persisted head names an existing event with the same MAC, which exposes deleting events while leaving the head alone. It does **not** detect deleting events *and* rewriting the head, or deleting the whole run. Chain validity is also exposed through run inspection. See [runbooks](runbooks.md#verifying-a-runs-audit-chain).
+- `tether audit verify` checks one run's chain, including both MAC versions, and its persisted head. What it detects, what it does not, and its exit codes are in [audit](../governance/audit.md#verifying-a-chain); the procedure is in [runbooks](runbooks.md#verifying-a-runs-audit-chain).
 - A refusal at the pre-dispatch re-check writes no audit event of its own.
 
 ### 6.4 Migration `0004` (ledger `outcome_class`) and migration `0005` (automatic verification)

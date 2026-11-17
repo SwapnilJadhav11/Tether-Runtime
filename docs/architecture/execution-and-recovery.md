@@ -129,7 +129,8 @@ another session holds the run's lock, the job cycles indefinitely without dead-l
 run shows `running`.
 
 A tool call that must be re-sent is released with a delay as its `run_after`: full jitter, ceiling
-0.5 s doubling per send, capped at 5 s. A verification probe that was inconclusive is released with
+0.5 s doubling per send, capped at 5 s. The run graph waits the same backoff between provider
+attempts within one model turn. A verification probe that was inconclusive is released with
 the backoff its tool declares. A handler that raises an unexpected error keeps its lease; the job is
 redelivered when the lease expires, and that delivery spends an attempt.
 

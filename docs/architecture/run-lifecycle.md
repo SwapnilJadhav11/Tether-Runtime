@@ -176,7 +176,7 @@ the `outcome_summary`.
 | Bound | Setting (development default) | What counts | When exceeded |
 |---|---|---|---|
 | Model turns | `TETHER_MAX_MODEL_TURNS` (8) | Successful model turns | Checked before the next model call: the run ends `failed`, summary `model turn budget exhausted`. |
-| Provider attempts | `TETHER_PROVIDER_MAX_ATTEMPTS` (3) | Attempts within one turn; only errors the adapter marks retryable are retried, with a jittered backoff (0.5 s base, doubling, 5 s cap) | A non-retryable error, or the last attempt failing, ends the run `failed` with summary `model call failed: ` followed by the provider error's text. |
+| Provider attempts | `TETHER_PROVIDER_MAX_ATTEMPTS` (3) | Attempts within one turn; only errors the adapter marks retryable are retried, with a jittered backoff ([Execution and recovery](execution-and-recovery.md#attempts-and-backoff)) | A non-retryable error, or the last attempt failing, ends the run `failed` with summary `model call failed: ` followed by Tether's message for the provider error, never the provider's response body. |
 | Repairs | `TETHER_MAX_REPAIRS` (3) | Invalid proposals: unknown or unoffered tool, invalid or unparseable arguments | One more than the bound ends the run `failed` with `repair_budget_exhausted`. |
 | Denials | `TETHER_MAX_DENIALS` (3) | Policy denials: a `deny` decision on a proposal, or current policy denying the call at the re-check before execution | One more than the bound ends the run `failed` with `denial_budget_exhausted`. |
 | Run deadline | `TETHER_RUN_MAX_DURATION_SECONDS` (3600) | Wall-clock time from submission, by the database clock | A stop: the run ends `timed_out` ([Stops](#stops)). |
