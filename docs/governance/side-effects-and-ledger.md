@@ -102,8 +102,8 @@ run waits instead. A write that reported success but returned output violating i
 an `output_invalid` marker.
 
 Any result other than `applied` ends the model turn: later calls the model proposed in the same turn
-are skipped, each with a `CALL_SKIPPED` event
-([ADR-0012](../adr/0012-sequential-multi-call-governance.md)).
+are skipped, each with a `CALL_SKIPPED` event, unless the run is ending because of a stop or an
+exhausted budget ([ADR-0012](../adr/0012-sequential-multi-call-governance.md)).
 
 ## Idempotency keys
 
@@ -152,6 +152,8 @@ budget is spent and the outcome is still unknown, the outcome is final: a write 
   flight, but no new send or re-send starts afterwards. An unknown outcome then becomes `indeterminate`
   for a write.
 - **A schema-invalid output.** It is a definite answer, not an unknown one.
+- **A `ValidationError` raised by a tool handler.** It is never retried. A write ends
+  `indeterminate` immediately, even with send budget left.
 
 Each send is bounded by the tool's `timeout_seconds` (default 10, at most 300). A timeout is always
 `unknown`. A send is never shortened to fit the run's deadline.

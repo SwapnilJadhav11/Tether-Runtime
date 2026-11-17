@@ -25,7 +25,7 @@ A decision takes these inputs, and nothing else ([ADR-0009](../adr/0009-policy-e
 | Requester | The subject and roles of the validated token that submitted the run, recorded on the run at submission and never changed |
 | Agent | The run's agent, bound by the workspace API key at submission |
 | Workspace | The run's workspace |
-| Tool metadata | The registered descriptor of the tool's pinned version: its name, version, effect, `risk` and `required_permissions` |
+| Tool metadata | The registered descriptor of the tool's pinned version: its name, version, effect, `risk` and `required_permissions`, and the `required_permissions` of its declared read-back, if any |
 | Call identity | The run, the step ordinal and the call hash |
 
 Model text, the model's stated rationale, raw arguments and tool output are never inputs. A model
@@ -67,7 +67,7 @@ event:
 
 A `deny` gives the model a typed `denied` result carrying the reasons. Any later calls in the same
 model turn are skipped (each with a `CALL_SKIPPED` event), and the model is called again with the
-results. A proposal for a tool that is not offered, or whose arguments do not validate, is not a policy
+results, unless the run is ending because of a stop or an exhausted budget. A proposal for a tool that is not offered, or whose arguments do not validate, is not a policy
 decision: it is recorded as `CALL_INVALID` and the model gets a typed `invalid` result. Repeated
 denials and invalid proposals are bounded: past the configured budgets (`TETHER_MAX_DENIALS`,
 `TETHER_MAX_REPAIRS`) the run ends `failed`. See [Run lifecycle](../architecture/run-lifecycle.md).
