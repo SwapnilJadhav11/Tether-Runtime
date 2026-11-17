@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = ROOT / "Dockerfile"
@@ -316,6 +317,23 @@ def test_t32_the_development_environment_is_named_explicitly_where_it_was_implie
     assert re.search(r"^env:\n\s+TETHER_ENV: test\s*$", workflow, re.MULTILINE)
     conftest = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
     assert 'os.environ.setdefault("TETHER_ENV", "test")' in conftest
+
+
+def test_t32_every_tether_service_in_the_compose_stack_names_its_environment() -> None:
+    """Each service that runs the Tether image starts a process that refuses to run without
+    ``TETHER_ENV`` (W7.1), including the one-shot ``migrate`` service, which has its own
+    environment block."""
+    compose = yaml.safe_load(
+        (ROOT / "deploy" / "compose" / "docker-compose.yml").read_text(encoding="utf-8")
+    )
+    tether_services = {
+        name: service
+        for name, service in compose["services"].items()
+        if service.get("image") == "tether-runtime:dev"
+    }
+    assert {"migrate", "api", "worker"} <= set(tether_services)
+    for name, service in tether_services.items():
+        assert service.get("environment", {}).get("TETHER_ENV") == "dev", name
 
 
 def test_t32_the_compose_stack_builds_the_dev_target_explicitly() -> None:

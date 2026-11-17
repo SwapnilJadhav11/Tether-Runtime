@@ -57,6 +57,8 @@ services:
     # Migrations, then the dev bootstrap (workspaces, agents, active policy version).
     command: ["sh", "-c", "tether migrate && tether bootstrap apply /app/config/bootstrap/dev.yaml"]
     environment:
+      # The CLI's database commands refuse to run without an explicit environment (W7.1).
+      TETHER_ENV: dev
       TETHER_MIGRATOR_DATABASE_URL: postgresql://tether_migrator:${TETHER_MIGRATOR_DB_PASSWORD}@postgres:5432/tether
     depends_on:
       postgres:
