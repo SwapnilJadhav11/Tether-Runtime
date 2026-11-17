@@ -13,7 +13,7 @@ WORKLOAD = Workload(
     name="flag_admin",
     tools=(set_flag, get_flag),
     agent=AgentDefinition(system_prompt="...", tools=("get_flag", "set_flag")),
-    retained_tools=(),   # earlier versions that must stay resolvable
+    retained_tools=(),  # earlier versions that must stay resolvable
 )
 ```
 
@@ -79,6 +79,7 @@ Declare `supported` only when the target really deduplicates by key. The guarant
 from typing import Annotated
 from tether.sdk import Sensitive
 
+
 class RotateIn(BaseModel):
     service: str
     new_token: Annotated[str, Sensitive]
@@ -122,11 +123,11 @@ A write may declare how to find out what happened after an unknown outcome:
 
 ```python
 VerifyDeclaration(
-    probe=_verify,                      # async (args, VerifyContext) -> VerificationResult
-    evidence_model=FlagCheck,           # Pydantic model; mark sensitive fields
+    probe=_verify,  # async (args, VerifyContext) -> VerificationResult
+    evidence_model=FlagCheck,  # Pydantic model; mark sensitive fields
     required_permissions=("flag:read",),
-    max_attempts=3,                     # default
-    backoff=VerifyBackoff(),            # base 1 s, x2, cap 30 s; the default
+    max_attempts=3,  # default
+    backoff=VerifyBackoff(),  # base 1 s, x2, cap 30 s; the default
 )
 ```
 
