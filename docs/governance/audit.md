@@ -14,9 +14,11 @@ critical event is appended **in the same database transaction** as the state cha
 fails, the transaction rolls back and the state change does not happen. There is no buffer and no
 asynchronous writer: the audit record is exactly as durable as the facts it describes.
 
-Because the dispatch record (`DISPATCHED`) commits before a tool is called, no side effect can
-happen without its event already being in the chain. The application database role may only insert
-audit events; it cannot update or delete them.
+Because the dispatch record (`DISPATCHED`) commits before a tool is called, no side effect sent
+through Tether's dispatch path happens without its event in the chain. The application database
+role may only insert audit events; it cannot update or delete them. Only audit and access events are
+insert-only, though: anyone holding the application role's database credential (including tool code
+running in the worker) can update approval, ledger, run, job and audit-head rows.
 
 ## What is audited
 
@@ -28,7 +30,7 @@ audit events; it cannot update or delete them.
 | | `REPLAY_DIVERGENCE` | A replay finds persisted state recorded for a different call; the run fails closed |
 | Governance | `POLICY_DECISION` | A proposal is decided; carries the decision, reasons, call hash, pinned tool version and policy version |
 | | `CALL_INVALID` | A proposal names a tool that is not offered, or its arguments do not validate |
-| | `CALL_SKIPPED` | A later call in the same model turn is skipped because an earlier one did not apply |
+| | `CALL_SKIPPED` | A later call in the same model turn is skipped because an earlier one did not apply, unless the run is ending because of a stop or an exhausted budget |
 | Approvals | `APPROVAL_REQUESTED` | An approval is created; carries the call hash and masked arguments |
 | | `APPROVAL_DECIDED` | An approver approves or rejects; actor is the approver |
 | | `APPROVAL_EXPIRED` | The expiry timer records a lapsed approval |
@@ -46,8 +48,10 @@ audit events; it cannot update or delete them.
 | | `CANCEL_REQUESTED` | A cancellation is recorded; actor is the person who cancelled |
 | | `DEADLINE_EXCEEDED` | The deadline timer records that the run's deadline passed |
 
-Verification events carry the actor `system:verification`. Every event records the tool it concerns,
-where there is one.
+Probe events (`VERIFICATION_ATTEMPTED`, `VERIFICATION_INCONCLUSIVE`, `VERIFIED`,
+`VERIFICATION_LATE`) carry the actor `system:verification`. `VERIFICATION_EXHAUSTED` and
+`VERIFICATION_SKIPPED` carry no actor. Every event records the tool it concerns, where there is
+one.
 
 Not audited: transitions between waiting statuses (`running`, `awaiting_approval`, `awaiting_tool`,
 `awaiting_reconciliation`), which no decision depends on; and a refusal at the re-check just before
@@ -60,16 +64,18 @@ An event's payload is stored as `payload_masked`, and only already-masked data m
 Arguments, precondition values, tool output and verification evidence pass through the masking
 function first, so a field a tool marks `Sensitive` never appears in an audit event. Some events carry
 no arguments at all: `CALL_SKIPPED` records identifiers and the cause only, and a probe exception
-is recorded by its type, not its message. Free text supplied by people (an approval reason, a
-reconciliation justification) is stored as given, and a failed run's summary in `RUN_FINISHED` can
-include a model provider's error text. See
+is recorded by its type, not its message. Some content is stored as given: free text supplied by
+people (an approval reason, a reconciliation justification); the requester's subject and roles in
+`RUN_SUBMITTED`; and, in `RUN_FINISHED`, the model's final text or, for a failed run, a summary that
+can include a model provider's error text. See
 [Secrets and data handling](../security/secrets-and-data-handling.md).
 
 ## The per-run HMAC chain
 
 Each event carries a MAC: HMAC-SHA-256, under an audit key, over the RFC 8785 canonical JSON of the
 event's fields, including the previous event's MAC. The events of one run therefore form a chain:
-changing, removing or reordering one event breaks every link after it.
+changing or reordering an event, or removing one from the middle, breaks the chain at that point.
+Removing the last events is caught only through the head check.
 
 | Field in the MAC record | MAC version 1 | MAC version 2 |
 |---|---|---|
@@ -125,14 +131,18 @@ mac_versions: 2
 | Exit code | Meaning |
 |---|---|
 | 0 | `VALID`: the chain recomputes and the head agrees |
-| 1 | `INVALID`, with a reason: `sequence_mismatch`, `prev_mac_mismatch`, `unsupported_mac_version`, `mac_mismatch` or `head_mismatch`, and the first failing sequence number |
+| 1 | `INVALID`, with a reason: `sequence_mismatch`, `prev_mac_mismatch`, `unsupported_mac_version`, `mac_mismatch` or `head_mismatch`, and, except for `head_mismatch`, the first failing sequence number |
 | 2 | Usage or configuration error; nothing was verified |
 | 3 | The database or an audit key was unavailable; nothing can be said about the chain |
 | 4 | `NOT_FOUND`: no such run in that workspace (another workspace's run is also `NOT_FOUND`) |
 
 The output carries identifiers, counts and codes only: never payloads, MACs, keys or connection
-details. Run inspection through the API also reports `audit_chain_valid`, which checks the chain but
-not the head.
+details.
+
+Run inspection through the API (the requester's view, the approver's run evidence and the ops run
+view) reports `audit_chain_valid`. It recomputes the chain only and does **not** check the persisted
+head, so removing a run's last events is invisible there; only `tether audit verify` compares the
+head.
 
 ### What verification detects
 
