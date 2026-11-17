@@ -9,10 +9,12 @@ Secrets reach Tether through the environment, through one interface, and nowhere
 | Secret | Read by | How it is loaded |
 |---|---|---|
 | `TETHER_DATABASE_URL` | `api`, `worker` | A `SecretStr` setting. Never rendered in a repr or dump. The URL and its password are registered with the log scrubber at startup. |
-| `TETHER_MIGRATOR_DATABASE_URL` | `tether migrate`, `tether bootstrap apply` | Used only by the one-shot commands, never by `api` or `worker`. |
+| `TETHER_MIGRATOR_DATABASE_URL` | `tether migrate`, `tether bootstrap apply` | Used only by the one-shot commands, never by `api` or `worker`. Not registered with the log scrubber. |
 | `TETHER_AUDIT_KEY_<ID>`, `TETHER_BINDING_KEY_<ID>` | `api`, `worker` | Through the key ring, which reads the secrets provider. Registered with the log scrubber on first load. |
 | `TETHER_OPENAI_API_KEY` | `worker` | Through the secrets provider only. It is deliberately not a setting, so it cannot reach a settings dump. The adapter registers it with the log scrubber. |
 | Workload credentials | The workload's tool code | Whatever the workload does. The change-control reference workload reads `CHANGE_CONTROL_GITHUB_TOKEN` directly from the process environment and puts it only in an `Authorization` header. It is outside the secrets provider and is not registered with the scrubber; only the `Bearer` shape in a log line would be caught. |
+
+Two settings decide where credentials are sent: `TETHER_OPENAI_BASE_URL` for the provider key, and `CHANGE_CONTROL_GITHUB_API_URL` for the GitHub token. Anyone who can set the process environment can redirect these credentials.
 
 The secrets provider (`src/tether/secrets/`) is the seam for a future secret manager. The only implementation reads a snapshot of the process environment taken at construction, and keeps **only** variables that start with `TETHER_`, so unrelated secrets in the environment never sit in the object. Rotating a secret needs a process restart.
 
@@ -31,7 +33,7 @@ Deployment rules that follow: keep real values out of any file in the repository
 
 Both are 32 random bytes in canonical base64url (unpadded or with its `=`). Any other spelling of the same bytes is rejected. A key ID is 1 to 32 characters of `A-Z` and `0-9`; uppercase only, because environment variable names are case-insensitive on Windows and lowercase IDs could silently alias. A missing, malformed or wrongly sized key raises an error and the operation fails closed: no decision, no dispatch, no audit event.
 
-**Why they are separate.** The call hash is shown to approvers, requesters and auditors next to the masked arguments. If it were a plain SHA-256 of the unmasked arguments, anyone who sees it could hash guesses and recover a low-entropy `Sensitive` value, which defeats masking. The hash is therefore an HMAC under a key that never sits in the database and that no viewer holds. That key is distinct from the audit key so that each secret has one purpose and a leak of one does not forge the other. See [ADR-0010](../adr/0010-keyed-canonical-call-hash.md).
+**Why they are separate.** The call hash is shown to approvers next to the masked arguments. If it were a plain SHA-256 of the unmasked arguments, anyone who sees it could hash guesses and recover a low-entropy `Sensitive` value, which defeats masking. The hash is therefore an HMAC under a key that never sits in the database and that no viewer holds. That key is distinct from the audit key so that each secret has one purpose and a leak of one does not forge the other. See [ADR-0010](../adr/0010-keyed-canonical-call-hash.md).
 
 Tether does not check at startup that the two families hold different material. Generate each key independently and keep them in separate entries.
 
@@ -62,7 +64,9 @@ class RotateCredentialInput(BaseModel):
     new_password: Annotated[str, Sensitive]
 ```
 
-Everything Tether persists, audits or shows passes through one function, `mask` in `src/tether/registry/masking.py`. It replaces each `Sensitive` field with `**********`, recursively through nested models, lists and dictionaries. A `Sensitive` field that holds a structure is replaced whole. There is one rule for every viewer; there are no field-level views ([ADR-0017](../adr/0017-sensitive-data-masking-choke-point.md)).
+Tool arguments and outputs stored in approval, ledger and audit rows, and shown in views, pass through one function, `mask` in `src/tether/registry/masking.py`. The exceptions are in the table below. It replaces each `Sensitive` field with `**********`, recursively through nested models, lists and dictionaries. A `Sensitive` field that holds a structure is replaced whole. There is one rule for every viewer; there are no field-level views ([ADR-0017](../adr/0017-sensitive-data-masking-choke-point.md)).
+
+`Sensitive` must annotate the field itself, for example `Annotated[str | None, Sensitive]`. `Sensitive` on an element type (such as `list[Annotated[str, Sensitive]]`) or inside a union member is not detected, and that data is stored and shown unmasked.
 
 The call hash is computed over the unmasked, validated arguments, so an approval binds the real value even though nobody sees it.
 
@@ -75,11 +79,12 @@ The call hash is computed over the unmasked, validated arguments, so an approval
 | Verification evidence | `ledger_entries.verification_evidence_masked` | Yes |
 | Validated arguments | The `execute_tool` job payload, which the worker needs to send the call | **No** |
 | The model's history and proposals | The LangGraph checkpoint (the `langgraph` schema) | **No** for what the model proposed; tool results in it are the masked ones |
-| Task input | `runs.task_input` | **No**: free text from the caller |
+| Task input | `runs.task_input`, stored as received, and the first message the model receives | **No**: free text from the caller |
+| A run's `outcome_summary` | `runs.outcome_summary`, returned in run views | **No**: the model's final text in a successful run; a Tether-authored reason, which can include a provider status code, in a failed one |
 | An approval reason and a reconciliation justification | The `APPROVAL_DECIDED` and `RECONCILED` audit payloads | **No**: free text from a person |
 | A tool's `ToolNotApplied` reason | `ledger_entries.outcome_reason`, and the result the model sees | **No**: text from the tool author |
 
-Unmasked arguments therefore exist in the job payload and the checkpoint, and Tether does not encrypt either at rest. Use storage-level encryption and restrict who can read the database. Nothing in a database reader's path is masked.
+Rows that hold unmasked data are listed above. Unmasked arguments exist in the job payload and the checkpoint, and Tether does not encrypt either at rest. Use storage-level encryption and restrict who can read the database. Nothing in a database reader's path is masked.
 
 A field the tool author does not mark is not masked. Mark every field that carries a credential, personal data or anything else that should not appear in an approval screen, a ledger row or a log. The reference workloads declare no `Sensitive` fields. Free-text fields (task input, reasons, justifications) are not masked, so do not put secrets in them.
 
@@ -89,7 +94,7 @@ If masking cannot complete because a model is malformed, `mask` raises. A write 
 
 | Viewer | Through | Sees |
 |---|---|---|
-| Requester | `GET /v1/tasks/runs/{run_id}` | Run status, approvals with masked arguments, ledger entries with masked outcomes and evidence, and a list of audit events (sequence, type, actor, tool, policy version) with whether the chain verifies. |
+| Requester | `GET /v1/tasks/runs/{run_id}` | Run status, approvals with masked arguments, ledger entries with masked outcomes and evidence, and a list of audit events (sequence, type, actor, tool, policy version) with `audit_chain_valid`, which recomputes the chain but does not check the persisted head. Use `tether audit verify` for that. |
 | Approver | Approval list, detail and run evidence | The tool, version, masked arguments and preconditions, call hash, requester, agent, expiry and decision. Not the model's rationale, the tool's risk or the task input. |
 | Auditor, workspace admin | `GET /v1/ops/runs/{run_id}` | The same view as the requester, for any run in the workspace. |
 
@@ -109,13 +114,13 @@ Telemetry is best effort. A failure in logging, tracing or export never blocks a
 
 **Logs** are JSON, correlated by `run_id`, `workspace_id`, `job_id`, `tool`, `trace_id` and `span_id`. Library records (the web server, the exporter, LangGraph) go through the same pipeline. Every record passes through redaction (`src/tether/observability/logging.py`):
 
-- keys named like payloads or credentials are dropped, including `payload`, `arguments`, `task_input`, `history`, `state`, `output`, `messages`, `body`, `headers`, `authorization`, `api_key`, `x-api-key`, `token`, `password` and `secret`;
+- top-level log fields named like payloads or credentials are dropped, including `payload`, `arguments`, `task_input`, `history`, `state`, `output`, `messages`, `body`, `headers`, `authorization`, `api_key`, `x-api-key`, `token`, `password` and `secret`;
 - registered secret values (the database URL and password, every audit and binding key that has been loaded, the provider API key) are replaced wherever they appear, including in exception text, if they are at least 8 characters;
 - bearer tokens, JWTs and Tether API keys are replaced by their shape;
 - tracebacks are rendered as text without local variables;
 - request-line logging by the HTTP client libraries is silenced, because a URL can carry tool arguments.
 
-The scrubber knows only registered values and these shapes. A secret that is neither, such as a workload credential outside the secrets provider, is not removed from a message that contains it. Do not log secrets from tool code.
+Nested fields and free-text messages are only pattern-scrubbed: dropping applies to top-level field names. The scrubber knows only registered values and these shapes. A secret that is neither, such as the migrator database URL or a workload credential outside the secrets provider, is not removed from a message that contains it. Do not log secrets from tool code.
 
 Graph state, job payloads, task input, arguments and outputs are never logged. Validation errors report field locations and error types, never the input values. Third-party agent tracing that would ship prompts and payloads to a hosted service is forced off.
 
@@ -140,7 +145,8 @@ The image runs as a non-root user, chooses neither its environment nor its boots
 - Unmasked arguments exist in the checkpoint and the job payload, and there is no encryption at rest in Tether.
 - Free-text fields are not masked.
 - The scrubber removes only registered values and known shapes.
-- No data-retention policy exists. The application database role has no `DELETE`, so nothing is removed.
+- No data-retention policy exists. The application database role has no `DELETE` on the `tether` schema tables, so nothing there is removed. It can delete from and update the `langgraph` checkpoint schema, which holds unmasked model proposals.
+- `Sensitive` on an element type or inside a union member is not detected.
 - Audit and binding key independence is not checked at startup.
 
 ## Related

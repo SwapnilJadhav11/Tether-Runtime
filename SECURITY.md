@@ -35,7 +35,15 @@ Use synthetic data. Do not include real credentials, tokens, API keys or private
 - Development-only tooling: the development token issuer in `tools/dev_issuer/`, the development Compose stack, and the `dev` image variant.
 - The development identity shortcut when `TETHER_ENV` is `dev` or `test`. It exists to make development easy and is refused when `TETHER_ENV` is `prod`. A way to use it in `prod` is in scope.
 - Weaknesses in a third-party service a tool calls, in PostgreSQL, in LangGraph, or in a model provider. Report those to their maintainers.
-- Behaviour the security model lists as not defended, such as prompt injection detection, a compromised database administrator or key holder, and untrusted tool code. A report that shows one of these limits is wider than documented is welcome.
+- Documented limits, which the security model lists as not defended:
+  - prompt injection detection, a compromised database administrator or key holder, and untrusted tool code;
+  - rate limiting and TLS termination, which the deployment provides;
+  - replay and revocation of bearer tokens;
+  - removal of the end of an audit chain by someone who also rewrites its persisted head;
+  - unmasked arguments in job payloads and checkpoints, and fields a tool author did not mark `Sensitive`;
+  - OIDC or JWKS discovery, and production service principals, which do not exist.
+
+  A report that shows one of these limits is wider than documented is welcome.
 
 ## Licence
 
