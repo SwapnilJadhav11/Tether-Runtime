@@ -37,7 +37,8 @@ Messages worth knowing:
 | Level | Message | Meaning |
 |---|---|---|
 | warning | `lease lost: handler aborted` | A worker lost a job's lease (field `reason`: `lost` or `unreachable`) and abandoned the delivery |
-| warning | `run dead-lettered` | A job exhausted its deliveries; the run was moved to `failed` or held |
+| warning | `run dead-lettered` | An `advance_run` job exhausted its deliveries; the run was moved to `failed` or held |
+| warning | `job dead-lettered` | An `execute_tool` job exhausted its deliveries; the ledger entry's outcome was recorded |
 | warning | `tool outcome indeterminate` | A write's outcome is unknown |
 | warning | `tool outcome unknown; retry scheduled` | A send will be repeated with the same idempotency key |
 | warning | `verification ended; reconciliation required` | Automatic verification gave up; a person must resolve the entry |
@@ -99,7 +100,9 @@ Metrics are exported over OTLP/HTTP every `TETHER_OTEL_METRIC_INTERVAL_SECONDS` 
 | `tether.model.call.duration` | histogram | `provider`, `outcome` (`succeeded`, `failed`) | One provider attempt |
 | `tether.access_events.dropped` | counter | none | Access events (who inspected which run) that were not recorded |
 
-The queue-depth gauge is a queue-wide snapshot, and every worker reports the same one. Combine workers with `max`, not `sum`. If the gauge disappears, no worker is running.
+The API also exports FastAPI's own HTTP server metrics (method, route template and status), which are not listed above.
+
+The queue-depth gauge is a queue-wide snapshot, and every worker reports the same one. Combine workers with `max`, not `sum`. The gauge reports only the (`kind`, `state`) groups that currently have rows, so an idle system reports nothing: treat a missing series as 0. Absence means either an empty queue or no worker sampling it, so it cannot tell you a worker is down. Alert on worker health (`tether-worker-healthcheck`) for that.
 
 ### What to alert on
 
@@ -107,12 +110,12 @@ Tether publishes no thresholds, because none have been measured for your workloa
 
 | Signal | Why it matters |
 |---|---|
-| `tether.jobs.dead_lettered` above zero | A job used all its deliveries. The run is `failed` with `system_error`, or held in `awaiting_reconciliation` if a ledger entry is unresolved. This is never normal. Follow [a dead job](runbooks.md#a-dead-job). |
+| `tether.jobs.dead_lettered` above zero | A job used all its deliveries. This is never normal. What it means depends on the kind: an `advance_run` job logs `run dead-lettered`, writes a `DEAD_LETTERED` audit event and ends the run `failed` with `system_error` (or holds it in `awaiting_reconciliation` if a ledger entry is unresolved); an `execute_tool` job logs `job dead-lettered` and records the ledger outcome (`TOOL_OUTCOME`) with no `DEAD_LETTERED` event; `verify_outcome` and the timers log nothing and appear only in this counter. Follow [a dead job](runbooks.md#a-dead-job). |
 | `tether.ledger.indeterminate` above zero | A write's outcome is unknown. Automatic verification may resolve it, but you want to know that it happened. |
 | `tether.verifications` with `result=exhausted` above zero | Verification gave up. A person must establish the truth and reconcile, and the run is waiting. |
 | Runs in `awaiting_reconciliation` (no metric reports this; query `tether.runs` for the status) | A run is parked until a person acts. |
 | `tether.jobs.queued` with `state=due` growing, or high `tether.job.pickup_latency` | Workers are saturated, stopped, or cannot reach the database. |
-| `tether.jobs.queued` absent | No worker is sampling the queue. |
+| Worker container health failing | The worker's heartbeat is stale: the database is unreachable, or one job has outlasted the heartbeat max age. A missing `tether.jobs.queued` series is not a reliable signal. |
 | `tether.jobs.lease_lost` above zero | A worker lost a lease: database trouble, or a worker too starved to heartbeat. The ledger rules keep this safe, but it signals instability. |
 | `tether.runs.finished` with `status` `failed` or `timed_out` rising | Provider trouble, budgets exhausted, or deadlines too tight. |
 | `tether.model.call.duration` with `outcome=failed` rising | Provider outage, credential problem or rate limiting. |

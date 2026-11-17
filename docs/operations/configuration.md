@@ -4,7 +4,7 @@ The complete reference for configuring Tether: every environment variable, the b
 
 Tether has no admin HTTP API ([ADR-0014](../adr/0014-bootstrap-config-no-admin-api.md)). Two things configure it: environment variables, read at process start, and one reviewed YAML file, the bootstrap file, applied to PostgreSQL with `tether bootstrap apply`. Nothing is reloaded while a process runs: change the environment or the file, then restart.
 
-A missing or invalid required setting stops the process with exit code 2 and a message that names the variable and never its value.
+A missing or invalid required setting stops the process with exit code 2 and a message that names the variable and never its value. That is the only refusal with exit code 2. Other start-up refusals in the worker (an unknown workload, a policy that allows a high-risk tool, an approval expiry above the maximum, a model provider that is misconfigured) are uncaught errors: a traceback and exit code 1. The API builds no model provider and runs none of those checks, so it can start while the worker refuses. An unreadable or invalid bootstrap file stops both. See [runbooks](runbooks.md#a-worker-that-will-not-start).
 
 ## Environment and identity
 
@@ -40,7 +40,7 @@ Provider behaviour and credential handling are in [model providers](model-provid
 | `TETHER_OPENAI_BASE_URL` | `https://api.openai.com/v1` | No | For a proxy or an OpenAI-compatible gateway. |
 | `TETHER_OPENAI_TIMEOUT_SECONDS` | `60.0` | No | Upper bound on one model call. Must be positive. |
 | `TETHER_PROVIDER_MAX_ATTEMPTS` | `3` | No | Provider attempts per model turn, retries included. Must be positive. |
-| `TETHER_SCENARIOS_DIR` | `scenarios` | `dev`/`test` with `scripted` | Directory of scenario files for the scripted provider. Must not be set in `prod`; the `prod` image contains none. |
+| `TETHER_SCENARIOS_DIR` | `scenarios` | `dev`/`test` with `scripted` | Directory of scenario files for the scripted provider. The default is relative to the working directory, which is `/tmp` in the images, so the `dev` image needs `TETHER_SCENARIOS_DIR=/app/scenarios` (the Compose stack sets it). Leave it unset in `prod`: the `prod` image contains no scenarios and the OpenAI provider ignores it. This is a checklist item; startup does not enforce it. |
 
 ## Run limits
 
@@ -66,7 +66,7 @@ Provider behaviour and credential handling are in [model providers](model-provid
 | `TETHER_WORKER_LEASE_SECONDS` | `60.0` | No | How long a leased job stays invisible to other workers before it can be reclaimed. Must be positive. |
 | `TETHER_WORKER_LEASE_HEARTBEAT_SECONDS` | unset (lease / 3) | No | How often a worker extends the lease of the job it is processing. Must be positive and below the lease, or start-up fails. |
 | `TETHER_WORKER_HEARTBEAT_FILE` | `tether-worker.heartbeat` in the system temporary directory | No | File the worker touches each poll while the database is reachable. |
-| `TETHER_WORKER_HEARTBEAT_MAX_AGE_SECONDS` | `30.0` | No | `tether-worker-healthcheck` exits 1 when the file is older than this. |
+| `TETHER_WORKER_HEARTBEAT_MAX_AGE_SECONDS` | `30.0` | No | `tether-worker-healthcheck` exits 1 when the file is older than this. The worker touches the file only between jobs, so set this above the longest single job you expect (a model call can take up to `TETHER_OPENAI_TIMEOUT_SECONDS`, a tool up to its timeout, at most 300 s), or a healthy worker is reported unhealthy mid-job. |
 
 Retry and delivery limits are not settings. A job is delivered at most 8 times for `advance_run`, 5 for `execute_tool` and `verify_outcome`, and 10 for the two timers. See [execution and recovery](../architecture/execution-and-recovery.md).
 
@@ -101,7 +101,7 @@ Read by the workload's own tools, not by Tether's settings.
 | Variable | Default | Workload | Meaning |
 |---|---|---|---|
 | `CHANGE_CONTROL_GITHUB_REPO` | none | change control | Target repository as `owner/name`. |
-| `CHANGE_CONTROL_GITHUB_TOKEN` | none | change control | GitHub credential. Treated as a secret and never logged. |
+| `CHANGE_CONTROL_GITHUB_TOKEN` | none | change control | GitHub credential. Never logged by the workload; unlike the provider key it is not registered with the log scrubber, so do not put it anywhere that could reach a log line. |
 | `CHANGE_CONTROL_GITHUB_API_URL` | GitHub's public API | change control | For GitHub Enterprise or tests. |
 | `DEMO_TARGET_URL` | `http://demo-target:8000` | incident remediation (`dev` image only) | Base URL of the demo target service. |
 
@@ -138,7 +138,7 @@ Field rules:
 | `issuers[].audiences` | One or more of `tether-tasks`, `tether-approvals`, `tether-ops`. A token's audience must also match its route. |
 | `issuers[].algorithm` | `EdDSA` (default) or `RS256`. Every key must match it. |
 | `issuers[].public_keys` | Map of `kid` to PEM public key. Private key material is rejected. Tokens name their key in the `kid` header. |
-| `api_keys[].key_id` | Lower-case letters, digits and `-`, up to 63 characters. Unique, and owned by one workspace. |
+| `api_keys[].key_id` | Starts with a lower-case letter or digit, then lower-case letters, digits and `-`; up to 63 characters. Unique, and owned by one workspace. |
 | `api_keys[].salt` | 32 lower-case hex characters. |
 | `api_keys[].secret_hash` | 64 lower-case hex characters (SHA-256). |
 | `api_keys[].agents` | Agents declared in the same workspace. |
@@ -224,7 +224,7 @@ It prints the raw key once (`tak_<key_id>_<secret>`), then a `key_id`, `salt`, `
 tether bootstrap apply /etc/tether/bootstrap.yaml
 ```
 
-It runs as the migrator role and needs `TETHER_ENV` and `TETHER_MIGRATOR_DATABASE_URL`. It validates the file, checks approval expiries against the limits in its own environment, and writes everything in one transaction: all or nothing. A validation failure exits 1 with `invalid bootstrap file: ...` or `approval expiry refused: ...` and writes nothing. Re-applying an unchanged file changes nothing.
+It runs as the migrator role and needs `TETHER_ENV` and `TETHER_MIGRATOR_DATABASE_URL`. It validates the file, checks approval expiries against the limits in its own environment, and writes everything in one transaction: all or nothing. A validation failure exits 1 with `invalid bootstrap file: ...` or `approval expiry refused: ...` and writes nothing. A missing `TETHER_MIGRATOR_DATABASE_URL` exits 2. An API key whose `key_id` already belongs to another workspace is detected while writing: the command raises with a traceback, exits 1 and the transaction rolls back. Re-applying an unchanged file changes nothing.
 
 For each workspace in the file, applying:
 
