@@ -31,7 +31,7 @@ A token issued for one audience is refused on another. A person who holds approv
 
 ## How a token is validated
 
-Validation runs before the handler. Any failure is `401` and nothing is evaluated or written. The checks, in order (`src/tether/identity/jwt.py`):
+Validation runs before the handler. Credential failures are `401`; a malformed `dev_identity`, `agent_id` or `dev_workspace_id` value can yield `422` first. Nothing is evaluated or written either way. The checks, in order (`src/tether/identity/jwt.py`):
 
 1. The token parses, and its header carries `alg` and a string `kid`. Only `EdDSA` and `RS256` are accepted. `none` and HMAC algorithms are never accepted.
 2. The unverified payload names a non-empty `workspace` and a string `iss`. These claims are used only to choose which issuer record to load. Nothing is trusted yet.
@@ -109,11 +109,11 @@ Four roles are fixed by name in the core. The requester is not a role: it is who
 Approval and reconciliation are authorized in two steps, both against roles in the validated token:
 
 1. **The core role.** The token must carry `approver` or `reconciler`. This is fixed in code.
-2. **The policy rule.** Under the workspace's active policy version, a role of the person must be named by the matching rule (`approver_roles`) or by `reconciliation.reconciler_roles`, and the person must not be the run's requester. The subject comparison is by `sub`, so the issuer must give each person a stable, unique subject.
+2. **The policy rule.** Under the workspace's active policy version, a role of the person must be named by the matching rule (`approver_roles`) or by `reconciliation.reconciler_roles`, and the person must not be the run's requester. The requester and the approver or reconciler are compared by `sub` alone, across issuers. Every issuer must use one shared, unique subject namespace for each person. If the tasks and approvals issuers name a person differently, the self-approval and self-reconciliation checks do not apply to that person.
 
 A person with only a custom role such as `senior-approver` fails step 1, whatever the policy says. The policy that defines these rules is in [policy](../governance/policy.md), the approval mechanics in [approvals](../governance/approvals.md) and reconciliation in [unknown outcomes](../governance/unknown-outcomes.md).
 
-If the process's loaded policy version differs from the workspace's active version, the human routes answer `503` ("policy is reloading") and change nothing.
+If the process's loaded policy version differs from the workspace's active version, the human routes answer `503` ("policy is reloading") and change nothing. This check comes before the eligibility check, so a holder of the core role learns that the policy is reloading even if they would be ineligible.
 
 Run views are read-only and return masked data. Inspecting a run through the approvals audience (run evidence) or the ops audience (the oversight view) also writes an access event. Access events are best effort; see [secrets and data handling](secrets-and-data-handling.md#what-a-person-can-see).
 
@@ -134,13 +134,13 @@ flowchart TD
 
 | Status | Meaning here |
 |---|---|
-| `401` | Missing, malformed or invalid credentials, a wrong audience, an agent outside the key's binding, or the development shortcut used in `prod`. Raised before the handler. |
+| `401` | Missing, malformed or invalid credentials, a wrong audience, an agent outside the key's binding, or the development shortcut used in `prod`. Raised before the handler. A malformed body or query value can produce `422` before this check. |
 | `404` | The resource does not exist **for this caller**: unknown id, another workspace, a missing role, an ineligible approver or reconciler (including the requester), or a run that belongs to another requester. |
 | `409` | The caller is eligible but the state forbids the action: an approval that is no longer pending, closed or expired; a run that is stopped or terminal; a ledger entry resolved with a different outcome. |
 | `422` | The request is malformed: an unknown outcome, a missing justification, an ambiguous agent. |
 | `503` | The policy version is reloading. |
 
-The code returns no `403`. A `403` would confirm that a resource exists. Eligibility is checked before state, so an ineligible caller learns nothing about a resource's state through `409`.
+The application's handlers return no `403`. A `403` would confirm that a resource exists. Eligibility is checked before state, so an ineligible caller learns nothing about a resource's state through `409`.
 
 An approval decision, as an approver would send it (illustrative):
 
@@ -158,15 +158,15 @@ Content-Type: application/json
 
 ## Workspace isolation
 
-Isolation is enforced in the data-access layer, not by convention in each handler.
+Isolation is enforced in the data-access layer: a handler supplies the scope but cannot omit it.
 
 - Handlers never receive a raw database session. They receive repositories that cannot be constructed without a `WorkspaceScope` taken from the principal's workspace.
 - Every read is filtered by that workspace. Every write is stamped with it, and a write for another workspace raises an error.
 - The worker derives its scope from the job and checks it against the run's workspace.
 - Composite foreign keys in the schema stop a child row from referencing a run in another workspace.
-- The only unscoped queries are the credential lookups that establish the workspace (issuer by workspace and `iss`, API key by key ID) and the worker's job lease.
+- The unscoped paths are the credential lookups that establish the workspace (issuer by workspace and `iss`, API key by key ID), the worker's queue queries and the LangGraph checkpoints.
 
-PostgreSQL row-level security is not used, so the scoped repositories and the composite keys are the whole defence. See [ADR-0013](../adr/0013-identity-trust-boundary-workspace-isolation.md) and [data model](../architecture/data-model.md).
+PostgreSQL row-level security is not used. Repositories cannot be built without a scope and filter every query by it. Each handler builds that scope from the validated principal. A handler that built the wrong scope would bypass isolation; the route-inventory test and the authorization matrix cover the existing routes. The LangGraph checkpoints are keyed by run and are not workspace-scoped; request handlers never read them. See [ADR-0013](../adr/0013-identity-trust-boundary-workspace-isolation.md) and [data model](../architecture/data-model.md).
 
 ## The development identity shortcut
 
