@@ -12,7 +12,10 @@ do; Tether decides whether, how and under what guarantees that action may change
 Every consequential action crosses one governed path: identity, policy, exact-action human
 approval when policy requires it, authorization against current policy, dispatch, execution,
 outcome classification, a retry or idempotency decision, verification or human reconciliation
-when the outcome is unknown, and audit. Nothing in the system reaches a tool any other way.
+when the outcome is unknown, and audit. Every tool call reaches a tool through this path. The one
+other contact with a target is the declared read-back probe for an unknown outcome. The tool author
+declares it read-only, policy authorizes it separately, and it is gated on stop
+([Unknown outcomes](../governance/unknown-outcomes.md)).
 
 ## Processes and the store
 
@@ -26,18 +29,27 @@ flowchart LR
     W[worker, one or more] -->|lease jobs, transactions| P
     W -->|model calls| M[Model provider]
     W -->|tool calls| T[Target systems]
-    O[tether CLI: migrate, bootstrap, apikey, audit] --> P
+    O[tether CLI: migrate, bootstrap apply, audit verify] --> P
 ```
+
+The `tether` CLI's `migrate`, `bootstrap apply` and `audit verify` commands connect to PostgreSQL.
+`tether apikey new` never does: it only prints a new key and its bootstrap entry.
 
 | Process | What it does | What it never does |
 |---|---|---|
 | `api` | Authenticates the request, authorizes it against the route's audience and the caller's workspace, records intent in one transaction (a run submission, an approval decision, a reconciliation, a cancellation) and enqueues a job in that same transaction. Serves run inspection. | Run graph nodes, call a model, execute a tool. |
-| `worker` | Leases jobs from the queue and runs them: driving a run through its graph (model calls, policy, approvals), executing tools, verifying unknown outcomes, and firing timers. Scales by adding replicas. | Accept HTTP requests. |
+| `worker` | Leases jobs from the queue and runs them: driving a run through its graph (model calls, policy, approvals), executing tools, verifying unknown outcomes, and firing timers. A worker process runs one job at a time: an `advance_run` job holds it for the model call, including provider backoff, and a tool job for the send. Throughput scales with the number of worker processes. | Accept HTTP requests. |
 | `tether migrate` | Applies the `tether` schema migrations and creates the LangGraph checkpoint tables, as the migrator database role. Idempotent. | Run at the same time as an older `api` or `worker` across a schema change (see [Data model](data-model.md#migrations)). |
 
 Both long-running processes are stateless. Every fact that matters is in PostgreSQL, so either
 process can be killed at any instruction and restarted; [Execution and
 recovery](execution-and-recovery.md) shows what happens at each point.
+
+Each `api` and `worker` process loads the bootstrap file, and with it the policy, once at startup.
+Changing policy therefore means running `tether bootstrap apply` and then restarting every process.
+Until a process restarts, its loaded policy is stale and it decides nothing: the approval and
+reconciliation routes return `503`, and workers release runs without deciding
+([Configuration](../operations/configuration.md)).
 
 **Why PostgreSQL is the only stateful dependency** ([ADR-0001](../adr/0001-two-process-topology-postgres-only.md)).
 Tether's core safety argument is that no side effect happens without a committed policy decision,
@@ -68,8 +80,11 @@ Tether builds on LangGraph for graph mechanics and does not reimplement them
 | Replay of a node after a crash | Making replay safe: create-or-get by deterministic key, with a call-hash check |
 
 The rule is short: **LangGraph decides where the graph is; Tether tables decide what has happened
-in the world.** The checkpoint is a progress cache. No side-effect decision reads it, the API never
-reads it, and Tether never writes the `langgraph` schema directly. Run inspection reads only
+in the world.** The checkpoint is a progress cache. It supplies only the graph's position and the
+model's proposals. Whether a decision, approval or ledger entry exists, and what it says, is read
+from Tether tables, and every reuse of a persisted row is checked against the hash of the
+checkpoint's call. The API never reads checkpoints, and Tether never writes the `langgraph` schema
+directly. Run inspection reads only
 Tether tables. The run graph is invoked with synchronous durability, so each step's checkpoint is
 durable before the next node can create an authoritative row. [Run lifecycle](run-lifecycle.md)
 describes the graph and its replay rules.
@@ -100,8 +115,10 @@ provider and the scenario files ([Deployment](../operations/deployment.md)).
 ## The path of one consequential action
 
 The diagram follows a run whose model proposes one write that policy says needs approval. Every
-arrow into PostgreSQL is one transaction, and every such transaction writes its audit event in the
-same commit as the state it describes.
+arrow that changes governed state is one transaction and writes its audit event in the same
+commit. Leasing a job, the driver's claim of the run and waiting statuses are separate
+transactions and are not audited; the lease of `execute_tool` and its dispatch commit are drawn as
+one arrow but are two transactions.
 
 ```mermaid
 sequenceDiagram
@@ -157,9 +174,10 @@ sequenceDiagram
    `DISPATCHED` event **before** the external call. It then calls the tool's handler under the
    tool's timeout.
 7. **Outcome.** The result is masked and classified (`applied`, `not_applied`, `unknown` or
-   `failed`) and committed with `TOOL_OUTCOME` and a wake job. An unknown write outcome becomes
-   `indeterminate`; it is resolved by automatic verification if the tool declares a read-back,
-   otherwise by a person ([Side effects and the ledger](../governance/side-effects-and-ledger.md),
+   `failed`) and committed with `TOOL_OUTCOME` and a wake job. An unknown outcome is re-sent with
+   the same key if the call is a read or an idempotent write, its send budget is not spent, and no
+   stop is active. Otherwise a write becomes `indeterminate`; it is resolved by automatic
+   verification if the tool declares a read-back, otherwise by a person ([Side effects and the ledger](../governance/side-effects-and-ledger.md),
    [Unknown outcomes](../governance/unknown-outcomes.md)).
 8. **Finish.** The woken run gives the model the result. When the model answers without a tool
    call, the run ends `succeeded` with `RUN_FINISHED`. The audit chain for the run can be checked

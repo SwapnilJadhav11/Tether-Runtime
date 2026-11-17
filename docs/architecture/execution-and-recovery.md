@@ -42,13 +42,21 @@ stateDiagram-v2
 `advance_run`, even if one is already queued. A duplicate wake is a harmless no-op; a coalesced
 wake could be consumed by a worker before the change that needed it commits, and strand the run.
 
-**Timers are delayed jobs**: a `run_after` in the future. A late timer is not a correctness
-problem. Expiry and the run deadline are also enforced wherever a decision is made, by comparing
-the database clock with the stored `expires_at` or `deadline_at`; the timer only makes the change
-visible and wakes the run.
+**Timers are delayed jobs**: a `run_after` in the future. A late timer never lets an expired
+approval or a passed deadline be acted on: both are also enforced wherever a decision is made, by
+comparing the database clock with the stored `expires_at` or `deadline_at`. But the timer is what
+makes the change visible and wakes the run. In particular, the deadline timer is what closes a
+run's pending approvals; until it runs, a run waiting on an approval ends only when that
+approval's own expiry timer wakes it.
 
 There is no `LISTEN/NOTIFY`. Each worker polls every `TETHER_WORKER_POLL_INTERVAL_SECONDS` and, while
-the database is reachable, processes due jobs one at a time until none is left.
+the database is reachable, processes due jobs one at a time until none is left. A worker process
+runs one job at a time; throughput scales with the number of worker processes. Leasing is
+first-in-first-out by `run_after` across all workspaces, with no fairness between workspaces and
+no priority.
+
+The `jobs` table grows without bound, since jobs are never deleted, and lease and heartbeat
+updates churn its rows.
 
 ### Leasing
 
@@ -83,11 +91,18 @@ Limits of this mechanism:
   expired but was not yet reclaimed can still extend it.
 - There is no maximum total extension. Each tool send is still bounded by the tool's
   `timeout_seconds` (default 10 s, at most 300 s); a send that times out has an unknown outcome.
+- Loss is detected on the worker's own clock and can trail the database's view of the expiry by a
+  beat's round trip. An aborted handler stops only at its next `await`, so a second delivery can
+  briefly overlap it. Conditional ledger updates, not the lease, keep that overlap safe.
 
 Heartbeats are implemented and tested, but their behaviour is not yet one of the proven guarantees
 ([Guarantees](../guarantees.md)).
 
 ### Attempts and backoff
+
+Three different budgets share the name `max_attempts`: deliveries per job (below), sends per tool
+call (on the tool's descriptor), and probes per unknown outcome (on the tool's verification
+declaration). They are counted separately.
 
 Every lease adds one attempt to the job. Each kind has a fixed delivery budget:
 
@@ -98,11 +113,20 @@ Every lease adds one attempt to the job. Each kind has a fixed delivery budget:
 | `verify_outcome` | 5 |
 | `run_deadline`, `expire_approval` | 10 |
 
-Not every release spends an attempt. When a worker cannot take a run's advisory lock for an
-`advance_run` job (another driver holds it), or the policy it loaded at startup is no longer the
-workspace's active version, it records nothing, releases the job to run again after 1 s and refunds
-the attempt; a worker with the current policy picks it up. When a driver is fenced by a newer one,
-the job is released immediately and the attempt stays spent.
+Not every release spends an attempt. For an `advance_run` job:
+
+- **Contended.** If another session holds the run's advisory lock, the worker releases the job to
+  run again after 1 s and refunds the attempt.
+- **Stale policy.** If the policy the worker loaded at startup is no longer the workspace's active
+  version, the decision node raises before writing. The run stays `running` (the claim and any
+  earlier nodes have already committed), the job is released after 1 s, and the attempt is
+  refunded; a worker with the current policy picks it up.
+- **Fenced.** If a newer driver took over, the job is released immediately and the attempt stays
+  spent.
+
+Contended and stale-policy releases have no bound. While every worker's policy is stale, or while
+another session holds the run's lock, the job cycles indefinitely without dead-lettering, and the
+run shows `running`.
 
 A tool call that must be re-sent is released with a delay as its `run_after`: full jitter, ceiling
 0.5 s doubling per send, capped at 5 s. A verification probe that was inconclusive is released with
@@ -113,13 +137,13 @@ redelivered when the lease expires, and that delivery spends an attempt.
 
 A lease that takes a job past its `max_attempts` does not run the handler. It runs the kind's
 **dead-letter transition**, which marks the job `dead` in the same transaction as a domain outcome
-and a wake. Exhaustion therefore never strands a run. If the lease is no longer current, the whole
-transaction rolls back.
+and a wake. Exhaustion therefore never strands a run with an unresolved effect. If the lease is no
+longer current, the whole transaction rolls back.
 
 | Job kind | Dead-letter outcome |
 |---|---|
 | `execute_tool` | Nothing is sent. A `pending` entry becomes `failed`, classified `not_applied` (it never left Tether). A `dispatched` write becomes `indeterminate`, with a verification job if its tool declares a read-back. A `dispatched` read becomes a typed failure, classified `unknown`. `TOOL_OUTCOME` and a wake. |
-| `advance_run` | Under the run's advisory lock with a fresh fencing token: the run moves to `awaiting_reconciliation` if any ledger entry is `pending`, `dispatched` or `indeterminate`, otherwise to `failed` with summary `system_error`. `DEAD_LETTERED`, plus `RUN_FINISHED` when the run becomes terminal, and a wake. If the lock is held elsewhere, the transition is retried after 1 s without spending an attempt. |
+| `advance_run` | Under the run's advisory lock with a fresh fencing token: the run moves to `awaiting_reconciliation` if any ledger entry is `pending`, `dispatched` or `indeterminate`, otherwise to `failed` with summary `system_error`. `DEAD_LETTERED`, plus `RUN_FINISHED` when the run becomes terminal, and a wake. If the lock is held elsewhere, the transition is retried after 1 s without spending an attempt. A held run is not failed: when its hold clears it resumes, and if the cause persists it dead-letters again and ends `failed` with `system_error`. |
 | `verify_outcome` | Automatic verification ends with `VERIFICATION_EXHAUSTED` (reason `delivery_exhausted`); the entry stays `indeterminate` for a reconciler. A wake. |
 | `run_deadline`, `expire_approval` | Marked `dead` with a wake. Their condition is still enforced at decision time. |
 
@@ -143,8 +167,9 @@ Tether serialises run driving with two mechanisms
    and checks that `driver_generation` still equals its token, in the same transaction as the
    write. On a mismatch the transaction rolls back and the invocation stops.
 
-The lock alone is not enough. If the lock's connection drops, PostgreSQL releases the lock, but the
-old driver's code may keep running until it notices: a **zombie driver**. A new driver can take the
+The lock alone is not enough. If PostgreSQL ends the lock's session (immediately on a clean
+disconnect, or only after TCP keepalive detection on a network partition), it releases the lock,
+but the old driver's code may keep running until it notices: a **zombie driver**. A new driver can take the
 lock and a new token in that window. The zombie's next write then fails the token check, so it
 cannot finalise a run the live driver is still working on, or record a decision from a different
 model response.
@@ -168,7 +193,10 @@ The `execute_tool` handler is the only place a tool's side effect happens. Each 
    the tool version the entry pinned. Re-validate the job's arguments and recompute their call hash;
    it must equal the ledger's. Check the stop predicate and whether the run has a recorded replay
    divergence. Then:
-   - a `pending` entry becomes `dispatched` (attempt 1) with a `DISPATCHED` event;
+   - a `pending` entry is dispatched only if the stop predicate is false, no divergence is
+     recorded, the pinned version resolves and the call hash matches. It becomes `dispatched`
+     (attempt 1) with a `DISPATCHED` event. Otherwise it becomes `failed`, classified
+     `not_applied`, with `TOOL_OUTCOME` and a wake, and nothing is sent;
    - a `dispatched` entry, which means an earlier send's outcome is unknown, is re-sent only if it
      is idempotent, the run is not stopped or diverged, and the tool's send budget is not spent.
      The gate records attempt n+1 with a `REDISPATCHED` event. Otherwise it records the unknown
@@ -177,19 +205,21 @@ The `execute_tool` handler is the only place a tool's side effect happens. Each 
 2. **Send.** Call the tool's handler with the entry's stored idempotency key, under the tool's
    `timeout_seconds`.
 3. **Outcome, committed after the send.** Share-lock the run, then record the masked, classified
-   outcome on the entry (only if it is still `dispatched`), with `TOOL_OUTCOME` and a wake.
+   outcome on the entry (only if it is still `dispatched`), with `TOOL_OUTCOME` and a wake. If the
+   entry is no longer `dispatched` (a newer delivery already recorded an outcome), the result is
+   discarded without an audit event.
 
-Outcome classification and idempotency are explained in
-[Side effects and the ledger](../governance/side-effects-and-ledger.md).
+Outcome classification, idempotency keys and the rules for re-sending a tool call are explained in
+[Side effects and the ledger](../governance/side-effects-and-ledger.md). In short, a read or an
+idempotent write whose outcome is unknown is re-sent with the same key, within the tool's send
+budget and never after a stop; a non-idempotent write is never re-sent.
 
 ## What is retried
 
+Apart from tool sends, covered by the governance page above:
+
 | Work | Retried? | Bound |
 |---|---|---|
-| A read, or a write declared idempotent, whose outcome is unknown | Yes, re-sent with the same idempotency key after a committed `REDISPATCHED`, never after a stop or a divergence | The tool's `max_attempts` sends (default 3), shared by retries and redeliveries; also the job's 5 deliveries |
-| A non-idempotent write after dispatch | **Never.** Any unknown outcome becomes `indeterminate` | One send |
-| A tool that raised `ToolNotApplied` | No: a definitive `not_applied` | |
-| A tool output that violates its output schema | No. A write is recorded `applied` without its output; a read is a typed failure | |
 | A model call | Only errors the provider adapter marks retryable | `TETHER_PROVIDER_MAX_ATTEMPTS` per turn (default 3) |
 | An `advance_run` delivery | Yes, on lease expiry; every replay is safe | 8 deliveries, then dead-letter |
 | A verification probe | Yes, while inconclusive, never after a stop | The tool's declared probe count (default 3); 5 deliveries |
@@ -199,6 +229,9 @@ Outcome classification and idempotency are explained in
 An idempotent re-send relies on the target honouring the key. If a lease is lost while a send is
 still in flight, two sends with the same key can overlap; applying once is then the target's
 deduplication, not Tether's.
+
+Run submission is not deduplicated: `POST /v1/tasks/runs` takes no client idempotency key, so a
+client that retries after losing the response creates a second run.
 
 ## What a crash does
 
@@ -210,20 +243,21 @@ lease runs out (by default after up to 60 s) and another worker leases the job.
 |---|---|---|
 | API, during a submission | All of the run, its first audit event and its two jobs, or none of them | Nothing to recover. Submission is not idempotent: a client that retries after losing the response creates a second run. |
 | Worker, during a model call | The checkpoint before the call; no `model_calls` row for the interrupted attempt | After lease expiry, the driver recovers from the checkpoint and calls the model again. The lost response's proposals never existed. |
-| Worker, after a model attempt's row commits, before the checkpoint | The `model_calls` row | The model is called again; both attempts are recorded, so cost stays truthful. |
+| Worker, after a model attempt's row commits, before the checkpoint | The `model_calls` row | The model is called again; both attempts are recorded. An attempt interrupted by a crash before its row committed, or made by a driver that has since been fenced, is not recorded. |
 | Worker, after a write node commits (decision, approval, ledger entry, skip events), before its checkpoint | The row and its audit event | The node replays, finds the row by its deterministic key, checks the call hash, and adopts it. Same outcome, no duplicate. |
-| Worker, after the ledger entry is created, before `execute_tool` runs | Entry `pending`, `execute_tool` job `ready` | Any worker leases the job and dispatches normally. |
-| `execute_tool`, before the dispatch commit | Entry `pending` | Redelivery dispatches normally. If the job's deliveries run out first, the dead-letter transition records `not_applied`; nothing was sent. |
+| Worker, after the ledger entry is created, before `execute_tool` runs | Entry `pending`, `execute_tool` job `ready` | Any worker leases the job and runs the dispatch gate. |
+| `execute_tool`, before the dispatch commit | Entry `pending` | Redelivery runs the gate again: the entry is dispatched only if the stop predicate is false, no divergence is recorded, the pinned version resolves and the call hash matches; otherwise it becomes `failed`, classified `not_applied`, and nothing is sent. If the job's deliveries run out first, the dead-letter transition records `not_applied`; nothing was sent. |
 | `execute_tool`, after the dispatch commit, before or during the send: **idempotent write or read** | Entry `dispatched`, `DISPATCHED` | Redelivery commits `REDISPATCHED` and re-sends with the same key, unless the run has stopped or the budget is spent; then the outcome is unknown: `indeterminate` for a write, a typed failure for a read. |
-| Same point: **non-idempotent write** | Entry `dispatched`, `DISPATCHED` | Redelivery sends nothing and records `indeterminate` (`outcome unknown after redelivery; not re-sent`). Tether cannot tell whether the first send reached the target, so this happens even if the crash came before the send. Automatic verification runs if the tool declares a read-back; otherwise a reconciler decides. |
+| Same point: **non-idempotent write** | Entry `dispatched`, `DISPATCHED` | Redelivery sends nothing and records `indeterminate` (`outcome unknown after redelivery; not re-sent`). Tether cannot tell whether the first send reached the target, so a non-idempotent write can be `indeterminate` although nothing was ever sent: a crash between the dispatch commit and the send has that result. Automatic verification runs if the tool declares a read-back; otherwise a reconciler decides. |
 | `execute_tool`, after the send returned, before the outcome commit | Entry `dispatched` | As the two rows above. The target already applied the write: an idempotent re-send is deduplicated by the target; a non-idempotent write becomes `indeterminate`, and a read-back would find it applied. |
 | `execute_tool`, after the outcome commit, before the job is marked done | Entry terminal, wake job enqueued | Redelivery finds the entry terminal, sends nothing, and completes the job. |
 | Driver loses its lock connection but keeps running | A newer driver may hold the lock and a newer token | The zombie's next write fails the token check and rolls back; it stops. |
-| Database unreachable | Nothing new | No beat succeeds; after a whole lease the handler aborts. Nothing progresses and nothing committed is lost. |
+| Database unreachable | Nothing new | No beat succeeds; after a whole lease the handler aborts. Nothing progresses and nothing committed is lost. A send already in flight may still reach the target; its result cannot be committed and is lost. On recovery, a non-idempotent write becomes `indeterminate` and an idempotent one is re-sent. |
 
 A non-idempotent write is never sent twice by Tether. An idempotent write in flight during a crash
 is applied once by a target that honours its key. No run is lost: its jobs are redelivered until
-they finish or dead-letter into a domain outcome.
+they finish, dead-letter into a domain outcome, or, for contended or stale-policy `advance_run`
+jobs, cycle until the lock frees or a worker with the current policy takes them.
 
 These cases are exercised by the chaos suite under `tests/chaos/`: a crash right after each
 critical commit, a crash during a model call, crashes with idempotent and non-idempotent writes in
@@ -240,7 +274,8 @@ Any number of workers can serve the same database. They need no coordination bey
   release their job without spending an attempt, and their later deliveries find nothing to do.
 - A tool call has one ledger entry and one `execute_tool` job; its dispatch and outcome are
   conditional updates on the entry's state, so a late result from a worker that lost its lease
-  cannot overwrite the record a newer worker wrote.
+  cannot overwrite the record a newer worker wrote. The late result is discarded without an audit
+  event, so a read-back or a person must settle the entry without it.
 - Timers and stop requests are conditional updates under the run row's lock and are no-ops when
   already applied.
 
@@ -257,7 +292,7 @@ operating limits; no operating limit is published ([Validation](../validation.md
 | `TETHER_WORKER_LEASE_SECONDS` | 60 | How long a leased job stays invisible to other workers without a beat. |
 | `TETHER_WORKER_LEASE_HEARTBEAT_SECONDS` | unset: a third of the lease (20 s) | How often the lease is extended. Must be below the lease. |
 | `TETHER_WORKER_POLL_INTERVAL_SECONDS` | 1.0 | How long an idle worker waits before polling again. |
-| `TETHER_WORKER_HEARTBEAT_MAX_AGE_SECONDS` | 30 | How stale the worker's heartbeat file may be before its container healthcheck fails. |
+| `TETHER_WORKER_HEARTBEAT_MAX_AGE_SECONDS` | 30 | How stale the worker's heartbeat file may be before its container healthcheck fails. The worker touches the file once per poll cycle, before it drains due jobs, so a single job or a backlog that takes longer than this setting also makes the file stale, as does an unreachable database. Use the check for alerting, not as a liveness restart, unless the setting exceeds your longest job. |
 | `TETHER_PROVIDER_MAX_ATTEMPTS` | 3 | Model attempts per turn. |
 | Tool `max_attempts` | 3 | Sends per tool call (set on the tool's descriptor). |
 | Tool `timeout_seconds` | 10 | Per send; at most 300. |
