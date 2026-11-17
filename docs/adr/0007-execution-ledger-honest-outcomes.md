@@ -1,7 +1,7 @@
 # ADR-0007: Execution ledger, honest outcome classification, and human-only resolution of `indeterminate`
 
 **Date**: 2026-10-06
-**Status**: accepted
+**Status**: superseded by [ADR-0019](0019-automatic-verification-of-unknown-outcomes.md) (2026-11-09; rules 1–6 carried over unchanged, rules 7–8 replaced by bounded automatic verification with human reconciliation as the fallback)
 **Deciders**: Tether project owner (SwapnilJadhav11); architecture reviewed by ecc:architect
 **Architecture source**: §12.1–12.4; §15; §24 item 17
 

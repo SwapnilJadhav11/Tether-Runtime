@@ -100,6 +100,12 @@ BOOT = BootstrapFile.model_validate(
                         {"tool": "probe_flaky", "decision": "allow"},
                     ],
                     "reconciliation": {"reconciler_roles": ["sre"]},
+                    "role_permissions": {
+                        "operator": ["service:read", "service:restart", "probe:write"]
+                    },
+                    "agent_permissions": {
+                        "agent-1": ["service:read", "service:restart", "probe:write"]
+                    },
                 },
             }
         ]
@@ -146,6 +152,8 @@ FLAKY = ToolDescriptor(
     effect="write",
     idempotency="supported",
     handler=_never_answers,
+    risk="low",
+    required_permissions=("probe:write",),
 )
 TEST_WORKLOAD = Workload(
     name=WORKLOAD.name,

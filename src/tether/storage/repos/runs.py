@@ -164,6 +164,9 @@ MAX_ATTEMPTS = {
     JobKind.EXECUTE_TOOL: 5,
     JobKind.EXPIRE_APPROVAL: 10,
     JobKind.RUN_DEADLINE: 10,
+    # One job per probe (ADR-0019 rule 9): deliveries beyond one are redeliveries after a crash
+    # or a lost lease, each of which re-runs the gate. Not a PD-14 value: chosen in W5.1.
+    JobKind.VERIFY_OUTCOME: 5,
 }
 
 
@@ -193,6 +196,19 @@ class JobsRepository(ScopedRepository):
         if run_after is not None:
             values["run_after"] = run_after
         await self.add(values)
+
+    async def verifying(self, run_id: uuid.UUID) -> set[uuid.UUID]:
+        """Ledger entries of the run with a ``verify_outcome`` job not yet done (read-only)."""
+        jobs = self.table
+        statement = self.scoped(
+            select(jobs.c.ref_id).where(
+                jobs.c.run_id == run_id,
+                jobs.c.kind == JobKind.VERIFY_OUTCOME,
+                jobs.c.state.in_([JobState.READY, JobState.LEASED]),
+                jobs.c.ref_id.is_not(None),
+            )
+        )
+        return {row[0] for row in (await self._connection.execute(statement)).all()}
 
     async def mark_dead(self, job_id: uuid.UUID, lease_token: uuid.UUID) -> bool:
         """TX12's last write: ``leased → dead``, refused unless this lease is still current."""

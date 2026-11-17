@@ -26,6 +26,7 @@ from tether.core.ids import WorkspaceId
 from tether.core.statuses import JobKind
 from tether.policy.config import BootstrapFile
 from tether.runtime.driver import WorkerRuntime
+from tether.runtime.graph import call_hash_for
 from tether.settings import Settings
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.scope import WorkspaceScope
@@ -42,17 +43,17 @@ BOOT = BootstrapFile.model_validate(
                 "agents": [{"id": "agent-g", "workload": "incident_remediation"}],
                 "policy": {
                     "rules": [
-                        {
-                            "tool": "get_service_health",
-                            "decision": "allow",
-                            "requester_roles": ["operator"],
-                        },
+                        {"tool": "get_service_health", "decision": "allow"},
                         {
                             "tool": "restart_service",
                             "decision": "require_approval",
                             "approver_roles": ["oncall"],
                         },
-                    ]
+                    ],
+                    # ADR-0020: only the operator role grants these; a requester without it is
+                    # denied (deny by default).
+                    "role_permissions": {"operator": ["service:read", "service:restart"]},
+                    "agent_permissions": {"agent-g": ["service:read", "service:restart"]},
                 },
             }
         ]
@@ -235,15 +236,45 @@ async def test_invalid_proposals_are_recorded_and_not_executed(
 async def test_a_persisted_decision_is_adopted_not_re_decided(
     runtime: WorkerRuntime, submit: Submit, seeded: Any
 ) -> None:
-    """Replay safety: an earlier invocation already recorded 'deny' for step 0."""
+    """Replay safety: an earlier invocation already recorded 'deny' for step 0.
+
+    The recorded decision carries the hash of the call it decided; adoption compares it with
+    the current call's hash (W2.2, ADR-0003 rule 4). A mismatch is a divergence, tested in
+    ``test_replay_divergence.py``.
+    """
     run_id = await submit("read")
+    [(workspace_id, agent_id, binding_key_id)] = rows(
+        seeded,
+        "SELECT workspace_id, agent_id, binding_key_id FROM tether.runs WHERE id = %s",
+        run_id,
+    )
+    descriptor = runtime.registries["incident_remediation"].offered("get_service_health")
+    assert descriptor is not None
+    decided_hash = call_hash_for(
+        runtime.keys,
+        {
+            "workspace_id": workspace_id,
+            "id": run_id,
+            "agent_id": agent_id,
+            "binding_key_id": binding_key_id,
+        },
+        descriptor,
+        descriptor.input_model(service="checkout"),
+    )
     async with UnitOfWork(runtime.engine) as uow:
         await uow.repository(AuditRepository, WorkspaceScope(WorkspaceId(WS))).append(
             runtime.keys,
             run_id=run_id,
             dedupe_key="decision:0",
             event_type="POLICY_DECISION",
-            payload={"decision": "deny", "reasons": ["recorded earlier"], "call_hash": None},
+            payload={
+                "decision": "deny",
+                "reasons": ["recorded earlier"],
+                "call_hash": decided_hash,
+                # Every recorded decision pins the version it governed (ADR-0011 rule 1).
+                "tool_version": descriptor.version,
+            },
+            tool="get_service_health",
         )
     await drain(runtime)
     assert run_status(seeded, run_id) == ("succeeded", "checked")

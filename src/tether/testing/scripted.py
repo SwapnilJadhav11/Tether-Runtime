@@ -16,7 +16,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tether.providers.history import ModelTurn, NeutralMessage, ToolCallProposal
-from tether.providers.protocol import ProviderError
+from tether.providers.protocol import ProviderCapabilities, ProviderError
 
 _MARKER = re.compile(r"#scenario=([A-Za-z0-9_-]+)")
 
@@ -29,6 +29,8 @@ class _ScriptedCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # A call whose arguments an adapter could not parse (W3.4): scripted without arguments.
+    malformed: bool = False
 
 
 class _Turn(BaseModel):
@@ -48,9 +50,19 @@ class ScriptedProvider:
     model = "scripted-v1"
 
     def __init__(self, scenarios_dir: Path, *, env: str) -> None:
-        if env == "prod":
-            raise ScenarioError("the scripted provider is for dev and test only")
+        # An allow-list, not "not prod": an unset or misspelled environment is refused too (W7.1).
+        if env not in ("dev", "test"):
+            raise ScenarioError("the scripted provider is for TETHER_ENV=dev or test only")
         self._dir = scenarios_dir
+
+    def capabilities(self) -> ProviderCapabilities:
+        # A scenario can script several calls in one turn, but there is no control to switch
+        # that off, and there is no context window to report: both are declared honestly.
+        return ProviderCapabilities(
+            tool_calling=True,
+            parallel_tool_calls_controllable=False,
+            context_window_tokens=None,
+        )
 
     def _scenario(self, history: Sequence[NeutralMessage]) -> _Scenario:
         first_user = next((m for m in history if m.role == "user"), None)
@@ -75,7 +87,12 @@ class ScriptedProvider:
             return ModelTurn(text=turn.final)
         return ModelTurn(
             tool_calls=tuple(
-                ToolCallProposal(call_id=f"call_{index}_{i}", tool=c.tool, arguments=c.arguments)
+                ToolCallProposal(
+                    call_id=f"call_{index}_{i}",
+                    tool=c.tool,
+                    arguments=c.arguments,
+                    malformed=c.malformed,
+                )
                 for i, c in enumerate(turn.tool_calls)
             )
         )

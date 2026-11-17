@@ -59,6 +59,9 @@ def test_ledger_states_and_resolutions() -> None:
         "reconciled_applied",
         "reconciled_not_applied",
         "reconciled_abandon",
+        # W5.1, ADR-0019 rule 12: resolved by a definitive verification probe.
+        "verified_applied",
+        "verified_not_applied",
     }
 
 
@@ -68,4 +71,10 @@ def test_approval_statuses() -> None:
 
 def test_job_states_and_kinds() -> None:
     assert values(JobState) == {"ready", "leased", "done", "dead"}
-    assert values(JobKind) == {"advance_run", "execute_tool", "expire_approval", "run_deadline"}
+    assert values(JobKind) == {
+        "advance_run",
+        "execute_tool",
+        "expire_approval",
+        "run_deadline",
+        "verify_outcome",  # W5.1, ADR-0019 rule 9
+    }

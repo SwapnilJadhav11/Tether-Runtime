@@ -10,6 +10,9 @@ dependencies = [
     # Exact pins (PD-22): bump only with the S1.3 LangGraph contract suite green.
     "langgraph==1.2.14",
     "langgraph-checkpoint-postgres==3.1.2",
+    # The first hosted model provider (TDR-004). Imported only by providers/openai_provider.py;
+    # the SDK sits on `httpx2`, and its automatic retries are switched off there.
+    "openai>=3.51.0",
     "opentelemetry-exporter-otlp-proto-http>=1.29",
     "opentelemetry-sdk>=1.29",
     "psycopg-pool>=3.2",
@@ -36,10 +39,13 @@ tether-worker-healthcheck = "tether.worker.main:healthcheck"
 # bootstrap configuration (ADR-0002).
 [project.entry-points."tether.workloads"]
 incident_remediation = "workloads.incident_remediation:WORKLOAD"
+change_control = "workloads.change_control:WORKLOAD"
 
 [dependency-groups]
 dev = [
     "httpx>=0.28",
+    # The OpenAI SDK's transport: the provider tests mock it, so they import it directly.
+    "httpx2>=2.13",
     "hypothesis>=6.100",
     "import-linter>=2.1",
     "mypy>=1.13",
@@ -49,7 +55,8 @@ dev = [
     "ruff>=0.8",
     "types-pyyaml>=6.0",
 ]
-# Live model-provider tests (PRD T-11). Populated when the provider adapters are implemented.
+# Live model-provider tests (PRD T-11) need nothing beyond the runtime dependencies: the OpenAI
+# SDK ships with the package.
 live = []
 
 [build-system]
@@ -203,11 +210,60 @@ sequence = [
 default_item_type = "cmd"
 envfile = "deploy/compose/.env"
 
+[tool.poe.tasks.test-provider-contract]
+help = "Provider contract suite on the scripted provider and the OpenAI adapter (no network, no database)"
+cmd = "pytest tests/contract/providers -m 'not live'"
+
+[tool.poe.tasks.test-live]
+help = "Live provider proof against the real OpenAI API (T-11), including one governed run end to end. Needs TETHER_MODEL_PROVIDER=openai, TETHER_OPENAI_API_KEY and TETHER_OPENAI_MODEL; skips without them. Paid calls: never run in ordinary CI."
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "pytest tests/contract/providers tests/integration/test_live_openai_governed_run.py -m live",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
 [tool.poe.tasks.test-contract]
 help = "LangGraph semantics contract suite on the pinned versions (required on every LangGraph bump)"
 sequence = [
     "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
     "pytest tests/contract/langgraph",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
+[tool.poe.tasks.test-chaos]
+help = "Chaos and race suite (crash injection, competing workers, 50x races, real process kills)"
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "pytest tests/chaos -m chaos",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
+[tool.poe.tasks.test-flake-gate]
+help = "Flake gate: run the chaos suite N times (default 20; arguments go to scripts/flake_gate.py). The caller holds the shared database lock"
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "python scripts/flake_gate.py",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
+[tool.poe.tasks.test-authz]
+help = "T-24 authorization matrix with a second fixture workspace, route inventory, ops run view and access events"
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "pytest tests/authz",
+]
+default_item_type = "cmd"
+envfile = "deploy/compose/.env"
+
+[tool.poe.tasks.test-perf]
+help = "Load and kill harness (several in-process workers; parameters via TETHER_PERF_* variables)"
+sequence = [
+    "docker compose -f deploy/compose/docker-compose.test.yml up -d --wait",
+    "pytest tests/perf -m perf -s",
 ]
 default_item_type = "cmd"
 envfile = "deploy/compose/.env"
@@ -221,5 +277,5 @@ sequence = [
 default_item_type = "cmd"
 
 [tool.poe.tasks.ci]
-help = "Static checks run by CI: lint, typecheck, contracts, unit tests"
-sequence = ["lint", "typecheck", "contracts", "test-unit"]
+help = "Static checks run by CI: lint, typecheck, contracts, unit and provider-contract tests"
+sequence = ["lint", "typecheck", "contracts", "test-unit", "test-provider-contract"]

@@ -45,9 +45,20 @@ workspaces:
       rules:
         - tool: get_service_health
           decision: allow
+        - tool: get_service_logs
+          decision: allow
         - tool: restart_service
+          decision: require_approval
+          approver_roles: [approver]
+        - tool: update_service_config
           decision: require_approval
           approver_roles: [approver]
       # Who may resolve an indeterminate write (ADR-0007); never the run's requester.
       reconciliation:
         reconciler_roles: [reconciler]
+      # ADR-0020: requester permissions (by role) ∩ agent permissions must cover a tool's
+      # required permissions; approver and reconciler roles grant no tool permissions.
+      role_permissions:
+        operator: [service:read, service:restart, service:configure]
+      agent_permissions:
+        incident-remediator: [service:read, service:restart, service:configure]

@@ -1,0 +1,12 @@
+# Scripted model turns: look at open changes, propose one (needs approval), report.
+name: open_change
+turns:
+  - tool_calls:
+      - tool: list_open_change_issues
+        arguments: {}
+  - tool_calls:
+      - tool: create_change_issue
+        arguments:
+          title: "Rotate the deploy key"
+          body: "The deploy key is due for rotation; owner to confirm the window."
+  - final: "opened the change issue after approval."

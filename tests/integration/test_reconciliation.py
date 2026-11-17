@@ -40,10 +40,12 @@ WS = "ws-r"
 OTHER_WS = "ws-r2"
 POLICY = {
     "rules": [
-        {"tool": "get_service_health", "decision": "allow", "requester_roles": ["operator"]},
-        {"tool": "probe_write", "decision": "allow", "requester_roles": ["operator"]},
+        {"tool": "get_service_health", "decision": "allow"},
+        {"tool": "probe_write", "decision": "allow"},
     ],
     "reconciliation": {"reconciler_roles": ["reconciler"]},
+    "role_permissions": {"operator": ["service:read", "probe:write"]},
+    "agent_permissions": {"agent-r": ["service:read", "probe:write"]},
 }
 BOOT = BootstrapFile.model_validate(
     {
@@ -121,6 +123,8 @@ PROBE_TOOL = ToolDescriptor(
     effect="write",
     idempotency="unsupported",
     handler=PROBE.handler,
+    risk="low",
+    required_permissions=("probe:write",),
 )
 TEST_WORKLOAD = Workload(
     name=WORKLOAD.name,

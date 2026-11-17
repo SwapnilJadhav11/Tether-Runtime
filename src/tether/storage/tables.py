@@ -23,6 +23,7 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     PrimaryKeyConstraint,
+    SmallInteger,
     Table,
     Text,
     UniqueConstraint,
@@ -211,10 +212,17 @@ ledger_entries = Table(
     Column("attempts", Integer, nullable=False, server_default=text("0")),
     Column("outcome_payload_masked", JSONB),
     Column("outcome_reason", Text),
+    # ADR-0021 rule 10 (migration 0004): applied / not_applied / unknown / failed; NULL for
+    # entries recorded before 0004.
+    Column("outcome_class", Text),
     Column("resolution", Text),
     Column("resolved_by", Text),
     Column("justification", Text),
     _created_at(),
+    # ADR-0019 (migration 0005): probes started by the verification gate (TX-V1), and the masked
+    # evidence of the definitive result that resolved the entry (TX-V2).
+    Column("verification_attempts", Integer, nullable=False, server_default=text("0")),
+    Column("verification_evidence_masked", JSONB),
     PrimaryKeyConstraint("id", name="pk_ledger_entries"),
     UniqueConstraint("run_id", "step_ordinal", name="uq_ledger_entries_run_id_step_ordinal"),
     UniqueConstraint("idempotency_key", name="uq_ledger_entries_idempotency_key"),
@@ -250,6 +258,8 @@ audit_events = Table(
     Column("prev_mac", Text),
     Column("mac", Text, nullable=False),
     Column("key_id", Text, nullable=False),
+    # How this event's MAC is computed (W2.4); no default: every write states it.
+    Column("mac_version", SmallInteger, nullable=False),
     PrimaryKeyConstraint("run_id", "seq", name="pk_audit_events"),
     UniqueConstraint("run_id", "dedupe_key", name="uq_audit_events_run_id_dedupe_key"),
     _run_fk("audit_events"),

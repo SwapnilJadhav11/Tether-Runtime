@@ -10,10 +10,15 @@ delivery re-sends with the same key, but only after committing the stop-gated TX
 tool's send budget (PD-14) is shared by retries and redeliveries; when it is spent, the unknown
 outcome is final: ``indeterminate`` for a write, a typed failure for a read. A non-idempotent
 write is never re-sent. ``dead_letter`` is TX12 for a job delivered past ``max_attempts``.
+
+ADR-0021: the worker resolves exactly the entry's pinned ``(tool, version)``; each send is bounded
+by the tool's ``timeout_seconds`` and a timeout is an unknown outcome; every outcome write states
+its ``outcome_class`` (``applied``, ``not_applied``, ``unknown`` or ``failed``).
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -21,20 +26,21 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.engine import RowMapping
 
 from tether.core.hashing import call_hashes_equal
-from tether.core.statuses import JobKind
+from tether.core.statuses import JobKind, OutcomeClass
 from tether.observability import metrics, tracing
 from tether.observability.logging import bound, get_logger
 from tether.queue import backoff
 from tether.queue.postgres import LeasedJob
 from tether.registry.masking import mask
 from tether.runtime.driver import WorkerRuntime
-from tether.runtime.graph import call_hash_for
+from tether.runtime.graph import OUTPUT_INVALID, call_hash_for
 from tether.sdk import ToolContext, ToolDescriptor, ToolNotApplied
 from tether.storage.repos.audit import AuditRepository
 from tether.storage.repos.ledger import LedgerRepository
 from tether.storage.repos.runs import JobsRepository, RunsRepository
 from tether.storage.scope import WorkspaceScope
 from tether.storage.uow import UnitOfWork
+from tether.worker.handlers.verify_outcome import verification_payload
 
 TERMINAL_LEDGER_STATES = frozenset({"completed", "failed", "indeterminate", "abandoned"})
 _log = get_logger(__name__)
@@ -59,15 +65,15 @@ def _unknown_state(entry: RowMapping) -> str:
 
 def _descriptor(
     runtime: WorkerRuntime, scope: WorkspaceScope, run: RowMapping, entry: RowMapping
-) -> ToolDescriptor | None:
+) -> ToolDescriptor | str:
+    """The entry's pinned descriptor, or why this worker cannot resolve it."""
     workspace = runtime.bootstrap.workspace(scope.workspace_id)
     agent = workspace.agent(run["agent_id"]) if workspace else None
     if agent is None:
-        return None
-    descriptor = runtime.registries[agent.workload].resolve(entry["tool"])
-    if descriptor is None or descriptor.version != entry["tool_version"]:
-        return None  # the pinned version is not resolvable (ADR-0011)
-    return descriptor
+        return "agent is not configured"  # configuration unavailable (scope delta I-4)
+    # Exactly the pinned version, never another one (ADR-0011 rule 1, ADR-0021 rule 14).
+    found = runtime.registries[agent.workload].resolve(entry["tool"], entry["tool_version"])
+    return found if found is not None else "tool version not resolvable"
 
 
 async def _record(
@@ -78,16 +84,23 @@ async def _record(
     *,
     expected: str,
     new: str,
+    outcome_class: OutcomeClass,
     output: dict[str, Any] | None = None,
     reason: str | None = None,
+    verify: dict[str, Any] | None = None,
 ) -> None:
-    """TX7 (and the not-dispatched failures): outcome + audit + wake the run, atomically."""
+    """TX7 (and the not-dispatched failures): outcome + audit + wake the run, atomically.
+
+    ``verify`` is the ``verify_outcome`` payload when the entry's pinned version declares a
+    read-back: an entry going ``indeterminate`` then enqueues its verification in this same
+    transaction (ADR-0019 rule 9). Without one it goes straight to human reconciliation."""
     changed = await uow.repository(LedgerRepository, scope).transition(
         entry["id"],
         expected=expected,
         new=new,
         outcome_payload_masked=output,
         outcome_reason=reason,
+        outcome_class=outcome_class.value,
     )
     if not changed:
         return
@@ -96,10 +109,20 @@ async def _record(
         run_id=entry["run_id"],
         dedupe_key=f"outcome:{entry['id']}",
         event_type="TOOL_OUTCOME",
-        payload={"ledger_id": str(entry["id"]), "state": new, "reason": reason},
+        payload={
+            "ledger_id": str(entry["id"]),
+            "state": new,
+            "outcome_class": outcome_class.value,
+            "reason": reason,
+        },
         tool=entry["tool"],
     )
-    await uow.repository(JobsRepository, scope).enqueue(JobKind.ADVANCE_RUN, entry["run_id"])
+    jobs = uow.repository(JobsRepository, scope)
+    await jobs.enqueue(JobKind.ADVANCE_RUN, entry["run_id"])
+    if new == "indeterminate" and verify is not None:
+        await jobs.enqueue(
+            JobKind.VERIFY_OUTCOME, entry["run_id"], ref_id=entry["id"], payload=verify
+        )
     tool = str(entry["tool"])
 
     def recorded() -> None:
@@ -123,29 +146,85 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
             return None
         run = await uow.repository(RunsRepository, scope).share_lock(entry["run_id"])
         state = entry["state"]
+        not_applied = OutcomeClass.NOT_APPLIED
         descriptor = _descriptor(runtime, scope, run, entry)
-        if descriptor is None:
-            reason = "not applied: tool version not resolvable"
+        if isinstance(descriptor, str):
             if state == "pending":
-                await _record(
-                    uow, runtime, scope, entry, expected=state, new="failed", reason=reason
-                )
+                # Nothing has left Tether (ADR-0011 rule 4).
+                new, outcome_class = "failed", not_applied
+                reason = f"not applied: {descriptor}"
+            else:
+                # A re-send is needed but impossible, and the first send may have applied
+                # (ADR-0011 rule 5): the outcome is unknown, never not applied. The run is woken
+                # and holds a write for reconciliation (ADR-0018).
+                new, outcome_class = _unknown_state(entry), OutcomeClass.UNKNOWN
+                reason = f"outcome unknown: {descriptor}; not re-sent"
+            await _record(
+                uow,
+                runtime,
+                scope,
+                entry,
+                expected=state,
+                new=new,
+                outcome_class=outcome_class,
+                reason=reason,
+            )
             return None
         args = descriptor.input_model.model_validate(job.payload.get("arguments", {}))
+        verify = verification_payload(descriptor, job.payload.get("arguments", {}))
         hashed = call_hash_for(runtime.keys, run, descriptor, args)
         if not call_hashes_equal(hashed, entry["call_hash"]):
-            reason = "call hash mismatch: not dispatched"
             if state == "pending":
                 await _record(
-                    uow, runtime, scope, entry, expected=state, new="failed", reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new="failed",
+                    outcome_class=not_applied,
+                    reason="call hash mismatch: not dispatched",
+                )
+            else:
+                # A re-send is needed but these are not the governed call's arguments, and the
+                # first send may have applied: the outcome is unknown, never not applied, and
+                # the run is woken (as for a pinned version gone after dispatch). Never re-sent.
+                # Verification, if declared, runs only if every ADR-0022 condition holds: its gate
+                # re-checks these arguments against the ledger's call hash and refuses.
+                await _record(
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new=_unknown_state(entry),
+                    outcome_class=OutcomeClass.UNKNOWN,
+                    reason="outcome unknown: call hash mismatch; not re-sent",
+                    verify=verify,
                 )
             return None
         attempt = entry["attempts"] + 1
+        # A recorded replay divergence (ADR-0003 rule 4) gates sends like a stop: nothing new
+        # leaves Tether for a run whose persisted state and replay disagree.
+        diverged = await uow.repository(AuditRepository, scope).has_event(
+            entry["run_id"], "REPLAY_DIVERGENCE"
+        )
         if state == "pending":
-            if run["stopped"]:
-                reason = "not applied: run stopped before dispatch"
+            if run["stopped"] or diverged:
+                reason = (
+                    "not applied: run stopped before dispatch"
+                    if run["stopped"]
+                    else "not applied: replay divergence"
+                )
                 await _record(
-                    uow, runtime, scope, entry, expected=state, new="failed", reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected=state,
+                    new="failed",
+                    outcome_class=not_applied,
+                    reason=reason,
                 )
                 return None
             event = "DISPATCHED"
@@ -154,6 +233,8 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
             refusal: str | None = None
             if run["stopped"] or not _resendable(entry):
                 refusal = "outcome unknown after redelivery; not re-sent"
+            elif diverged:
+                refusal = "outcome unknown; replay divergence; not re-sent"
             elif entry["attempts"] >= descriptor.max_attempts:
                 refusal = f"outcome unknown after {entry['attempts']} attempts; not re-sent"
             if refusal is not None:
@@ -164,7 +245,9 @@ async def _prepare(runtime: WorkerRuntime, scope: WorkspaceScope, job: LeasedJob
                     entry,
                     expected=state,
                     new=_unknown_state(entry),
+                    outcome_class=OutcomeClass.UNKNOWN,
                     reason=refusal,
+                    verify=verify,
                 )
                 return None
             event = "REDISPATCHED"
@@ -189,8 +272,9 @@ async def handle(runtime: WorkerRuntime, job: LeasedJob) -> float | None:
     if prepared is None:
         return None
     entry, descriptor, args, attempt = prepared
+    verify = verification_payload(descriptor, job.payload.get("arguments", {}))
     with bound(tool=descriptor.name):
-        return await _send(runtime, scope, entry, descriptor, args, attempt)
+        return await _send(runtime, scope, entry, descriptor, args, attempt, verify)
 
 
 async def _send(
@@ -200,6 +284,7 @@ async def _send(
     descriptor: ToolDescriptor,
     args: BaseModel,
     attempt: int,
+    verify: dict[str, Any] | None,
 ) -> float | None:
     """One send to the tool and its TX7; returns the retry delay, or ``None`` when done."""
     output: dict[str, Any] | None = None
@@ -219,21 +304,31 @@ async def _send(
         started = time.monotonic()
         retry_in: float | None = None
         try:
-            result = await descriptor.handler(args, context)
-            output = mask(descriptor.output_model.model_validate(result.model_dump()))
+            # One send attempt is bounded by the tool's timeout; it is never clipped to the run
+            # deadline, and a timeout is an unknown outcome (ADR-0021 rule 6).
+            async with asyncio.timeout(descriptor.timeout_seconds):
+                result = await descriptor.handler(args, context)
             new = outcome = "completed"
+            outcome_class = OutcomeClass.APPLIED
+            try:
+                output = mask(descriptor.output_model.model_validate(result.model_dump()))
+            except ValidationError:
+                if entry["effect"] != "write":
+                    raise  # a read: a typed failure, below
+                # PD-33: the write reported success, so the effect occurred. Its output violates
+                # the schema: it is never persisted, logged or shown to the model, only marked.
+                tracing.event("tool.output_invalid")
+                reason, outcome = OUTPUT_INVALID, "output_invalid"
         except ToolNotApplied as not_applied:
             new, reason, outcome = "failed", f"not applied: {not_applied.reason}", "not_applied"
+            outcome_class = OutcomeClass.NOT_APPLIED
         except Exception as error:
             outcome = "unknown"
             tracing.mark_error(current, type(error).__name__)
+            invalid = isinstance(error, ValidationError)
             # Unknown outcome. Re-send with the same key while the budget lasts, but only when
             # that cannot duplicate an effect. Invalid output is never retried (PD-33).
-            retry = (
-                _resendable(entry)
-                and attempt < descriptor.max_attempts
-                and not isinstance(error, ValidationError)
-            )
+            retry = _resendable(entry) and attempt < descriptor.max_attempts and not invalid
             if retry:
                 retry_in = backoff.tool_backoff_seconds(attempt)
                 metrics.tool_retry(descriptor.name)
@@ -244,15 +339,37 @@ async def _send(
                     error=type(error).__name__,
                     delay_s=round(retry_in, 3),
                 )
-            # ADR-0007: a write whose result is unknown is indeterminate, never failed.
-            new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
+            if invalid and entry["effect"] == "read":
+                # A read answered with output that violates its schema: a definitive ordinary
+                # failure. Nothing can have changed at the target.
+                new, reason = "failed", "failed: output invalid"
+                outcome_class = OutcomeClass.FAILED
+            else:
+                # ADR-0007: a write whose result is unknown is indeterminate, never failed. (A
+                # write that returned output violating its schema is applied, PD-33, above; a
+                # validation error raised inside the handler is an ordinary unknown outcome.)
+                new, reason = _unknown_state(entry), f"outcome unknown: {type(error).__name__}"
+                outcome_class = OutcomeClass.UNKNOWN
         metrics.tool_executed(descriptor.name, outcome, time.monotonic() - started)
         tracing.annotate(current, **{"tether.tool.outcome": outcome})
     if retry_in is not None:
         return retry_in
     async with UnitOfWork(runtime.engine) as uow:
+        # TX7. Lock order: run row → ledger row → audit head → jobs (§13.1). Without the run row
+        # first, the inserts' foreign-key checks lock it after the audit head, which deadlocks
+        # with a stop (TX9/TX10/TX-EA) holding the run row and waiting for that head.
+        await uow.repository(RunsRepository, scope).share_lock(entry["run_id"])
         await _record(
-            uow, runtime, scope, entry, expected="dispatched", new=new, output=output, reason=reason
+            uow,
+            runtime,
+            scope,
+            entry,
+            expected="dispatched",
+            new=new,
+            outcome_class=outcome_class,
+            output=output,
+            reason=reason,
+            verify=verify,
         )
     return None
 
@@ -266,7 +383,7 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
     try:
         async with UnitOfWork(runtime.engine) as uow:
             # Lock order: run row → ledger row → audit head → jobs (§13.1).
-            await uow.repository(RunsRepository, scope).share_lock(job.run_id)
+            run = await uow.repository(RunsRepository, scope).share_lock(job.run_id)
             entry = None
             if job.ref_id is not None:
                 entry = await uow.repository(LedgerRepository, scope).lock(job.ref_id)
@@ -274,10 +391,23 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
                 # No call is reachable without TX6: this one never left Tether.
                 reason = "not applied: delivery exhausted before dispatch"
                 await _record(
-                    uow, runtime, scope, entry, expected="pending", new="failed", reason=reason
+                    uow,
+                    runtime,
+                    scope,
+                    entry,
+                    expected="pending",
+                    new="failed",
+                    outcome_class=OutcomeClass.NOT_APPLIED,
+                    reason=reason,
                 )
             elif entry is not None and entry["state"] == "dispatched":
                 reason = "outcome unknown: delivery exhausted"
+                descriptor = _descriptor(runtime, scope, run, entry)
+                verify = (
+                    None
+                    if isinstance(descriptor, str)
+                    else verification_payload(descriptor, job.payload.get("arguments", {}))
+                )
                 await _record(
                     uow,
                     runtime,
@@ -285,7 +415,9 @@ async def dead_letter(runtime: WorkerRuntime, job: LeasedJob) -> None:
                     entry,
                     expected="dispatched",
                     new=_unknown_state(entry),
+                    outcome_class=OutcomeClass.UNKNOWN,
                     reason=reason,
+                    verify=verify,
                 )
             if not await uow.repository(JobsRepository, scope).mark_dead(job.id, job.lease_token):
                 raise _StaleLease

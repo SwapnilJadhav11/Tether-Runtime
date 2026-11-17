@@ -11,6 +11,9 @@ x-tether-image: &tether-image
   build:
     context: ../..
     dockerfile: Dockerfile
+    # The development variant: dev bootstrap file, scenarios and the demo workload. The
+    # production image is `--target prod` and is never built by this file (W7.2).
+    target: dev
   image: tether-runtime:dev
 
 x-app-env: &app-env
@@ -26,6 +29,12 @@ x-app-env: &app-env
   TETHER_BINDING_ACTIVE_KEY_ID: ${TETHER_BINDING_ACTIVE_KEY_ID:?set TETHER_BINDING_ACTIVE_KEY_ID in deploy/compose/.env}
   TETHER_BINDING_KEY_DEV1: ${TETHER_BINDING_KEY_DEV1:?set TETHER_BINDING_KEY_DEV1 in deploy/compose/.env}
   TETHER_DATABASE_URL: postgresql://tether_app:${TETHER_APP_DB_PASSWORD:?set TETHER_APP_DB_PASSWORD in deploy/compose/.env}@postgres:5432/tether
+  # Model provider (ADR-0016 rule 6). Unset, the stack runs the scripted provider as before.
+  # For OpenAI set all three in .env; the key is read through the SecretsProvider and is never
+  # logged. There is no default model: Tether never spends on a model nobody chose.
+  TETHER_MODEL_PROVIDER: ${TETHER_MODEL_PROVIDER:-scripted}
+  TETHER_OPENAI_MODEL: ${TETHER_OPENAI_MODEL:-}
+  TETHER_OPENAI_API_KEY: ${TETHER_OPENAI_API_KEY:-}
 
 services:
   postgres:
@@ -48,6 +57,8 @@ services:
     # Migrations, then the dev bootstrap (workspaces, agents, active policy version).
     command: ["sh", "-c", "tether migrate && tether bootstrap apply /app/config/bootstrap/dev.yaml"]
     environment:
+      # The CLI's database commands refuse to run without an explicit environment (W7.1).
+      TETHER_ENV: dev
       TETHER_MIGRATOR_DATABASE_URL: postgresql://tether_migrator:${TETHER_MIGRATOR_DB_PASSWORD}@postgres:5432/tether
     depends_on:
       postgres:

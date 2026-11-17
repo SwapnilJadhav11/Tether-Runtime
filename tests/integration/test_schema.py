@@ -68,10 +68,10 @@ def test_core_schema_tables_exist(fresh_db: Any) -> None:
     assert {row[0] for row in found} - {"alembic_version"} == EXPECTED_TABLES
 
 
-def test_migration_head_is_0002(fresh_db: Any) -> None:
+def test_migration_head_is_0005(fresh_db: Any) -> None:
     with owner(fresh_db) as conn:
         versions = conn.execute("SELECT version_num FROM tether.alembic_version").fetchall()
-    assert versions == [("0002",)]
+    assert versions == [("0005",)]
 
 
 def test_database_time_defaults_use_clock_timestamp(fresh_db: Any) -> None:
@@ -168,6 +168,11 @@ def test_child_status_columns_accept_exactly_the_core_values(
                 overrides |= {"decided_by": "user-2", "decided_at": datetime.now(UTC)}
             if column == "resolution" and value.startswith("reconciled_"):
                 overrides |= {"resolved_by": "user-3", "justification": "checked the target"}
+            if column == "resolution" and value.startswith("verified_"):
+                overrides |= {
+                    "resolved_by": "system:verification",
+                    "verification_evidence_masked": Jsonb({"found": True}),
+                }
             if column == "state" and value == "leased":
                 overrides |= {"lease_token": uuid.uuid4(), "lease_expires_at": datetime.now(UTC)}
             rows.insert(conn, table, rows.child(table, WS_A, seeded.run_a, **overrides))
@@ -197,6 +202,17 @@ def test_child_status_columns_accept_exactly_the_core_values(
         ("ledger_entries", {"resolution": "reconciled_applied"}),
         ("ledger_entries", {"resolution": "reconciled_abandon", "resolved_by": "user-3"}),
         ("ledger_entries", {"resolution": "reconciled_not_applied", "justification": "why"}),
+        # W5.1 (migration 0005): a verified resolution needs its resolver and its evidence.
+        ("ledger_entries", {"resolution": "verified_applied"}),
+        (
+            "ledger_entries",
+            {"resolution": "verified_applied", "resolved_by": "system:verification"},
+        ),
+        (
+            "ledger_entries",
+            {"resolution": "verified_not_applied", "verification_evidence_masked": Jsonb({})},
+        ),
+        ("ledger_entries", {"verification_attempts": -1}),
         ("jobs", {"state": "leased"}),
         ("jobs", {"state": "leased", "lease_token": uuid.uuid4()}),
         ("approvals", {"decided_at": datetime(2026, 1, 1, tzinfo=UTC)}),

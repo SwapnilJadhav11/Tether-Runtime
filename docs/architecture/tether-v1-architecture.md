@@ -4,6 +4,8 @@
 > **Scope:** high-level architecture only. No implementation plans or code. Decisions marked **AD-xx** and the §24 candidates are recorded as ADRs in [`docs/adr/`](../adr/README.md).
 > **Status:** revised after architect review (`ecc:architect`) — 2026-10-06. Review disposition in §27.
 > **Amended 2026-10-08:** §9.3 step 3 resumes with an opaque sentinel instead of `Command(resume=None)` (S1.3 contract finding; ADR-0003 unchanged).
+> **Amended 2026-11-09 (documentation reconciliation):** aligned with the revised PRD and the accepted product direction ([`docs/product/tether-v1-direction-2026-11.md`](../product/tether-v1-direction-2026-11.md); dispositions in [`docs/product/tether-v1-scope-delta.md`](../product/tether-v1-scope-delta.md)). Implementation baseline `ec35254`. **Markers:** everything labelled **[ADR-0019; required, not implemented]** is the design of [ADR-0019](../adr/0019-automatic-verification-of-unknown-outcomes.md) (accepted 2026-11-09, superseding ADR-0007's human-only resolution); it is accepted design that the baseline does not yet realise, and the baseline behaviour is still human-only reconciliation. Items labelled **[required, not implemented]** are accepted design the baseline does not yet realise (see the guarantee card). Items labelled **[deferred]** keep their design but are post-V1. Items labelled **`TBD (owner, U-nnn)`** are open decision gates. Accepted ADRs were not edited.
+> **Marker update 2026-11-16 (after the owner-authorized parallel lanes, phase 1 and phase 2, and W5.1):** markers were removed or corrected only where the code and its tests now realise the design; each corrected place names the plan step and, where it differs from the design, what is still missing. ADR-0019's verification design is implemented by W5.1 under [ADR-0022](../adr/0022-verify-operation-policy-mapping.md) (accepted by owner decision 2026-11-16; its wording awaits the owner's review). No design text was changed. Nothing here has been proven against the real OpenAI API or the real GitHub API: those live runs have not happened.
 
 ---
 
@@ -45,12 +47,13 @@ Each major decision uses the format **Problem → How → Why over the alternati
 
 ## 1. Architectural drivers
 
-1. **Every side effect is governed, durable, and honest** — policy before dispatch; no duplicate supported writes; unknown outcomes never reported as failures; critical audit before side effects.
-2. **LangGraph owns graph mechanics; Tether owns production semantics** — Tether must not reimplement checkpointing/interrupts, and LangGraph must not be trusted with side-effect correctness.
+1. **Every side effect is governed, durable, and honest** — policy before dispatch; no duplicate supported writes; unknown outcomes never reported as failures; critical audit before side effects. The governed path is identity → policy → exact-action approval → authorization → dispatch → execution → outcome classification → retry/idempotency → verification (ADR-0019, ADR-0022; implemented in W5.1) or human reconciliation → audit (PRD, TDR-005).
+2. **LangGraph owns graph mechanics; Tether owns the harness and its production semantics** — Tether owns model invocation through a provider boundary, the loop and run state, tool governance, dispatch and outcomes (TDR-001); it must not reimplement checkpointing/interrupts, and LangGraph must not be trusted with side-effect correctness.
 3. **Crash anywhere, lose nothing** — API or worker may die at any instruction; runs resume; replays are safe.
-4. **Identity and workspace boundaries are fail-closed** on every endpoint and record.
-5. **Small footprint** — Postgres is the only stateful dependency; ~10 concurrent runs; single node; ~$50/month.
-6. **Domain independence** — workloads plug in through a public SDK surface; core never imports them.
+4. **Identity and workspace boundaries are fail-closed** on every endpoint and record; production processes fail closed on configuration (TDR-020, D-12).
+5. **Small, measured footprint** — Postgres is the only stateful dependency; single node; correctness at a modest scale whose limits are measured and published rather than assumed (TDR-018; targets `TBD (owner, U-006)`).
+6. **Domain independence, proven twice** — workloads plug in through a public SDK surface; core never imports them; two unrelated workloads and one real external API exercise the same kernel (TDR-012, TDR-013).
+7. **Provider portability is a product requirement** — provider-specific behaviour stays behind the adapter boundary; OpenAI is the first real provider (TDR-003, TDR-004).
 
 ---
 
@@ -84,9 +87,10 @@ flowchart LR
     DT[("demo_target database<br/>owned by demo-target-service")]
   end
 
-  OLL["Ollama<br/>local model"]
-  HOS["Hosted provider<br/>(Anthropic or OpenAI - TBD)"]
-  DTS["demo-target-service<br/>(reference workload only)"]
+  HOS["OpenAI<br/>(first real provider, TDR-004)"]
+  SCR["Scripted provider<br/>(dev/test only)"]
+  DTS["demo-target-service<br/>(incident workload, dev/test only)"]
+  GH["GitHub sandbox repository<br/>(change-control workload, U-001)"]
   OTC["OTel collector"]
   JAE["Jaeger"]
 
@@ -96,14 +100,17 @@ flowchart LR
   API --> TDB
   W --> TDB
   W --> LG
-  W --> OLL
   W --> HOS
+  W -. "dev/test" .-> SCR
   W -- "tool calls with idempotency keys" --> DTS
+  W -- "governed writes, read-back verification" --> GH
   DTS --> DT
   API -. OTLP .-> OTC
   W -. OTLP .-> OTC
   OTC --> JAE
 ```
+
+*2026-11-09:* the Ollama service and automatic provider failover are **[deferred]** (D-5; ADR-0016 remains the design for failover). The scripted provider loads only in an explicit `dev`/`test` environment and is never the production default (implemented: W3.3 selects the provider by `TETHER_MODEL_PROVIDER`; W7.1 makes `TETHER_ENV` explicit and lets `ScriptedProvider` load only for `dev`/`test`; `TETHER_MODEL_PROVIDER` still defaults to `scripted`, which `prod` refuses at startup). A production build excludes demo-only components (D-12).
 
 ---
 
@@ -243,6 +250,7 @@ flowchart TD
 ### AD-05 — `PolicyEngine` protocol with three decision points and versioned policy
 
 - **Problem:** One engine must decide tool actions, approval eligibility, and reconciliation eligibility; built-in now, Cedar/OPA later; decisions must be attributable to a policy version.
+- **V1 contract (W3.1, [ADR-0020](../adr/0020-v1-policy-engine-contract.md), implemented 2026-11-15):** `PolicyEngine` with `evaluate_action(ActionRequest) → PolicyDecision`, `evaluate_approval_eligibility(ApprovalEligibilityRequest) → Eligibility` and `evaluate_reconciliation_eligibility(ReconciliationEligibilityRequest) → Eligibility`; trusted inputs only (requester snapshot, agent, workspace, registry risk and required permissions, runtime metadata, and an empty runtime-attested `trusted_attributes`); permissions from versioned `role_permissions` ∩ `agent_permissions`; risk `low`/`high`, a high-risk tool is never allowed (refused at worker startup, `deny` at runtime); one rule per tool; separation of duties built in; no SDK rule code in V1. [ADR-0022](../adr/0022-verify-operation-policy-mapping.md) (2026-11-16) adds a fourth decision point, `evaluate_verification(VerificationRequest)` (`allow`/`deny` only, for the verify operation of §12.2.1), implemented in W5.1; that this amends ADR-0020 rule 1 awaits the owner's review. The paragraph below is the original design.
 - **How:** Protocol methods:
   - `evaluate_action(input) → Decision{allow|deny|require_approval, reasons, policy_version}` — input: requester snapshot, agent identity, workspace, `ToolDescriptor` (risk, effect, required permissions — **from the registry only**), canonical call hash, run metadata.
   - `evaluate_approval_eligibility(approver, requester, approval) → bool`
@@ -258,16 +266,19 @@ flowchart TD
 
 ## 7. Tool registry and `ToolSource`
 
-- **`ToolDescriptor`** (from workload code via `tether.sdk`): name, version, description, input model, output model (with `Sensitive` field annotations), `effect` (`read`/`write`), `risk`, required permissions, `idempotency` (`supported`/`unsupported`), optional `precondition` fields, retry budget, timeout, `on_exhausted` (`typed_failure`/`fail_run` — reads only).
-- **`ToolSource` protocol:** `list_tools(workspace) → [ToolDescriptor]`, `resolve(name, version) → ExecutableTool`. V1 implementation: `NativePythonToolSource`. MCP later is another `ToolSource`; its tools pass through the identical govern/execute path.
+- **`ToolDescriptor`** (from workload code via `tether.sdk`): name, version, description, input model, output model (with `Sensitive` field annotations), `effect` (`read`/`write`), `risk`, required permissions, `idempotency` (`supported`/`unsupported`), optional `precondition` fields, retry budget (`max_attempts`), timeout, `on_exhausted` (`typed_failure`/`fail_run` — reads only), and (ADR-0019; implemented in W5.1) an optional `verify` operation with `verify_max_attempts` and `verify_backoff`. The contract carries governance semantics end to end (TDR-009): policy reads risk and permissions, approvals bind arguments and preconditions, the ledger records idempotency, execution honours timeout and retry, verification uses `verify`. **Status:** the contract is decided by [ADR-0021](../adr/0021-v1-tool-contract.md) (U-008, tool-contract half, 2026-11-15) and implemented in W3.2: `risk` and `required_permissions` (W3.1), target-enforced `preconditions` bound into the call hash and the approval, a per-send `timeout_seconds`, `on_exhausted` (`fail_run` a terminating result under ADR-0012 rule 6, held while any entry is unresolved), and the ledger `outcome_class`. Executing the `verify` declaration is implemented in W5.1 (2026-11-16), authorized by the verify-operation policy mapping of [ADR-0022](../adr/0022-verify-operation-policy-mapping.md), which resolves ADR-0021 rule 18 (see §12.2.1). No parallel schema is introduced.
+- **`ToolSource` protocol** (ADR-0021 rule 12, which clarifies this sketch): workload-scoped `name`, `list_tools()` (offered versions) and `resolve(name, version)` (exact pinned version, offered or retained; never another version); `ToolDescriptor` is the executable type. V1 implementation: `NativePythonToolSource(workload)`, with `Workload.retained_tools` for versions kept resolvable but not offered (ADR-0011 rule 2). Every lookup after TX2 uses the pinned version. MCP later is another `ToolSource` **[deferred]**; its tools pass through the identical govern/execute path.
 - **Manifest:** the registry renders a provider-neutral tool manifest (name, description, input JSON schema) for the active agent's allowed tools; adapters translate it.
-- **Tool result contract:** tools return `ToolOutcome.applied(output)`, `ToolOutcome.not_applied(reason, evidence)`, or raise. The framework classifies (§12.3).
+- **Tool result contract:** tools return `ToolOutcome.applied(output)`, `ToolOutcome.not_applied(reason, evidence)`, or raise. The framework classifies (§12.3). (ADR-0019; implemented in W5.1) A `verify` operation returns `confirmed_applied(evidence)`, `confirmed_not_applied(evidence)` or `inconclusive(evidence)` and performs safe reads only.
+- **Workloads at the baseline and in V1:** `workloads/incident_remediation/` (deterministic proof against `demo-target-service`; four tools since W9.3, `restart_service` 1.1.0 declares a read-back) and the repository change-control workload `workloads/change_control/` against a GitHub sandbox (U-002, U-001; implemented in W9.2 and proven over a mocked GitHub transport only: the credentialed sandbox run (T-30) **has not been run**, GATE-3 is not confirmed), both registered through `tether.sdk` only; GitHub-specific code never enters `src/tether/` (T-14).
 
 ---
 
 ## 8. Provider abstraction, neutral history, retry/fallback
 
 ### AD-06 — Provider-neutral history with capability-qualified fallback
+
+*2026-11-09 (D-5, TDR-003/004):* the **neutral history, the `ModelProvider` boundary, bounded stop-gated provider retry and truthful per-attempt recording are V1 requirements**. **OpenAI is the first real adapter** (user-supplied key via `SecretsProvider`); provider choice is configuration only. The **fallback branch of this section and the Ollama adapter are [deferred]**: ADR-0016 remains the accepted design for failover, nothing in it is implemented, and no fallback is claimed. **Baseline:** `ModelProvider` exposed `complete()` only, with no `capabilities()`, no adapters and no retry. **Implemented since (W3.3, W9.1):** `capabilities()`; provider selection by `TETHER_MODEL_PROVIDER` (`src/tether/providers/factory.py`); the OpenAI adapter (`src/tether/providers/openai_provider.py`, key via `SecretsProvider`); bounded, stop-gated retry of retryable provider errors in `call_model` (`TETHER_PROVIDER_MAX_ATTEMPTS`, default 3, PD-13 backoff, one `model_calls` row per attempt). The OpenAI adapter is proven against a mocked transport and a local stub only; **no call to the real OpenAI API has been made** (T-11 live, GATE-4 not confirmed). The fallback branch stays **[deferred]**.
 
 - **Problem:** Mid-run fallback must work across providers with different tool-call formats and context sizes, without silent truncation.
 - **How:**
@@ -412,7 +423,7 @@ Terminal records carry an outcome summary (e.g. `cancelled` + "in-flight write r
 - **How:**
   - `jobs(id, kind, workspace_id, run_id, ref_id, payload, run_after, state[ready|leased|done|dead], lease_token, lease_expires_at, attempts, max_attempts, concurrency_key, trace_parent, created_at)`.
   - **Enqueue** happens inside the caller's transaction (same Unit of Work as ledger/audit) — the job table is its own transactional outbox.
-  - **Lease:** `SELECT … FOR UPDATE SKIP LOCKED` on `ready` (or `leased` with an expired lease) where `run_after <= clock_timestamp()`; set a new `lease_token`, `lease_expires_at`, `attempts += 1`. Handlers heartbeat to extend long leases. Completion and failure are conditional on `lease_token`.
+  - **Lease:** `SELECT … FOR UPDATE SKIP LOCKED` on `ready` (or `leased` with an expired lease) where `run_after <= clock_timestamp()`; set a new `lease_token`, `lease_expires_at`, `attempts += 1`. Handlers heartbeat to extend long leases. Completion and failure are conditional on `lease_token`. **Heartbeat semantics (TDR-010; implemented in W6.1: `src/tether/queue/postgres.py::heartbeat`, the worker's `keep_lease`; interval `TETHER_WORKER_LEASE_HEARTBEAT_SECONDS`, default a third of the lease; a maximum total extension is not implemented):** the handler that holds a lease extends `lease_expires_at` on a fixed interval while its work is healthy, conditional on its own `lease_token`; a healthy long tool call is therefore never redelivered or classified `unknown` merely for outliving the base lease. If the extension fails (lease already taken, database unreachable, lock connection lost) the handler aborts without completing its job, exactly as ADR-0005 rule 5 requires, and the ordinary lease-expiry rules take over. Heartbeat interval, base lease and any maximum total extension are configuration; development defaults are recorded in the guarantee card.
   - **Wake-up:** polling (~250 ms) in V1; `LISTEN/NOTIFY` is an optional latency optimization, not required (queue latency is outside P-01).
   - **Per-run serialization:** the **session-level advisory lock** held by the run driver (§9.3) is the per-run mutex. `concurrency_key = run_id` may be used as a lease-query optimization only; it is not relied upon for mutual exclusion (it is not atomic across concurrent leasers).
   - **No coalescing (F-01):** duplicate `advance_run` jobs are allowed and are no-ops by the wake protocol. A coalescing `ON CONFLICT DO NOTHING` insert takes no lock on the existing ready row, so a concurrent lease could consume it before the event transaction commits and strand the run. **Invariant:** every state-changing event transaction (TX4, TX6r when it moves an entry to `indeterminate`, TX-EA, TX7, TX8, TX9, TX10, TX12) inserts its own wake job, which cannot be leased before that transaction commits.
@@ -451,6 +462,9 @@ stateDiagram-v2
   dispatched --> dispatched: idempotent retry or redelivery (same key, attempts+1, no stop requested)
   dispatched --> indeterminate: unknown and (non-idempotent OR attempts exhausted OR stop requested OR version unavailable)
   indeterminate --> indeterminate: late result observed (evidence only)
+  indeterminate --> indeterminate: verification probe inconclusive (ADR-0019)
+  indeterminate --> completed: verified applied (ADR-0019)
+  indeterminate --> failed: verified not_applied (ADR-0019)
   indeterminate --> completed: reconciled applied
   indeterminate --> failed: reconciled not_applied
   indeterminate --> abandoned: reconciled abandon
@@ -459,7 +473,11 @@ stateDiagram-v2
   abandoned --> [*]
 ```
 
-`resolution` (`automatic` | `reconciled_applied` | `reconciled_not_applied` | `reconciled_abandon`) and `resolved_by` distinguish human outcomes from automatic ones.
+`resolution` (`automatic` | `reconciled_applied` | `reconciled_not_applied` | `reconciled_abandon`) and `resolved_by` distinguish human outcomes from automatic ones. ADR-0019 adds `verified_applied` and `verified_not_applied` (resolved by `system:verification`) and the columns `verification_attempts` and `verification_evidence_masked`: implemented in W5.1 by migration `0005`. The three transitions marked (ADR-0019) are implemented and proven by T-27. The "late result observed" self-transition is not implemented as such; a probe answer that arrives after a person reconciled is recorded as `VERIFICATION_LATE` evidence.
+
+#### 12.2.1 Automatic verification of unknown outcomes (ADR-0019)
+
+When an entry becomes `indeterminate` and its tool declares `verify`, the same transaction enqueues a `verify_outcome` job. Each probe is preceded by a committed gate **TX-V1** (entry still `indeterminate` and unresolved, attempts below `verify_max_attempts`, stop predicate false, policy `allow` for the verify operation under the active version; `verification_attempts += 1`; observation audit `VERIFICATION_ATTEMPTED`). The probe performs safe reads only and never re-sends the write. A definitive result commits **TX-V2** (conditional `indeterminate → completed|failed`, `resolution = verified_*`, masked evidence, critical audit `VERIFIED`, wake). `inconclusive` records `VERIFICATION_INCONCLUSIVE` and schedules the next probe; exhaustion, a policy deny, an unavailable pinned version or a stop records `VERIFICATION_EXHAUSTED` and leaves the entry to human reconciliation (TX8). TX8 takes the run row `FOR UPDATE` and wins on conflict; a later probe result is `VERIFICATION_LATE` evidence only. After a stop, a verified outcome only terminates the run (ADR-0006 rule 5). Full rules: ADR-0019 rules 7–12; the verify operation is authorized by a separate read-purpose decision, `PolicyEngine.evaluate_verification`, bounded by the original action ([ADR-0022](../adr/0022-verify-operation-policy-mapping.md)). **Implemented in W5.1 (2026-11-16)** (`src/tether/worker/handlers/verify_outcome.py`, `src/tether/runtime/verification.py`) **and proven by T-27** (`tests/integration/test_t27_verification.py`, `tests/chaos/test_chaos_verification.py`). Two wording points are recorded for the owner, not resolved here: the code's TX8 takes the run row `FOR SHARE` then the ledger row `FOR UPDATE`, where this paragraph and ADR-0019 say `FOR UPDATE` on the run row (TX-V1 and TX-V2 follow the code's order); and a policy deployment between a write and its probe refuses the probe (`policy_changed`), so that entry goes to a person (scope delta §3.5).
 
 ### 12.3 Outcome classification (answers open question 9)
 
@@ -545,6 +563,8 @@ sequenceDiagram
 | TX10 | Deadline | worker (timer) | set `deadline_exceeded_at` + close pending approvals + audits + enqueue `advance_run` |
 | TX11 | Status transition | worker (run driver) | conditional `runs.status` update + audit `RUN_STATUS_CHANGED` (terminal: `RUN_COMPLETED` with outcome summary) |
 | TX12 | Dead-letter | worker (queue, same txn that marks the job `dead`) | `execute_tool`: `pending → failed` (not_applied — no call is reachable without TX6) or `dispatched → indeterminate` (writes) / typed failure (reads) + audit `TOOL_OUTCOME` + enqueue `advance_run`. `advance_run`: run-driver dead-letter function, under the run's advisory lock, transitions the run to `failed`/`system_error`, or to `awaiting_reconciliation` if a non-terminal or `indeterminate` ledger entry exists, + audit |
+| TX-V1 (ADR-0019, ADR-0022; implemented W5.1) | Verification gate | worker (`verify_outcome`) | run row `FOR SHARE` → ledger row `FOR UPDATE` → active policy version `FOR SHARE`; conditional on ledger `indeterminate` with `resolution IS NULL`, `verification_attempts < verify_max_attempts`, stop predicate false, policy `allow` for the verify operation (active version read in the same transaction) → `verification_attempts + 1` + observation audit `VERIFICATION_ATTEMPTED`; committed before the probe. Stop true → `VERIFICATION_SKIPPED` + `VERIFICATION_EXHAUSTED` (reason `stopped`) + hand over to reconciliation; policy deny / version unavailable / exhaustion → `VERIFICATION_EXHAUSTED` + enqueue `advance_run` |
+| TX-V2 (ADR-0019; implemented W5.1) | Verification outcome | worker (`verify_outcome`) | conditional (on `state='indeterminate' AND resolution IS NULL`) `indeterminate → completed/failed` with `resolution = verified_applied/verified_not_applied`, `resolved_by = system:verification`, masked evidence + critical audit `VERIFIED` + enqueue `advance_run`; zero rows (human reconciled first) → observation `VERIFICATION_LATE` only |
 
 If any critical audit append fails, the enclosing transaction rolls back and no side effect follows (fail closed). Model-call records (usage/cost, **including failed attempts**) are written in their own small transaction after each provider attempt; they are authoritative for cost and retry reconstruction but are not side-effect authorization events.
 
@@ -604,7 +624,8 @@ sequenceDiagram
   end
 ```
 
-- **Approval detail view** (masked): canonical call (tool, version, masked arguments, `call_hash`), precondition values, requester, expiry, model rationale labelled *untrusted*, link to run evidence.
+- **Approval operational API (TDR-006, D-10):** `GET /v1/approvals/approvals` lists only approvals the caller is currently eligible to act on (own requests excluded); `GET /v1/approvals/approvals/{id}` returns the masked detail; `POST …/{id}/approve|reject` decides (TX4); `GET /v1/approvals/runs/{id}` shows runs the approver is eligible for or has acted on. **Implemented in W4.1** (`src/tether/api/routers/approvals.py`; real credentials only, `404` for anyone not eligible, `503` under a stale policy, read-only), with one difference: the approver run view requires a caller currently eligible for at least one approval of the run; "has acted on" is **[required, not implemented]**. Per-tool expiry with a configurable default and an explicit maximum (D-8) is **implemented in W4.2**: `approval_expiry_seconds` on a `require_approval` rule, part of the policy version, default `TETHER_APPROVAL_TTL_SECONDS`, maximum `TETHER_APPROVAL_MAX_TTL_SECONDS` refused (never clamped) at `tether bootstrap apply` and worker startup; the values 3600 s and 86400 s are proposed, awaiting owner confirmation. Race, revalidation and masking detail: `TBD (owner, U-010)`; W4.1 applied the assumptions recorded in the scope delta.
+- **Approval detail view** (masked): canonical call (tool, version, masked arguments, `call_hash`), precondition values, requester, expiry, model rationale labelled *untrusted*, link to run evidence. **[required, not implemented]** for two fields: the tool's `risk` (not stored with the approval and the api has no registry) and the model rationale (the API never exposes rationale, OD-7); both are open owner items in the scope delta §3.5.
 - **Stale world (preconditions):** tools declare precondition fields (e.g. `expected_config_version`), which are part of the hash; the **target** enforces them at execution. A mismatch → `not_applied` (definitive) → typed result (F10 / T-21). Tether does not attempt world-state checks itself.
 
 ---
@@ -635,6 +656,8 @@ sequenceDiagram
   end
 ```
 
+(ADR-0019; implemented in W5.1) Between TX7's `indeterminate` and the reconciler's TX8, the `verify_outcome` job of §12.2.1 may resolve the entry (TX-V2) when the tool declares `verify`; the run driver then treats a `verified_*` resolution like a reconciled one (typed result, or termination after a stop). The sequence above is unchanged for tools without `verify` and whenever verification ends without a definitive result.
+
 **Cancellation (TX9) and deadline (TX10):** both set a stop flag and close pending approvals atomically under the run-row lock (`FOR UPDATE`). TX2/TX3/TX5 take `FOR SHARE` on the run row and refuse when the stop predicate is true, so a new proposal decision, approval, or ledger entry cannot slip in after a stop commits. A concurrent approval (TX4) either commits first — and the subsequent dispatch is then blocked at TX5 or TX6 by the stop predicate (`failed`, not applied) — or is refused. Writes already `dispatched` are not recalled; `await_tool` keeps waiting for their outcome (a stop flag never short-circuits a non-terminal ledger entry). No re-send starts once the stop is visible: an attempt already in flight may still record a definitive outcome, but an unknown outcome (or a pending re-send) becomes `indeterminate` immediately and routes to reconciliation (ADR-0008). After any stop, the stop predicate prevents further model calls or proposals; reconciliation then only records the outcome and terminates (answers open question 10).
 
 ---
@@ -647,8 +670,9 @@ sequenceDiagram
 - **How:** `audit_heads(run_id, seq, last_mac, key_id)` and `audit_events(workspace_id, run_id, seq, dedupe_key, event_type, actor, tool, payload_masked, policy_version, trace_id, created_at, prev_mac, mac, key_id)` with `UNIQUE(run_id, seq)`, `UNIQUE(run_id, dedupe_key)`, and indexes on `(workspace_id, actor)`, `(workspace_id, tool)`, `(workspace_id, created_at)` for the PRD's audit queries. Append inside the caller's transaction: lock the run's head row `FOR UPDATE` → if `dedupe_key` exists, return it (dedupe classes: §13.3) → `mac = HMAC-SHA256(K[key_id], JCS({workspace_id, run_id, seq, event_type, actor, tool, payload_masked, policy_version, created_at, prev_mac}))` → insert → advance head. The key comes from `SecretsProvider` and is never stored in the DB; `key_id` allows rotation. `tether audit verify` recomputes chains.
 - **Why over the alternative:** A global chain serialises all runs; unkeyed hashes can be recomputed by anyone with DB write access.
 - **Failure:** Append failure aborts the enclosing transaction (fail closed). Detects in-place edits and reordering without the key; does **not** detect tail truncation or whole-run deletion (documented V1 limit; future external anchor).
+- **Baseline discrepancy and resolution (D-6.3; implemented by W2.4, 2026-11-14):** at `ec35254` the MAC record (`src/tether/audit/chain.py::mac_record`) omitted `created_at`, so timestamps could be altered undetected. Conformance as designed: the append reads `clock_timestamp()` inside its transaction under the head lock, stores that exact value as `created_at`, and MACs it (`mac_record_v2`: the version-1 fields plus `mac_version` and `created_at` as UTC ISO 8601 with six fractional digits and `Z`). Migration `0003` records a `mac_version` per event: every event written before it is version 1, valid as written and never re-MACed, so **its timestamp remains uncovered**; every new event is version 2. Verification is per event and fails closed on any other version; one run's chain may mix versions. `tether audit verify` (implemented, P-9; it also compares the persisted head) recomputes chains from the CLI; chain validity is already exposed in run inspection. A general cross-run audit-query API is **[deferred]** (D-10); run-level reconstruction and the audit data are not.
 
-**Access events** (run inspection, audit queries) go to `access_events` asynchronously via a small buffered writer; not chained; loss on crash is acceptable by PRD decision.
+**Access events** (run inspection, audit queries) go to `access_events` asynchronously via a small buffered writer; not chained; loss on crash is acceptable by PRD decision. Implemented in W4.3 for permitted run inspections through the approvals and ops audiences (`src/tether/audit/access_events.py`; flushed every second, at 100 events and at a clean api shutdown); audit queries are **[deferred]** with the query API.
 
 ### AD-13 — Authoritative reconstruction vs best-effort traces (answers open question 6)
 
@@ -754,9 +778,12 @@ flowchart TB
   OC --> JG
 ```
 
-- Secrets (HMAC key, hosted-provider API key, issuer *public* keys) via Docker secrets/env files. **Issuer private keys are not deployed with Tether**; a dev-only token-minting tool (outside the runtime image) issues demo tokens, using a separate approver key, so the calling app holds only `tether-tasks` tokens.
+- Secrets (HMAC keys, OpenAI API key, issuer *public* keys) via Docker secrets/env files. **Issuer private keys are not deployed with Tether**; a dev-only token-minting tool (outside the runtime image) issues demo tokens, using a separate approver key, so the calling app holds only `tether-tasks` tokens.
 - `worker` replicas = 2 in chaos tests to exercise overlapping deliveries (C-07).
-- No Prometheus, Grafana, Redis, or Kubernetes in V1.
+- No Prometheus, Grafana, Redis, or Kubernetes in V1. The Ollama service is **[deferred]** and unused (D-5).
+- **The Compose stack is the development stack** (`TETHER_ENV=dev`). **Production/dev separation (TDR-020, D-12; implemented in W7.1 and W7.2):** `TETHER_ENV` must be explicit and a production-capable process fails startup when it is absent or invalid; the dev identity shortcut, the scripted provider, scenario files and demo-only workloads require an explicit `dev`/`test` environment and are excluded from the production build and startup path. The Dockerfile has a `prod` target (no demo workload, scenarios, scripted provider module or `config/`) and a `dev` target (last, the default; Compose builds it explicitly). The dev identity module still ships in the `prod` image, inert outside `dev`/`test`. In `prod` the api does not serve the unauthenticated OpenAPI schema (proposed, awaiting owner confirmation). Controls and gaps: [`docs/operations/production-configuration.md`](../operations/production-configuration.md).
+- **Controlled automation identities (D-4):** in an explicit `dev`/`test` environment a run may be started with an automation identity restricted to that environment, one workspace and the API key's bound agents, producing the same `Principal` and passing the same authorization as a human token. The production trust boundary (ADR-0013: every production run requires a human end-user JWT) is unchanged; production service principals are **[deferred]**.
+- **Database recovery posture:** Postgres is the single stateful dependency and single point of failure (ADR-0001); backup, restore, outage behaviour, failover effects and decision gates (`TBD (owner, U-007)`) are in [`docs/operations/postgres-recovery.md`](../operations/postgres-recovery.md).
 
 ---
 
@@ -859,6 +886,10 @@ sequenceDiagram
 33. A call executes only under its pinned `tool_version`: unresolvable before dispatch → `not_applied`; needed for a re-send after dispatch → `indeterminate` (writes). An approved approval authorizes TX5 only before its `expires_at` (ADR-0011).
 34. Call hashes are HMAC-SHA-256 under the run's pinned call-binding key, distinct from the audit key; the key never enters the database (ADR-0010).
 35. No external send (first or re-send) starts unless a committed gate transaction observed the stop predicate false; after a stop, a dispatched write with an unknown outcome becomes `indeterminate` without a re-send (ADR-0008).
+36. (ADR-0019, accepted 2026-11-09; implemented in W5.1 and proven by T-27) An `indeterminate` entry is resolved only by a committed TX8 (human) or by a committed TX-V2 whose probe was preceded by a committed gate that observed the stop predicate false and a policy `allow`; a verification probe never sends the original write or any mutation.
+37. (ADR-0019, accepted 2026-11-09; implemented in W5.1 and proven by T-27) `resolution` records whether an outcome was automatic, verified or reconciled, and model-visible payloads carry the verification marker.
+
+**Baseline conformance (2026-11-09; updated 2026-11-14).** Invariant 3 (hash-checked create-or-get, `REPLAY_DIVERGENCE`) was **[required, not implemented]** at `ec35254` and is **implemented by W2.2 (2026-11-14)**: every adoption compares the stored call hash, a divergence is audited, the run drains unresolved entries and then ends through the stop predicate (`cancelled`/`timed_out`, divergence named in the summary) or `failed` with reason `replay_divergence`. The audit event of invariant 32's `skipped` results is **implemented by W2.3 (2026-11-14)** (`CALL_SKIPPED`, fenced and create-or-get per skipped ordinal; the model-facing result references call k's call ID and outcome) (D-6.2). The "time" field of AD-12 is **implemented by W2.4 (2026-11-14)** for every event written since (`mac_version` 2); events written before stay version 1 with uncovered timestamps (D-6.3). Invariant 19 holds for `prod` only; D-12 binds the scripted provider to an explicit `dev`/`test` (implemented in W7.1, 2026-11-16). Heartbeats (§11) are implemented by W6.1 (TDR-010). Invariants 36 and 37 are implemented by W5.1 (2026-11-16). See the guarantee card for the proven subset.
 
 ---
 
@@ -874,8 +905,13 @@ sequenceDiagram
 | No duplicate supported writes (C-04–C-07) | §12.4 ledger + same-key redelivery; ledger-first authorization; conditional outcome commits independent of lease token |
 | Honest ambiguous writes (T-17, T-20, C-07) | §12.3 classification; invariants 4, 5 |
 | Stale-world protection (T-21) | Preconditions in the hash, enforced by the target |
-| Provider swap & fallback (T-10, T-11) | AD-06 neutral history + capability-qualified fallback |
-| Model-output handling (T-22) | Repair/denial budget in `govern_call`; not a provider failure |
+| Provider portability and bounded retry (T-10 retry variant, T-11 on scripted + OpenAI) | AD-06 neutral history + `ModelProvider` boundary + stop-gated retry; failover [deferred] |
+| Model-output handling (T-22) | Explicit repair/denial bound in `govern_call` (D-11); not a provider failure |
+| Automatic verification (T-27; implemented W5.1) | §12.2.1 gate TX-V1 + outcome TX-V2 (ADR-0019, ADR-0022); human reconciliation fallback |
+| Approval operations (T-28) | §14 list/detail/decide API, policy eligibility, masking |
+| Heartbeat-safe long-running work (T-29) | §11 lease heartbeats; ADR-0005 rule 5 abort on loss |
+| Real external API (T-30) and second workload (T-31) | §7 workloads via `tether.sdk`; GitHub sandbox; T-14 |
+| Production fails closed (T-32) | §19 explicit `TETHER_ENV`; dev/test-only components excluded |
 | Untrusted input / injection (T-23) | Invariant 11; masked canonical args vs untrusted rationale |
 | Sensitive-data containment (T-16) | AD-14 single choke point |
 | Reconstructability (T-12) | AD-13 authoritative timeline |

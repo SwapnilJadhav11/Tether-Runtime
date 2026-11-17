@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+# The environment is always explicit (W7.1, D-12): `TETHER_ENV` has no default, and every job here
+# runs the test suites, which are the `test` environment.
+env:
+  TETHER_ENV: test
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -45,3 +50,79 @@ jobs:
 
       - name: Unit tests
         run: uv run poe test-unit
+
+      # Both providers over a mocked transport: no network, no database, no credential. The
+      # live OpenAI proof (marker `live`) is manual dispatch only and never runs here.
+      - name: Provider contract tests (T-11, deterministic)
+        run: uv run poe test-provider-contract
+
+  # The database-backed suites run on Linux against deploy/compose/docker-compose.test.yml (a
+  # tmpfs Postgres started fresh per job), with throwaway credentials generated in the runner.
+  integration:
+    name: integration + LangGraph contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python (from .python-version)
+        run: uv python install
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Throwaway test database credentials
+        run: >-
+          uv run python -c "import secrets, pathlib;
+          names = ('TETHER_POSTGRES_PASSWORD', 'TETHER_MIGRATOR_DB_PASSWORD', 'TETHER_APP_DB_PASSWORD');
+          pathlib.Path('deploy/compose/.env').write_text(''.join(f'{n}={secrets.token_urlsafe(24)}\n' for n in names))"
+
+      - name: Integration tests
+        run: uv run poe test-integration
+
+      # T-24 matrix, route inventory, ops run view and access events, on the same test database.
+      - name: Authorization matrix
+        run: uv run poe test-authz
+
+      - name: LangGraph contract tests
+        run: uv run poe test-contract
+
+      - name: Stop the test database
+        if: always()
+        run: docker compose -f deploy/compose/docker-compose.test.yml down -v
+
+  chaos:
+    name: chaos and races
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python (from .python-version)
+        run: uv python install
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Throwaway test database credentials
+        run: >-
+          uv run python -c "import secrets, pathlib;
+          names = ('TETHER_POSTGRES_PASSWORD', 'TETHER_MIGRATOR_DB_PASSWORD', 'TETHER_APP_DB_PASSWORD');
+          pathlib.Path('deploy/compose/.env').write_text(''.join(f'{n}={secrets.token_urlsafe(24)}\n' for n in names))"
+
+      - name: Chaos and race suite
+        run: uv run poe test-chaos
+
+      - name: Stop the test database
+        if: always()
+        run: docker compose -f deploy/compose/docker-compose.test.yml down -v

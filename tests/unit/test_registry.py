@@ -32,9 +32,29 @@ def _tool(name: str = "probe_tool", **overrides: object) -> ToolDescriptor:
         "output_model": Out,
         "effect": "read",
         "handler": _handler,
+        "risk": "low",
+        "required_permissions": ("probe:read",),
         **overrides,
     }
     return ToolDescriptor(**values)  # type: ignore[arg-type]
+
+
+def test_w3_1_every_tool_declares_its_risk_and_required_permissions() -> None:
+    """ADR-0020: risk is low or high; at least one well-formed permission is required."""
+    assert _tool(risk="high").risk == "high"
+    with pytest.raises(ValueError, match="risk"):
+        _tool(risk="medium")
+    with pytest.raises(ValueError, match="permission"):
+        _tool(required_permissions=())
+    for bad in ("probe", "probe:*", "Probe:Read", "probe:read:extra", ""):
+        with pytest.raises(ValueError, match="permission"):
+            _tool(required_permissions=(bad,))
+
+
+def test_the_reference_workload_declares_risk_and_permissions_for_every_tool() -> None:
+    for tool in load_workload(REFERENCE).tools:
+        assert tool.risk in ("low", "high")
+        assert tool.required_permissions
 
 
 def test_reference_workload_loads_by_entry_point_name() -> None:
@@ -59,10 +79,11 @@ def test_manifest_offers_the_agent_tools_with_input_schemas() -> None:
         assert entry["input_schema"]["type"] == "object"
 
 
-def test_resolve_returns_the_descriptor_or_none() -> None:
+def test_resolve_returns_the_pinned_descriptor_or_none() -> None:
     registry = ToolRegistry(Workload(name="w", tools=(_tool(),), agent=AgentDefinition("p", ())))
-    assert registry.resolve("probe_tool") is not None
-    assert registry.resolve("missing") is None
+    assert registry.resolve("probe_tool", "1.0.0") is not None
+    assert registry.resolve("probe_tool", "2.0.0") is None
+    assert registry.resolve("missing", "1.0.0") is None
 
 
 def test_write_tools_must_declare_idempotency_support() -> None:

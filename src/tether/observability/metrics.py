@@ -44,6 +44,9 @@ _INSTRUMENTS: dict[str, Any] = {
     "tether.jobs.dead_lettered": _METER.create_counter(
         "tether.jobs.dead_lettered", unit="{job}", description="Jobs ended by TX12"
     ),
+    "tether.jobs.lease_lost": _METER.create_counter(
+        "tether.jobs.lease_lost", unit="{job}", description="Deliveries aborted on a lost lease"
+    ),
     "tether.tool.duration": _histogram("tether.tool.duration", "One tool send, by outcome"),
     "tether.tool.retries": _METER.create_counter(
         "tether.tool.retries", unit="{retry}", description="Tool sends scheduled again"
@@ -58,6 +61,11 @@ _INSTRUMENTS: dict[str, Any] = {
     ),
     "tether.policy.decisions": _METER.create_counter(
         "tether.policy.decisions", unit="{decision}", description="Recorded policy decisions"
+    ),
+    "tether.verifications": _METER.create_counter(
+        "tether.verifications",
+        unit="{probe}",
+        description="Verification probes of indeterminate entries, and their ends (ADR-0019)",
     ),
     "tether.approval.wait_duration": _histogram(
         "tether.approval.wait_duration", "Approval requested to decided, expired or closed"
@@ -126,6 +134,10 @@ def job_dead_lettered(kind: str) -> None:
     _emit("tether.jobs.dead_lettered", 1, kind=kind)
 
 
+def job_lease_lost(kind: str) -> None:
+    _emit("tether.jobs.lease_lost", 1, kind=kind)
+
+
 def tool_executed(tool: str, outcome: str, duration_seconds: float) -> None:
     _emit("tether.tool.duration", duration_seconds, tool=tool, outcome=outcome)
 
@@ -140,6 +152,12 @@ def ledger_indeterminate(tool: str) -> None:
 
 def reconciled(outcome: str) -> None:
     _emit("tether.reconciliations", 1, outcome=outcome)
+
+
+def verification(tool: str, result: str) -> None:
+    """``result``: a probe's kind (``confirmed_applied``, ``confirmed_not_applied``,
+    ``inconclusive``), ``late``, or ``exhausted``. Bounded labels only; never a reason text."""
+    _emit("tether.verifications", 1, tool=tool, result=result)
 
 
 def policy_decision(decision: str, tool: str) -> None:

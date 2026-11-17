@@ -26,6 +26,8 @@ def _descriptor(**overrides: object) -> ToolDescriptor:
         "output_model": _In,
         "effect": "read",
         "handler": _handler,
+        "risk": "low",
+        "required_permissions": ("probe:read",),
     }
     fields.update(overrides)
     return ToolDescriptor(**fields)  # type: ignore[arg-type]

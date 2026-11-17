@@ -2,9 +2,10 @@
 
 Architecture Decision Records (ADRs) for Tether V1. Each ADR records one significant, hard-to-reverse decision: its context, the alternatives considered, the rationale, and the consequences.
 
-- Requirements baseline (frozen): [`../../.claude/PRPs/prds/tether-runtime.prd.md`](../../.claude/PRPs/prds/tether-runtime.prd.md)
+- Requirements baseline: [`../../.claude/PRPs/prds/tether-runtime.prd.md`](../../.claude/PRPs/prds/tether-runtime.prd.md) (revision 2026-11-09)
+- Product direction and scope delta: [`../product/tether-v1-direction-2026-11.md`](../product/tether-v1-direction-2026-11.md), [`../product/tether-v1-scope-delta.md`](../product/tether-v1-scope-delta.md). The direction record is the latest product-direction input; it does not outrank an accepted ADR, and a conflict is resolved only through this ADR process.
 - Reviewed architecture: [`../architecture/tether-v1-architecture.md`](../architecture/tether-v1-architecture.md)
-- Lifecycle: `proposed` → `accepted` → `deprecated` | `superseded by ADR-NNNN`. A superseded ADR always links its replacement. New ADRs use [`template.md`](template.md) and take the next number.
+- Lifecycle: `proposed` → `accepted` → `deprecated` | `superseded by ADR-NNNN`. A superseded ADR always links its replacement. New ADRs use [`template.md`](template.md) and take the next number. A `proposed` ADR changes no behaviour and supersedes nothing until the owner marks it `accepted`.
 
 | ADR | Title | Status | Date |
 |-----|-------|--------|------|
@@ -14,7 +15,7 @@ Architecture Decision Records (ADRs) for Tether V1. Each ADR records one signifi
 | [0004](0004-postgres-job-queue.md) | Postgres job queue: at-least-once delivery, per-event wake jobs, delayed-job timers, dead-letter transitions | accepted | 2026-10-06 |
 | [0005](0005-run-driver-mutex-and-fencing.md) | Run-driver mutual exclusion: session advisory lock plus per-run fencing token | accepted | 2026-10-06 |
 | [0006](0006-run-lifecycle-single-status-writer.md) | Run lifecycle: single status writer, stop predicate, terminal immutability | accepted | 2026-10-06 |
-| [0007](0007-execution-ledger-honest-outcomes.md) | Execution ledger, honest outcome classification, and human-only resolution of `indeterminate` | accepted | 2026-10-06 |
+| [0007](0007-execution-ledger-honest-outcomes.md) | Execution ledger, honest outcome classification, and human-only resolution of `indeterminate` | superseded by ADR-0019 (2026-11-09) | 2026-10-06 |
 | [0008](0008-idempotency-keys-and-stop-gated-resends.md) | Deterministic idempotency keys and stop-gated re-sends of in-flight writes | accepted | 2026-10-06 |
 | [0009](0009-policy-engine-current-policy.md) | Policy engine, current-policy definition, and re-evaluation before execution | accepted | 2026-10-06 |
 | [0010](0010-keyed-canonical-call-hash.md) | Approval binding: RFC 8785 canonical envelope with keyed (HMAC) call hash | accepted | 2026-10-06 |
@@ -26,6 +27,12 @@ Architecture Decision Records (ADRs) for Tether V1. Each ADR records one signifi
 | [0016](0016-provider-neutral-history-and-fallback.md) | Provider-neutral history with capability-qualified, per-turn fallback | accepted | 2026-10-06 |
 | [0017](0017-sensitive-data-masking-choke-point.md) | Sensitive-data masking at a single choke point | accepted | 2026-10-06 |
 | [0018](0018-awaiting-reconciliation-hold.md) | Clarification of ADR-0006: a run awaiting reconciliation is held until its ledger entries are resolved | accepted | 2026-11-08 |
+| [0019](0019-automatic-verification-of-unknown-outcomes.md) | Execution ledger, honest outcomes, bounded automatic verification of unknown outcomes, human reconciliation as the fallback (complete restatement superseding ADR-0007) | accepted | 2026-11-09 |
+| [0020](0020-v1-policy-engine-contract.md) | Clarification of ADR-0009: the V1 policy engine contract, mandatory separation of duties and trusted policy inputs (amends ADR-0009 rule 1 on separation of duties and SDK rule code) | accepted | 2026-11-15 |
+| [0021](0021-v1-tool-contract.md) | The V1 governed tool contract: target-enforced preconditions, timeout, `on_exhausted`, outcome classification, `ToolSource`, retained and pinned versions, `verify` declaration (clarifies ADR-0011, ADR-0012 rule 6, ADR-0019 naming) | accepted | 2026-11-15 |
+| [0022](0022-verify-operation-policy-mapping.md) | How the verify operation is authorized: a separate, read-purpose policy decision bounded by the original action (clarifies ADR-0019 rule 8, resolves ADR-0021 rule 18, amends ADR-0020 rule 1 with a fourth decision point) | accepted (owner decision 2026-11-16; wording pending owner review) | 2026-11-16 |
+
+ADR-0019 was accepted on 2026-11-09 and supersedes ADR-0007 (rules 1–6 carried over; rules 7–8 replaced). Its design is **required, not yet implemented** (plan W5.1); the baseline behaviour is still human-only reconciliation.
 
 ## Mapping from architecture §24 (ADR candidates)
 
